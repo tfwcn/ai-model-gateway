@@ -129,33 +129,6 @@ class ModelStateManager:
             return is_available
 
 
-class ModelRoundRobinManager:
-    """模型轮询管理器 - 跟踪每个平台的轮询位置"""
-    
-    def __init__(self):
-        # 存储每个平台的轮询索引: {platform_name: current_index}
-        self.round_robin_index = {}
-        self.lock = asyncio.Lock()
-    
-    async def get_next_model_index(self, platform_name: str, available_models_count: int) -> int:
-        """获取平台的下一个模型索引"""
-        if available_models_count <= 0:
-            return 0
-        
-        async with self.lock:
-            current_index = self.round_robin_index.get(platform_name, 0)
-            # 确保索引在有效范围内
-            next_index = current_index % available_models_count
-            # 更新为下一个位置
-            self.round_robin_index[platform_name] = (current_index + 1) % available_models_count
-            return next_index
-    
-    async def reset_platform_index(self, platform_name: str):
-        """重置平台的轮询索引"""
-        async with self.lock:
-            self.round_robin_index[platform_name] = 0
-
-
 class OpenAIProxy:
     """OpenAI代理服务核心类"""
     
@@ -164,7 +137,6 @@ class OpenAIProxy:
         self.models: Dict[str, List[ModelConfig]] = {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.model_state_manager = ModelStateManager()  # 添加模型状态管理器
-        self.round_robin_manager = ModelRoundRobinManager()  # 添加轮询管理器
         self.load_config()
     
     def load_config(self):
@@ -334,6 +306,8 @@ class OpenAIProxy:
                                     return False, error_msg
                                 
                                 # 如果不包含error字段，检查是否有有效的content字段
+                                # 注意：这里只对JSON格式的响应进行content验证
+                                # SSE格式的响应不会进入这个分支
                                 if not self._has_valid_content(json_data):
                                     error_msg = f"流式响应缺少有效的content字段: {chunk_str}"
                                     logger.warning(error_msg)
@@ -343,7 +317,11 @@ class OpenAIProxy:
                                     
                         except (json.JSONDecodeError, ValueError):
                             # 不是有效的JSON，可能是正常的流式数据（如SSE格式）
+                            # 对于SSE格式，我们不进行content验证，直接认为有效
                             pass
+                    else:
+                        # 不是以{开头，很可能是SSE格式，直接认为有效
+                        pass
                 
                 # 如果不是错误，创建一个包装对象包含原始响应和预读取的数据
                 class StreamResponseWrapper:
@@ -453,7 +431,7 @@ class OpenAIProxy:
     async def chat_completion_non_stream(self, request_data: Dict[str, Any]) -> Any:
         """
         执行非流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
-        实现平台内模型的轮询切换机制，只要模型调用失败就认为达到限额
+        实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         """
         logger.debug("DEBUG: 开始处理非流式聊天完成请求")
         logger.debug(f"DEBUG: 原始请求数据: {request_data}")
@@ -471,15 +449,33 @@ class OpenAIProxy:
         logger.debug(f"DEBUG: 消息数量: {len(messages)}")
         
         if model_group is None or model_group == "all":
-            # 遍历所有平台，按轮询顺序尝试
+            # 获取所有平台并按权重排序（weight值越大优先级越高）
             all_platforms = list(self.models.keys())
+            
             if not all_platforms:
                 logger.error("DEBUG: 无可用模型配置")
                 raise HTTPException(status_code=400, detail="无可用模型配置")
             
+            # 创建平台权重映射
+            platform_weights = {}
+            for platform_name in all_platforms:
+                # 获取平台的第一个模型来获取weight（同一平台内所有模型weight相同）
+                if self.models[platform_name]:
+                    platform_weights[platform_name] = self.models[platform_name][0].weight
+                else:
+                    platform_weights[platform_name] = 0
+            
+            # 按权重降序排序（权重高的优先），权重相同时保持原有顺序
+            platforms_to_try = sorted(
+                all_platforms, 
+                key=lambda x: (-platform_weights.get(x, 0), all_platforms.index(x))
+            )
+            
+            logger.debug(f"DEBUG: 平台权重排序结果: {[(p, platform_weights.get(p, 0)) for p in platforms_to_try]}")
+            
             # 尝试每个平台
             last_error = None
-            for platform_name in all_platforms:
+            for platform_name in platforms_to_try:
                 platform_models = self.models[platform_name]
                 result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data)
                 if result["success"]:
@@ -506,7 +502,7 @@ class OpenAIProxy:
     async def chat_completion_stream(self, request_data: Dict[str, Any]) -> Any:
         """
         执行流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
-        实现平台内模型的轮询切换机制，只要模型调用失败就认为达到限额
+        实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         注意：流式请求必须在开始传输前完成所有模型选择，不能在流式过程中切换
         """
         logger.debug("DEBUG: 开始处理流式聊天完成请求")
@@ -525,15 +521,33 @@ class OpenAIProxy:
         logger.debug(f"DEBUG: 消息数量: {len(messages)}")
         
         if model_group is None or model_group == "all":
-            # 遍历所有平台，按轮询顺序尝试
+            # 获取所有平台并按权重排序（weight值越大优先级越高）
             all_platforms = list(self.models.keys())
+            
             if not all_platforms:
                 logger.error("DEBUG: 无可用模型配置")
                 raise HTTPException(status_code=400, detail="无可用模型配置")
             
+            # 创建平台权重映射
+            platform_weights = {}
+            for platform_name in all_platforms:
+                # 获取平台的第一个模型来获取weight（同一平台内所有模型weight相同）
+                if self.models[platform_name]:
+                    platform_weights[platform_name] = self.models[platform_name][0].weight
+                else:
+                    platform_weights[platform_name] = 0
+            
+            # 按权重降序排序（权重高的优先），权重相同时保持原有顺序
+            platforms_to_try = sorted(
+                all_platforms, 
+                key=lambda x: (-platform_weights.get(x, 0), all_platforms.index(x))
+            )
+            
+            logger.debug(f"DEBUG: 平台权重排序结果: {[(p, platform_weights.get(p, 0)) for p in platforms_to_try]}")
+            
             # 尝试每个平台
             last_error = None
-            for platform_name in all_platforms:
+            for platform_name in platforms_to_try:
                 platform_models = self.models[platform_name]
                 result = await self._try_platform_models_stream(platform_name, platform_models, request_data)
                 if result["success"]:
@@ -569,16 +583,11 @@ class OpenAIProxy:
             logger.debug(f"DEBUG: 平台 {platform_name} 无可用模型（非流式）")
             return {"success": False, "error": f"平台 {platform_name} 无可用模型", "data": None}
         
-        # 总是使用轮询机制，无论是否配置了 quota_period
-        start_index = await self.round_robin_manager.get_next_model_index(platform_name, len(available_models))
-        models_to_try = []
-        # 从轮询位置开始，循环遍历所有可用模型
-        for i in range(len(available_models)):
-            idx = (start_index + i) % len(available_models)
-            models_to_try.append(available_models[idx])
+        # 故障转移模式：总是从索引0开始尝试（最高优先级）
+        models_to_try = available_models  # 保持原始顺序，索引0为首选
         
         logger.debug(f"DEBUG: 平台 {platform_name} 有 {len(models_to_try)} 个模型待尝试（非流式）: {[m.name for m in models_to_try]}")
-        logger.debug(f"DEBUG: 平台 {platform_name} 轮询机制: 启用")
+        logger.debug(f"DEBUG: 平台 {platform_name} 故障转移机制: 启用（优先级顺序）")
         
         # 按顺序尝试每个模型
         for i, model_config in enumerate(models_to_try):
@@ -620,16 +629,11 @@ class OpenAIProxy:
             logger.debug(f"DEBUG: 平台 {platform_name} 无可用模型（流式）")
             return {"success": False, "error": f"平台 {platform_name} 无可用模型", "data": None}
         
-        # 总是使用轮询机制，无论是否配置了 quota_period
-        start_index = await self.round_robin_manager.get_next_model_index(platform_name, len(available_models))
-        models_to_try = []
-        # 从轮询位置开始，循环遍历所有可用模型
-        for i in range(len(available_models)):
-            idx = (start_index + i) % len(available_models)
-            models_to_try.append(available_models[idx])
+        # 故障转移模式：总是从索引0开始尝试（最高优先级）
+        models_to_try = available_models  # 保持原始顺序，索引0为首选
         
         logger.debug(f"DEBUG: 平台 {platform_name} 有 {len(models_to_try)} 个模型待尝试（流式）: {[m.name for m in models_to_try]}")
-        logger.debug(f"DEBUG: 平台 {platform_name} 轮询机制: 启用")
+        logger.debug(f"DEBUG: 平台 {platform_name} 故障转移机制: 启用（优先级顺序）")
         
         # 按顺序尝试每个模型
         for i, model_config in enumerate(models_to_try):
@@ -694,16 +698,24 @@ class OpenAIProxy:
                 message = first_choice["message"]
                 if isinstance(message, dict) and "content" in message:
                     content = message["content"]
-                    # content 可以是字符串（可能为空字符串）或 None
-                    # 只要字段存在就认为是有效的
-                    return True
+                    # content 必须是非None值，如果是字符串则不能是空字符串
+                    if content is not None:
+                        if isinstance(content, str):
+                            return len(content.strip()) > 0
+                        else:
+                            return True  # 非字符串类型（如数字、布尔值等）认为有效
             
             # 对于流式响应的 chunk，检查 delta.content
             if "delta" in first_choice:
                 delta = first_choice["delta"]
                 if isinstance(delta, dict) and "content" in delta:
-                    # delta.content 字段存在就认为有效
-                    return True
+                    content = delta["content"]
+                    # content 必须是非None值，如果是字符串则不能是空字符串
+                    if content is not None:
+                        if isinstance(content, str):
+                            return len(content.strip()) > 0
+                        else:
+                            return True  # 非字符串类型认为有效
             
             # 如果既没有 message 也没有 delta，或者没有 content 字段
             return False
@@ -785,28 +797,30 @@ async def chat_completions(request: Request):
                         yield chunk
                 elif isinstance(result, aiohttp.ClientResponse):
                     logger.debug("DEBUG: 流式响应 - 直接转发模型响应")
-                    async for chunk in result.content.iter_any():
-                        chunk_size = len(chunk)
-                        logger.debug(f"DEBUG: 流式响应 - 转发数据块，大小: {chunk_size}字节")
-                        
-                        # 打印响应内容（进行脱敏和截断处理）
-                        try:
-                            chunk_str = chunk.decode('utf-8', errors='replace')
-                            # 截断过长的内容以避免日志过大
-                            if len(chunk_str) > 500:
-                                chunk_preview = chunk_str[:500] + "..."
-                            else:
-                                chunk_preview = chunk_str
+                    # 使用按行读取来正确处理SSE格式
+                    async for line in result.content:
+                        if line:
+                            chunk_size = len(line)
+                            logger.debug(f"DEBUG: 流式响应 - 转发数据行，大小: {chunk_size}字节")
                             
-                            # 检查是否包含敏感信息（如API密钥等），如果有则脱敏
-                            if "api_key" in chunk_preview.lower() or "secret" in chunk_preview.lower():
-                                chunk_preview = "[SENSITIVE DATA REDACTED]"
+                            # 打印响应内容（进行脱敏和截断处理）
+                            try:
+                                chunk_str = line.decode('utf-8', errors='replace')
+                                # 截断过长的内容以避免日志过大
+                                if len(chunk_str) > 500:
+                                    chunk_preview = chunk_str[:500] + "..."
+                                else:
+                                    chunk_preview = chunk_str
+                                
+                                # 检查是否包含敏感信息（如API密钥等），如果有则脱敏
+                                if "api_key" in chunk_preview.lower() or "secret" in chunk_preview.lower():
+                                    chunk_preview = "[SENSITIVE DATA REDACTED]"
+                                
+                                logger.debug(f"DEBUG: 流式响应内容预览: {chunk_preview}")
+                            except Exception as decode_error:
+                                logger.debug(f"DEBUG: 无法解码响应内容为UTF-8: {decode_error}")
                             
-                            logger.debug(f"DEBUG: 流式响应内容预览: {chunk_preview}")
-                        except Exception as decode_error:
-                            logger.debug(f"DEBUG: 无法解码响应内容为UTF-8: {decode_error}")
-                        
-                        yield chunk
+                            yield line
                 else:
                     # 如果返回的是普通响应但请求是流式的，转换为流式格式
                     logger.debug("DEBUG: 流式响应 - 转换普通响应为流式")
