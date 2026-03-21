@@ -21,6 +21,8 @@ if [ ! -d "$VENV_PATH" ]; then
 else
     echo "虚拟环境已存在，跳过创建步骤"
     source "$VENV_PATH/bin/activate"
+    pip install --upgrade pip
+    pip install -r "$APP_PATH/requirements.txt"
 fi
 
 echo "启动 OpenAI 代理服务..."
