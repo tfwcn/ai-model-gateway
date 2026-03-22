@@ -28,6 +28,7 @@ openrouter:
     args: # 参数可选
       category: "free"
       input_modalities: ["text"]
+      output_modalities: ["text"]
       cache_timeout: 300 # 缓存过期时间（秒），默认300秒（5分钟）
   models: # 静态配置的模型会放在插件返回的模型后面
     - openrouter/free
