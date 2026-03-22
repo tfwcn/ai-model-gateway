@@ -26,11 +26,11 @@ class ModelFailoverManager:
     async def get_session(self) -> aiohttp.ClientSession:
         """获取HTTP会话"""
         if self.session is None or self.session.closed:
+            # 移除total超时，避免影响流式响应
             self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60),
                 headers={"Content-Type": "application/json"}
             )
-            logger.debug("DEBUG: 创建了新的HTTP会话")
+            logger.debug("DEBUG: 创建了新的HTTP会话（无总超时）")
         else:
             logger.debug("DEBUG: 复用现有的HTTP会话")
         return self.session
@@ -123,16 +123,20 @@ class ModelFailoverManager:
             start_time = time.time()
             logger.info(f"调用模型: {model_config.name} ({model_config.model}) - 流式")
             
-            # 流式响应 - 设置合理的超时
-            # total: 连接建立和等待首个响应的总超时
-            # sock_read: 流式数据读取的超时，设置为None表示无超时限制
+            # 流式响应 - 设置精确的超时控制
+            # connect: 连接建立超时
+            # sock_connect: socket连接超时  
+            # total: None 表示无总超时限制（一旦开始接收数据就不会超时）
+            # sock_read: None 表示流式数据读取无超时限制
             response = await session.post(
                 url, 
                 json=request_body, 
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(
-                    total=model_config.timeout,  # 总超时（连接+等待首个响应）
-                    sock_read=None  # 流式数据读取不设超时
+                    connect=model_config.timeout,      # 连接建立超时
+                    sock_connect=model_config.timeout, # socket连接超时
+                    total=None,                        # 无总超时限制
+                    sock_read=None                     # 流式数据读取无超时
                 )
             )
             elapsed_time = time.time() - start_time
@@ -252,7 +256,7 @@ class ModelFailoverManager:
             start_time = time.time()
             logger.info(f"调用模型: {model_config.name} ({model_config.model}) - 非流式")
 
-            # 普通响应
+            # 普通响应 - 保持总超时行为
             async with session.post(
                 url,
                 json=request_body,
