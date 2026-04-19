@@ -8,6 +8,7 @@ services:
       - "8000:8000"
     volumes:
       - ./models.yaml:/app/models.yaml:ro
+      - playwright-cache:/app/.cache/ms-playwright
     restart: unless-stopped
     networks:
       - proxy-network
@@ -15,3 +16,6 @@ services:
 networks:
   proxy-network:
     driver: bridge
+
+volumes:
+  playwright-cache:

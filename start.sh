@@ -20,7 +20,10 @@ fi
 source "$VENV_PATH/bin/activate"
 pip install --upgrade pip
 pip install -r "$APP_PATH/requirements.txt"
-python3 -m playwright install --dry-run chromium
+export PLAYWRIGHT_BROWSERS_PATH="$APP_PATH/.cache/ms-playwright"
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+# 安装 Chromium 浏览器及其系统依赖
+playwright install --with-deps chromium
 echo "依赖安装完成"
 
 echo "启动 OpenAI 代理服务..."

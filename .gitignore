@@ -8,6 +8,7 @@ venv/
 .opencode/
 .lingma/
 .trae/
+.cache/
 openspec/
 __pycache__/
 data/
