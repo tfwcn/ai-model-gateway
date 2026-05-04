@@ -9,6 +9,8 @@
 > 
 > **Smart Multi-Platform Free AI Model Gateway** - Auto failover, load balancing, OpenAI-compatible API
 
+💡 **定位说明：** 本项目专注于聚合多个提供 **OpenAI 兼容 API** 的免费模型平台，不提供非 OpenAI 格式的 API 支持。
+
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
 **[快速开始](#-快速开始)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[API 文档](#-api-参考)** · **[监控运维](docs/MONITORING.md)** · **[贡献指南](#-贡献指南)**

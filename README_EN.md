@@ -10,6 +10,8 @@
 > 
 > **智能多平台免费 AI 模型网关服务** - 自动切换、负载均衡、OpenAI 兼容接口
 
+💡 **Positioning:** This project focuses on aggregating multiple free model platforms that provide **OpenAI-compatible APIs**. It does not support non-OpenAI format APIs.
+
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
 **[Quick Start](#-quick-start-30-seconds)** · **[Configuration](#-configuration-guide)** · **[API Reference](#-api-reference)** · **[FAQ](docs/PLUGIN_FAQ.md)** · **[Contributing](#-contributing)**

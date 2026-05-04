@@ -2,6 +2,8 @@
 
 详细的 AI Model Gateway 配置说明。
 
+> 💡 **重要提示：** 本项目仅支持提供 **OpenAI 兼容 API** 的平台。所有配置的平台必须支持 OpenAI 格式的 `/v1/chat/completions` 端点。
+
 ## 📋 目录
 
 - [环境变量配置](#环境变量配置)

@@ -64,17 +64,19 @@ AI Model Gateway 的未来发展规划。
 
 ### 更多平台支持
 
-- [ ] Anthropic Claude API
-  - 支持 Claude 3 系列模型
-  - 智能路由到最优模型
-  
-- [ ] Cohere API
-  - 文本生成和嵌入模型
-  - 多语言支持优化
+专注于 OpenAI 兼容的平台集成：
 
 - [ ] Google Vertex AI
-  - Gemini 模型支持
+  - Gemini 模型支持（OpenAI 兼容模式）
   - 企业级 SLA 保障
+  
+- [ ] Azure OpenAI Service
+  - 更完善的区域支持
+  - 企业级合规认证
+  
+- [ ] 阿里云百炼
+  - 通义千问系列模型
+  - 国内访问优化
 
 ### 高级缓存策略
 
