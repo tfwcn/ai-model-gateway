@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIProxyService:
-    """OpenAI代理服务主类 - 负责FastAPI应用和路由"""
+    """AI Model Gateway 主服务类 - 负责FastAPI应用和路由"""
 
     def __init__(self, config_file: str = "models.yaml"):
         self.config_loader = ConfigLoader(config_file)
@@ -166,19 +166,19 @@ class OpenAIProxyService:
         async def lifespan(app: FastAPI):
             """应用生命周期管理器"""
             # 启动事件
-            logger.info("OpenAI代理服务启动中...")
+            logger.info("AI Model Gateway 启动中...")
             logger.info(f"正在加载配置文件: {self.config_loader.config_file}")
 
             # 初始化服务（加载配置和插件）
             await self.initialize()
 
-            logger.info("OpenAI代理服务启动完成")
+            logger.info("AI Model Gateway 启动完成")
             yield
             # 关闭事件
             await self.close()
-            logger.info("OpenAI代理服务已关闭")
+            logger.info("AI Model Gateway 已关闭")
 
-        app = FastAPI(title="OpenAI Proxy Service", version="1.0.0", lifespan=lifespan)
+        app = FastAPI(title="AI Model Gateway", version="1.0.0", lifespan=lifespan)
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):

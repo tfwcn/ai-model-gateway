@@ -1,9 +1,9 @@
 version: "3.8"
 
 services:
-  openai-proxy:
+  ai-model-gateway:
     build: .
-    container_name: openai-proxy
+    container_name: ai-model-gateway
     ports:
       - "8000:8000"
     volumes:

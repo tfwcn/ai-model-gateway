@@ -26,7 +26,7 @@
 - ❌ 模型列表过时，无法及时获取新发布的免费模型
 - ❌ 缺乏监控，不知道哪个平台出了问题
 
-**AI Free Model Proxy Service** 为你解决这些问题：
+**AI Model Gateway** 为你解决这些问题：
 
 - 🔄 **智能故障转移**：当某个平台失败时，自动切换到备用平台，无需人工干预
 - ⚖️ **权重负载均衡**：基于配置的优先级分配请求，优先使用高质量平台
@@ -114,7 +114,7 @@ curl http://localhost:8000/v1/chat/completions \
        │
        ▼
 ┌─────────────────────────────────┐
-│   AI Free Model Proxy Service   │
+│     AI Model Gateway            │
 │                                 │
 │  ┌──────────┐  ┌─────────────┐ │
 │  │ Failover │  │ Load Balance│ │

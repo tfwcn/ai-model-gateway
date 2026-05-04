@@ -40,7 +40,7 @@ else
 fi
 echo "依赖安装完成"
 
-echo "启动 OpenAI 代理服务..."
+echo "启动 AI Model Gateway..."
 cd "$APP_PATH"
 # uvicorn run:app --host 0.0.0.0 --port 8000 --reload
 uvicorn run:app --host 0.0.0.0 --port 8000

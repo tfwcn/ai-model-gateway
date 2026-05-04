@@ -1,16 +1,16 @@
 # Prometheus ServiceMonitor 配置
-# 用于自动发现 openai-proxy 服务的 /metrics 端点
+# 用于自动发现 ai-model-gateway 服务的 /metrics 端点
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: openai-proxy-monitor
+  name: ai-model-gateway-monitor
   labels:
-    app: openai-proxy
+    app: ai-model-gateway
     release: prometheus  # 与 Prometheus 的 serviceMonitorSelector 匹配
 spec:
   selector:
     matchLabels:
-      app: openai-proxy
+      app: ai-model-gateway
   namespaceSelector:
     matchNames:
       - default  # 根据实际部署命名空间调整

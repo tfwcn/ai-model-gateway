@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenAI代理服务 - 支持多平台模型自动切换重试
+AI Model Gateway - 支持多平台模型自动切换重试
 面向对象重构版本 - 多文件架构
 """
 

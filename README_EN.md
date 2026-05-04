@@ -26,7 +26,7 @@ Are you facing these issues?
 - ❌ Outdated model lists, can't get newly released free models in time
 - ❌ Lack of monitoring, don't know which platform has problems
 
-**AI Free Model Proxy Service** solves these problems for you:
+**AI Model Gateway** solves these problems for you:
 
 - 🔄 **Smart Failover**: Automatically switch to backup platforms when one fails, no manual intervention needed
 - ⚖️ **Weighted Load Balancing**: Distribute requests based on configured priorities, prefer high-quality platforms
@@ -114,7 +114,7 @@ curl http://localhost:8000/v1/chat/completions \
        │
        ▼
 ┌─────────────────────────────────┐
-│   AI Free Model Proxy Service   │
+│     AI Model Gateway            │
 │                                 │
 │  ┌──────────┐  ┌─────────────┐ │
 │  │ Failover │  │ Load Balance│ │
