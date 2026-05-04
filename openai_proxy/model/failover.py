@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from openai_proxy.models import ModelConfig
 from openai_proxy.model.state import ModelStateManager
+from openai_proxy.model.error_classifier import ErrorClassifier, ClassifiedError
 
 logger = logging.getLogger(__name__)
 
@@ -235,15 +236,28 @@ class ModelFailoverManager:
                 
         except asyncio.TimeoutError:
             elapsed_time = time.time() - start_time
-            error_msg = f"模型 {model_config.name} 请求超时 (耗时: {elapsed_time:.2f}秒, 超时阈值: {model_config.timeout}秒)"
-            logger.warning(error_msg)
-            return False, error_msg
+            # 使用错误分类器进行分类
+            classified_error = ErrorClassifier.classify_timeout_error(
+                model_config.name, elapsed_time, model_config.timeout
+            )
+            logger.warning(classified_error.message)
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
+        except aiohttp.ClientError as e:
+            elapsed_time = time.time() - start_time
+            # 使用错误分类器分类连接错误
+            classified_error = ErrorClassifier.classify_connection_error(e, model_config.name)
+            logger.warning(classified_error.message)
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
         except Exception as e:
             elapsed_time = time.time() - start_time
-            error_msg = f"模型 {model_config.name} 调用异常: {str(e)} (耗时: {elapsed_time:.2f}秒)"
-            logger.warning(error_msg)
+            # 使用错误分类器分类未知错误
+            classified_error = ErrorClassifier.classify_unknown_error(e, model_config.name, elapsed_time)
+            logger.warning(classified_error.message)
             logger.debug(f"DEBUG: 异常详细信息: {repr(e)}", exc_info=True)
-            return False, error_msg
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
 
     async def call_model_non_stream(self, model_config: ModelConfig, request_data: Dict[str, Any]) -> tuple[bool, Any]:
         """
@@ -317,24 +331,49 @@ class ModelFailoverManager:
                     else:
                         error_msg = f"模型 {model_config.name} 返回的响应缺少有效的 content 字段"
                         logger.warning(error_msg)
-                        return False, error_msg
+                        # 使用错误分类器进行分类
+                        classified_error = ErrorClassifier.classify_invalid_response(
+                            model_config.name, error_msg
+                        )
+                        logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+                        return False, classified_error
                 else:
                     error_text = await response.text()
                     logger.warning(f"模型 {model_config.name} 返回错误: {response.status} - {error_text}")
 
-                    return False, f"HTTP {response.status}: {error_text}"
+                    # 使用错误分类器进行分类
+                    classified_error = ErrorClassifier.classify_http_error(
+                        response.status, error_text, model_config.name
+                    )
+                    
+                    logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+                    
+                    return False, classified_error
 
         except asyncio.TimeoutError:
             elapsed_time = time.time() - start_time
-            error_msg = f"模型 {model_config.name} 请求超时 (耗时: {elapsed_time:.2f}秒, 超时阈值: {model_config.timeout}秒)"
-            logger.warning(error_msg)
-            return False, error_msg
+            # 使用错误分类器进行分类
+            classified_error = ErrorClassifier.classify_timeout_error(
+                model_config.name, elapsed_time, model_config.timeout
+            )
+            logger.warning(classified_error.message)
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
+        except aiohttp.ClientError as e:
+            elapsed_time = time.time() - start_time
+            # 使用错误分类器分类连接错误
+            classified_error = ErrorClassifier.classify_connection_error(e, model_config.name)
+            logger.warning(classified_error.message)
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
         except Exception as e:
             elapsed_time = time.time() - start_time
-            error_msg = f"模型 {model_config.name} 调用异常: {str(e)} (耗时: {elapsed_time:.2f}秒)"
-            logger.warning(error_msg)
+            # 使用错误分类器分类未知错误
+            classified_error = ErrorClassifier.classify_unknown_error(e, model_config.name, elapsed_time)
+            logger.warning(classified_error.message)
             logger.debug(f"DEBUG: 异常详细信息: {repr(e)}", exc_info=True)
-            return False, error_msg
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
 
     async def _try_platform_models_non_stream(self, platform_name: str, platform_models: List[ModelConfig], request_data: Dict[str, Any]) -> Dict[str, Any]:
         """尝试平台内的模型（非流式），支持轮询机制"""
@@ -365,18 +404,36 @@ class ModelFailoverManager:
                 logger.debug(f"DEBUG: 成功返回结果，类型: {type(result)}")
                 return {"success": True, "data": result, "error": None}
             else:
-                # 只要模型调用失败，就认为达到限额，标记为周期内用完
-                if model_config.quota_period is not None:
-                    # 配置了 quota_period，持久化禁用
-                    logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
-                    await self.model_state_manager.disable_model_for_period(model_config)
+                # 根据错误分类决定是否禁用模型
+                if isinstance(result, ClassifiedError):
+                    classified_error = result
+                    error_summary = ErrorClassifier.get_error_summary(classified_error)
+                    logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
+                    
+                    # 如果错误分类建议禁用模型，则禁用
+                    if classified_error.should_disable_model:
+                        if model_config.quota_period is not None:
+                            # 配置了 quota_period，持久化禁用
+                            logger.warning(f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）")
+                            await self.model_state_manager.disable_model_for_period(model_config)
+                        else:
+                            # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
+                            logger.debug(f"DEBUG: 模型 {model_config.name} 临时禁用（无quota_period配置）")
+                    else:
+                        logger.debug(f"DEBUG: 模型 {model_config.name} 不禁用（错误类型: {classified_error.category.value}，可重试）")
                 else:
-                    # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
-                    logger.debug(f"DEBUG: 模型 {model_config.name} 失败，临时禁用（无quota_period配置）")
+                    # 兼容旧版本的字符串错误
+                    logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
+                    if model_config.quota_period is not None:
+                        logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
+                        await self.model_state_manager.disable_model_for_period(model_config)
+                    else:
+                        logger.debug(f"DEBUG: 模型 {model_config.name} 失败，临时禁用（无quota_period配置）")
 
                 # 如果是最后一个模型，返回错误
                 if i == len(models_to_try) - 1:
-                    return {"success": False, "error": str(result), "data": None}
+                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+                    return {"success": False, "error": error_message, "data": None}
                 else:
                     logger.debug(f"DEBUG: 继续尝试下一个模型...")
 
@@ -411,18 +468,36 @@ class ModelFailoverManager:
                 logger.debug(f"DEBUG: 成功返回结果，类型: {type(result)}")
                 return {"success": True, "data": result, "error": None}
             else:
-                # 只要模型调用失败，就认为达到限额，标记为周期内用完
-                if model_config.quota_period is not None:
-                    # 配置了 quota_period，持久化禁用
-                    logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
-                    await self.model_state_manager.disable_model_for_period(model_config)
+                # 根据错误分类决定是否禁用模型
+                if isinstance(result, ClassifiedError):
+                    classified_error = result
+                    error_summary = ErrorClassifier.get_error_summary(classified_error)
+                    logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
+                    
+                    # 如果错误分类建议禁用模型，则禁用
+                    if classified_error.should_disable_model:
+                        if model_config.quota_period is not None:
+                            # 配置了 quota_period，持久化禁用
+                            logger.warning(f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）")
+                            await self.model_state_manager.disable_model_for_period(model_config)
+                        else:
+                            # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
+                            logger.debug(f"DEBUG: 模型 {model_config.name} 临时禁用（无quota_period配置）")
+                    else:
+                        logger.debug(f"DEBUG: 模型 {model_config.name} 不禁用（错误类型: {classified_error.category.value}，可重试）")
                 else:
-                    # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
-                    logger.debug(f"DEBUG: 模型 {model_config.name} 失败，临时禁用（无quota_period配置）")
+                    # 兼容旧版本的字符串错误
+                    logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
+                    if model_config.quota_period is not None:
+                        logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
+                        await self.model_state_manager.disable_model_for_period(model_config)
+                    else:
+                        logger.debug(f"DEBUG: 模型 {model_config.name} 失败，临时禁用（无quota_period配置）")
 
                 # 如果是最后一个模型，返回错误
                 if i == len(models_to_try) - 1:
-                    return {"success": False, "error": str(result), "data": None}
+                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+                    return {"success": False, "error": error_message, "data": None}
                 else:
                     logger.debug(f"DEBUG: 继续尝试下一个模型...")
 
