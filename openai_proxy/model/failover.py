@@ -12,6 +12,8 @@ from fastapi.responses import StreamingResponse
 from openai_proxy.models import ModelConfig
 from openai_proxy.model.state import ModelStateManager
 from openai_proxy.model.error_classifier import ErrorClassifier, ClassifiedError
+from openai_proxy.utils.tool_call_converter import ToolCallConverter
+from openai_proxy.utils.streaming_tool_call_buffer import StreamingToolCallBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -208,9 +210,11 @@ class ModelFailoverManager:
                         self.original_response = original_response
                         self.preloaded_data = preloaded_data
                         self.first_chunk_sent = False
+                        # 【新增】初始化工具调用缓冲器（如果启用）
+                        self.tool_call_buffer = StreamingToolCallBuffer() if model_config.enable_tool_call_conversion else None
                     
                     async def __aiter__(self):
-                        """使用iter_any()避免readuntil()超时问题"""
+                        """使用iter_any()避免readuntil()超时问题，并支持工具调用转换"""
                         if self.preloaded_data and not self.first_chunk_sent:
                             self.first_chunk_sent = True
                             yield self.preloaded_data
@@ -218,7 +222,31 @@ class ModelFailoverManager:
                         # 使用iter_any()而不是按行读取，避免readuntil()超时
                         async for chunk in self.original_response.content.iter_any():
                             if chunk:
-                                yield chunk
+                                # 【新增】尝试解析并转换工具调用（如果启用）
+                                if self.tool_call_buffer:
+                                    try:
+                                        chunk_str = chunk.decode('utf-8', errors='replace')
+                                        # 解析 SSE 格式
+                                        if chunk_str.startswith('data: '):
+                                            import json
+                                            try:
+                                                data = json.loads(chunk_str[6:])
+                                                # 处理工具调用转换
+                                                events = self.tool_call_buffer.process_chunk(data, ToolCallConverter)
+                                                if events:
+                                                    for event in events:
+                                                        yield event.encode('utf-8')
+                                                    continue
+                                            except json.JSONDecodeError:
+                                                pass
+                                        # 如果不是 SSE 格式或转换失败，原样发送
+                                        yield chunk
+                                    except Exception as e:
+                                        logger.debug(f"Chunk processing error: {e}, forwarding as-is")
+                                        yield chunk
+                                else:
+                                    # 未启用转换，直接转发
+                                    yield chunk
                 
                 wrapped_response = StreamResponseWrapper(response, first_chunk)
                 return True, wrapped_response
@@ -327,6 +355,41 @@ class ModelFailoverManager:
 
                     # 检查响应中是否包含 content 字段
                     if self._has_valid_content(result):
+                        # 【新增】工具调用格式转换（如果启用）
+                        if model_config.enable_tool_call_conversion:
+                            try:
+                                choices = result.get("choices", [])
+                                if choices and len(choices) > 0:
+                                    first_choice = choices[0]
+                                    if "message" in first_choice and isinstance(first_choice["message"], dict):
+                                        message = first_choice["message"]
+                                        content = message.get("content", "")
+                                        existing_tool_calls = message.get("tool_calls", [])
+                                        
+                                        # 当 tool_calls 为空且 content 非空时，尝试转换
+                                        if (not existing_tool_calls or len(existing_tool_calls) == 0) and content:
+                                            converted_tool_calls, remaining_content = ToolCallConverter.convert_to_standard_format(
+                                                content=content,
+                                                existing_tool_calls=existing_tool_calls
+                                            )
+                                            
+                                            if converted_tool_calls and len(converted_tool_calls) > 0:
+                                                # 转换成功，更新 message
+                                                message["tool_calls"] = converted_tool_calls
+                                                message["content"] = remaining_content
+                                                logger.info(
+                                                    f"Tool call converted successfully | "
+                                                    f"model={model_config.name} | "
+                                                    f"tool_calls_count={len(converted_tool_calls)}"
+                                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Tool call conversion failed, forwarding as-is | "
+                                    f"model={model_config.name} | error={str(e)}"
+                                )
+                        else:
+                            logger.debug(f"Tool call conversion disabled for model {model_config.name}")
+                        
                         return True, result
                     else:
                         error_msg = f"模型 {model_config.name} 返回的响应缺少有效的 content 字段"

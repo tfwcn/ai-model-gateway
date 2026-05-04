@@ -12,6 +12,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 import aiohttp
 from datetime import datetime, timezone
+from ...utils.tool_call_converter import ToolCallConverter
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ class ToolCapabilityTester:
                             }
                         }],
                         "tool_choice": "auto",
-                        "max_tokens": 10,
+                        "max_tokens": 50,  # 增加max_tokens以确保完整响应
                         "temperature": 0,
                         "stream": False
                     }
@@ -168,12 +169,18 @@ class ToolCapabilityTester:
 
                         message = choices[0].get("message", {})
                         tool_calls = message.get("tool_calls")
+                        content = message.get("content", "")
 
-                        # 检查是否有工具调用
+                        # 检查是否有标准工具调用
                         if tool_calls and len(tool_calls) > 0:
                             return True
-                        else:
-                            return False
+                        
+                        # 使用转换器检测非标准格式
+                        if content and ToolCallConverter.is_non_standard_format(content):
+                            logger.debug(f"检测到非标准工具调用格式: {model_id}")
+                            return True
+                        
+                        return False
 
             except asyncio.TimeoutError:
                 logger.warning(f"测试超时 ({self.timeout}秒): {model_id}")
@@ -217,7 +224,7 @@ class ToolCapabilityTester:
                             }
                         }],
                         "tool_choice": "auto",
-                        "max_tokens": 10,
+                        "max_tokens": 50,  # 增加max_tokens以确保完整响应
                         "temperature": 0,
                         "stream": True
                     }
@@ -254,6 +261,8 @@ class ToolCapabilityTester:
 
                         # 读取流式响应，检查是否有 tool_calls
                         has_tool_calls = False
+                        accumulated_content = ""  # 累积content内容用于后续检查
+                        
                         async for line in response.content:
                             line = line.decode('utf-8').strip()
                             if line.startswith('data: '):
@@ -268,11 +277,23 @@ class ToolCapabilityTester:
                                     if choices:
                                         delta = choices[0].get("delta", {})
                                         tool_calls = delta.get("tool_calls")
+                                        content = delta.get("content", "")
+                                        
+                                        # 累积content内容
+                                        if content:
+                                            accumulated_content += content
+                                        
                                         if tool_calls and len(tool_calls) > 0:
                                             has_tool_calls = True
                                             break
                                 except json.JSONDecodeError:
                                     continue
+                        
+                        # 如果没有检测到标准tool_calls，检查累积的content是否包含非标准格式
+                        if not has_tool_calls and accumulated_content:
+                            if ToolCallConverter.is_non_standard_format(accumulated_content):
+                                logger.debug(f"检测到非标准工具调用格式（流式）: {model_id}")
+                                has_tool_calls = True
 
                         return has_tool_calls
 

@@ -13,3 +13,4 @@ class ModelConfig:
     weight: int = 1  # 权重，用于负载均衡（可选）
     enabled: bool = True
     quota_period: Optional[str] = None  # 额度刷新周期
+    enable_tool_call_conversion: bool = True  # 是否启用工具调用格式转换

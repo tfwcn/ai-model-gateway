@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Dict, List, Any, Optional
 from ..utils.session import RedisSessionStore
+from ..utils.tool_call_converter import ToolCallConverter
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,26 @@ class ResponsesAdapter:
                 # 返回所有工具调用事件
                 if events:
                     return "".join(events)
+            
+            # 兼容非标准平台：检查content是否包含非标准格式的工具调用
+            if content is not None and isinstance(content, str) and ToolCallConverter.is_non_standard_format(content):
+                logger.debug(f"DEBUG Stream: 检测到非标准工具调用格式")
+                # 转换为标准格式并生成事件
+                converted_tool_calls, _ = ToolCallConverter.convert_to_standard_format(content, [])
+                if converted_tool_calls:
+                    # 为每个转换后的工具调用生成事件
+                    events = []
+                    for tc in converted_tool_calls:
+                        function_info = tc.get("function", {})
+                        tool_call_event = {
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "call_id": tc.get("id", ""),
+                            "name": function_info.get("name", ""),
+                            "arguments": function_info.get("arguments", "{}")
+                        }
+                        events.append(f"event: response.function_call_arguments.delta\ndata: {json.dumps(tool_call_event)}\n\n")
+                    return "".join(events)
                 
         except (json.JSONDecodeError, IndexError, KeyError) as e:
             logger.debug(f"Failed to parse stream event: {event_line[:100]} Error: {e}")
@@ -307,6 +328,17 @@ class ResponsesAdapter:
             message = choices[0]["message"]
             content_text = message.get("content", "")
             tool_calls = message.get("tool_calls") or []
+            
+            # 使用转换器处理非标准格式
+            if not tool_calls and content_text:
+                converted_tool_calls, remaining_content = ToolCallConverter.convert_to_standard_format(
+                    content=content_text,
+                    existing_tool_calls=tool_calls
+                )
+                if converted_tool_calls:
+                    logger.debug(f"检测到非标准工具调用格式，已转换为标准格式")
+                    tool_calls = converted_tool_calls
+                    content_text = remaining_content
             
         new_response_id = f"resp_{uuid.uuid4().hex}"
         
