@@ -9,7 +9,7 @@
 > 
 > **Smart Multi-Platform Free AI Model Gateway** - Auto failover, load balancing, OpenAI-compatible API
 
-💡 **定位说明：** 本项目专注于聚合多个提供 **OpenAI 兼容 API** 的免费模型平台，不提供非 OpenAI 格式的 API 支持。
+💡 **定位说明：** 本项目支持**任何提供 OpenAI 兼容 API** 的平台。内置插件可自动获取 ModelScope、NVIDIA、OpenRouter 的免费模型；其他平台需手动配置模型信息。
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
@@ -189,8 +189,8 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### 其他
 
+- [🗺️ 项目功能清单](docs/ROADMAP.md) - 已实现的功能列表
 - [🔄 迁移指南](docs/MIGRATION_GUIDE.md) - 从旧版配置迁移
-- [🗺️ 路线图](docs/ROADMAP.md) - 未来规划
 
 ---
 
@@ -228,29 +228,6 @@ pytest tests/
 
 ---
 
-## 🗺️ 路线图
-
-查看完整路线图：[📖 ROADMAP.md](docs/ROADMAP.md)
-
-### v1.0 (已完成) ✅
-- [x] 基础故障转移机制
-- [x] 权重负载均衡
-- [x] 插件系统框架
-- [x] Prometheus 监控
-
-### v2.0 (进行中) 🚧
-- [ ] 更多平台支持（Anthropic、Cohere）
-- [ ] 高级缓存策略（分布式 Redis）
-- [ ] Web UI 管理界面
-- [ ] 更细粒度的错误分类
-
-### v3.0 (计划中) 📋
-- [ ] AI 驱动的动态权重调整
-- [ ] 成本优化建议
-- [ ] 企业级 RBAC 权限系统
-
----
-
 ## 📄 许可证
 
 本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
@@ -270,7 +247,6 @@ pytest tests/
 
 ## 📞 联系方式
 
-- 📧 Email: [your-email@example.com](mailto:your-email@example.com)
 - 💬 GitHub Issues: [提交问题](https://github.com/tfwcn/ai-model-gateway/issues)
 - 📖 文档: [完整文档](docs/)
 

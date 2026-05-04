@@ -10,7 +10,7 @@
 > 
 > **智能多平台免费 AI 模型网关服务** - 自动切换、负载均衡、OpenAI 兼容接口
 
-💡 **Positioning:** This project focuses on aggregating multiple free model platforms that provide **OpenAI-compatible APIs**. It does not support non-OpenAI format APIs.
+💡 **Positioning:** This project supports **any platform providing OpenAI-compatible APIs**. Built-in plugins can automatically fetch free models from ModelScope, NVIDIA, and OpenRouter; other platforms require manual model configuration.
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
@@ -540,33 +540,6 @@ flake8 openai_proxy/
 
 ---
 
-## 🗺️ Roadmap
-
-### ✅ v1.0 (Completed)
-
-- ✅ Multi-platform support (ModelScope, OpenRouter, NVIDIA, etc.)
-- ✅ Smart failover and load balancing
-- ✅ Plugin system for dynamic model fetching
-- ✅ Prometheus monitoring metrics
-- ✅ Smart error classification system
-- ✅ Request caching (Memory/Redis)
-
-### 🚧 v2.0 (Planned)
-
-- 🔄 Web UI management interface
-- 🔄 More platform integration (Google Vertex AI, Anthropic, etc.)
-- 🔄 AI-driven model recommendation
-- 🔄 Finer-grained rate limit control
-- 🔄 Distributed deployment support
-
-### 💡 Future Vision
-
-- 🌟 Model performance analysis and auto-optimization
-- 🌟 Multi-language SDK support
-- 🌟 Enterprise features (SSO, audit logs, etc.)
-
----
-
 ## 📄 License
 
 This project uses [MIT License](LICENSE) open source protocol.
@@ -587,7 +560,6 @@ Thanks to the following excellent open source projects:
 
 ## 📞 Contact
 
-- 📧 Email: [your-email@example.com](mailto:your-email@example.com)
 - 💬 GitHub Issues: [Submit Issue](https://github.com/tfwcn/ai-model-gateway/issues)
 - 📖 Documentation: [Full Documentation](docs/)
 

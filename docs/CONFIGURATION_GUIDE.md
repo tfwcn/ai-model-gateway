@@ -2,7 +2,7 @@
 
 详细的 AI Model Gateway 配置说明。
 
-> 💡 **重要提示：** 本项目仅支持提供 **OpenAI 兼容 API** 的平台。所有配置的平台必须支持 OpenAI 格式的 `/v1/chat/completions` 端点。
+> 💡 **重要提示：** 本项目支持**任何提供 OpenAI 兼容 API** 的平台。对于有专用插件的平台（ModelScope、NVIDIA、OpenRouter），可以自动获取免费模型列表；对于其他平台，需要手动配置模型信息。
 
 ## 📋 目录
 
