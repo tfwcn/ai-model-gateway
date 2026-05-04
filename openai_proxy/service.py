@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Dict, List, Any
@@ -10,7 +11,9 @@ from fastapi.responses import StreamingResponse
 
 from openai_proxy.models import ModelConfig
 from openai_proxy.core.config_loader import ConfigLoader
-from openai_proxy.core.model_failover_manager import ModelFailoverManager
+from openai_proxy.model.failover import ModelFailoverManager
+from openai_proxy.adapter.responses import ResponsesAdapter
+from openai_proxy.utils.session import RedisSessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,8 @@ class OpenAIProxyService:
         # 注意：models 将在异步初始化方法中加载
         self.models = None
         self.failover_manager = None
+        self.responses_adapter = None
+        self.session_store = None
 
     async def initialize(self):
         """异步初始化服务
@@ -33,21 +38,37 @@ class OpenAIProxyService:
         3. 爬虫完成后加载完整的配置（包含模型列表）
 
         这样只会加载一次配置，避免重复。
+        
+        如果设置了 SKIP_PLUGIN_SCRAPER 环境变量，则跳过爬虫步骤，直接使用缓存。
         """
-        # 第一步：仅加载平台列表（不加载模型，不会触发插件调用）
-        platforms = await self.config_loader.load_platforms_only()
+        # 检查是否跳过插件爬虫
+        skip_scraper = os.getenv("SKIP_PLUGIN_SCRAPER", "false").lower() == "true"
+        
+        if skip_scraper:
+            logger.info("=" * 60)
+            logger.info("检测到 SKIP_PLUGIN_SCRAPER=true，跳过插件爬虫，直接使用缓存")
+            logger.info("=" * 60)
+            # 直接加载完整配置（会使用缓存的模型列表）
+            self.models = await self.config_loader.load_config()
+        else:
+            # 第一步：仅加载平台列表（不加载模型，不会触发插件调用）
+            platforms = await self.config_loader.load_platforms_only()
 
-        # 第二步：启动所有插件的定时任务调度器（会等待首次爬虫完成）
-        await self._start_plugin_schedulers_for_platforms(platforms)
+            # 第二步：启动所有插件的定时任务调度器（会等待首次爬虫完成）
+            await self._start_plugin_schedulers_for_platforms(platforms)
 
-        # 第三步：爬虫完成后，加载完整配置以获取最新的模型列表
-        logger.info("=" * 60)
-        logger.info("爬虫任务已完成，加载配置以获取最新模型列表")
-        logger.info("=" * 60)
-        self.models = await self.config_loader.load_config()
+            # 第三步：爬虫完成后，加载完整配置以获取最新的模型列表
+            logger.info("=" * 60)
+            logger.info("爬虫任务已完成，加载配置以获取最新模型列表")
+            logger.info("=" * 60)
+            self.models = await self.config_loader.load_config()
 
         # 第四步：初始化故障转移管理器
         self.failover_manager = ModelFailoverManager(self.models)
+        
+        # 第五步：初始化 Responses API 适配器和会话存储
+        self.session_store = RedisSessionStore()
+        self.responses_adapter = ResponsesAdapter(session_store=self.session_store)
 
     async def _start_plugin_schedulers_for_platforms(self, platforms: Dict[str, Any]):
         """
@@ -115,7 +136,10 @@ class OpenAIProxyService:
         """关闭服务"""
         # 停止所有插件的定时任务调度器
         await self._stop_plugin_schedulers()
-        await self.failover_manager.close()
+        if self.failover_manager:
+            await self.failover_manager.close()
+        if self.session_store:
+            await self.session_store.close()
 
     async def _stop_plugin_schedulers(self):
         """停止所有插件的定时任务调度器"""
@@ -244,6 +268,82 @@ class OpenAIProxyService:
                 result = await self.failover_manager.chat_completion_non_stream(request_data)
                 logger.debug("DEBUG: 返回普通响应")
                 return result
+
+        @app.post("/v1/responses")
+        async def responses_create(request: Request):
+            """
+            OpenAI Responses API 兼容接口 - 自动转换为 Chat Completions API
+            """
+            try:
+                responses_payload = await request.json()
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+            # 1. 转换请求体 (Responses -> Chat)
+            chat_payload = await self.responses_adapter.convert_request(responses_payload)
+            
+            is_stream = chat_payload.get("stream", False)
+            
+            if is_stream:
+                async def stream_generator():
+                    try:
+                        # 2. 调用上游 Chat API
+                        upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
+                        
+                        # 3. 转换流式事件并转发
+                        async for chunk in upstream_stream:
+                            if chunk:
+                                try:
+                                    chunk_str = chunk.decode('utf-8', errors='replace')
+                                    for line in chunk_str.splitlines():
+                                        if line.strip():
+                                            converted_line = self.responses_adapter.convert_stream_event(line)
+                                            if converted_line:
+                                                yield converted_line.encode('utf-8')
+                                except Exception as e:
+                                    logger.error(f"Stream conversion error: {e}")
+                    except Exception as e:
+                        logger.error(f"Upstream stream error: {e}")
+                        
+                return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            else:
+                # 非流式处理逻辑
+                chat_response = await self.failover_manager.chat_completion_non_stream(chat_payload)
+                
+                # 1. 包装响应对象
+                response_obj, new_id = self.responses_adapter.build_response_object(chat_response, responses_payload)
+                
+                # 2. 更新会话状态 (将当前请求和回复存入 Redis)
+                # 提取当前请求的 input 转换为 messages
+                current_messages = self.responses_adapter._convert_input_to_messages(responses_payload.get("input", []))
+                if responses_payload.get("instructions"):
+                    current_messages.insert(0, {"role": "system", "content": responses_payload["instructions"]})
+                
+                # 构造完整的对话历史并保存
+                history = await self.session_store.get_history(responses_payload.get("previous_response_id", "")) if responses_payload.get("previous_response_id") else []
+                
+                # 提取助手响应内容（支持message和function_call类型）
+                assistant_message = {"role": "assistant"}
+                if response_obj["output"] and len(response_obj["output"]) > 0:
+                    first_output = response_obj["output"][0]
+                    if first_output.get("type") == "message" and first_output.get("content"):
+                        # 文本消息
+                        assistant_message["content"] = first_output["content"][0].get("text", "")
+                    elif first_output.get("type") == "function_call":
+                        # 工具调用：存储为特殊格式
+                        assistant_message["tool_calls"] = [{
+                            "id": first_output.get("call_id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": first_output.get("name", ""),
+                                "arguments": first_output.get("arguments", "{}")
+                            }
+                        }]
+                
+                full_history = history + current_messages + [assistant_message]
+                await self.session_store.save_session(new_id, full_history)
+                
+                return response_obj
 
         @app.get("/health")
         async def health_check():

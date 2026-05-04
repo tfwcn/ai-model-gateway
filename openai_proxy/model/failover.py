@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from openai_proxy.models import ModelConfig
-from openai_proxy.core.model_state_manager import ModelStateManager
+from openai_proxy.model.state import ModelStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -59,29 +59,51 @@ class ModelFailoverManager:
             if not isinstance(first_choice, dict):
                 return False
 
-            # 对于普通响应，检查 message.content
+            # 对于普通响应，检查 message.content 或 message.tool_calls
             if "message" in first_choice:
                 message = first_choice["message"]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-                    # content 必须是非None值，如果是字符串则不能是空字符串
-                    if content is not None:
-                        if isinstance(content, str):
-                            return len(content.strip()) > 0
-                        else:
-                            return True  # 非字符串类型（如数字、布尔值等）认为有效
+                if isinstance(message, dict):
+                    # 检查 tool_calls（工具调用也是有效响应，优先级最高）
+                    if "tool_calls" in message and message["tool_calls"]:
+                        return True
+                    
+                    # 检查 content
+                    if "content" in message:
+                        content = message["content"]
+                        # content 必须是非None值，如果是字符串则不能是空字符串
+                        if content is not None:
+                            if isinstance(content, str):
+                                if len(content.strip()) > 0:
+                                    return True
+                            else:
+                                return True  # 非字符串类型（如数字、布尔值等）认为有效
+                    
+                    # 检查 reasoning_content（某些模型如 minimax 使用此字段）
+                    if "reasoning_content" in message:
+                        reasoning_content = message["reasoning_content"]
+                        if reasoning_content is not None:
+                            if isinstance(reasoning_content, str):
+                                return len(reasoning_content.strip()) > 0
+                            else:
+                                return True
 
-            # 对于流式响应的 chunk，检查 delta.content
+            # 对于流式响应的 chunk，检查 delta.content 或 delta.tool_calls
             if "delta" in first_choice:
                 delta = first_choice["delta"]
-                if isinstance(delta, dict) and "content" in delta:
-                    content = delta["content"]
-                    # content 必须是非None值，如果是字符串则不能是空字符串
-                    if content is not None:
-                        if isinstance(content, str):
-                            return len(content.strip()) > 0
-                        else:
-                            return True  # 非字符串类型认为有效
+                if isinstance(delta, dict):
+                    # 检查 content
+                    if "content" in delta:
+                        content = delta["content"]
+                        # content 必须是非None值，如果是字符串则不能是空字符串
+                        if content is not None:
+                            if isinstance(content, str):
+                                return len(content.strip()) > 0
+                            else:
+                                return True  # 非字符串类型认为有效
+                    
+                    # 检查 tool_calls（工具调用也是有效响应）
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        return True
 
             # 如果既没有 message 也没有 delta，或者没有 content 字段
             return False
@@ -269,6 +291,25 @@ class ModelFailoverManager:
                 if response.status == 200:
                     result = await response.json()
                     logger.debug(f"DEBUG: 模型 {model_config.name} 返回成功响应")
+
+                    # 确保响应中包含 usage 字段，如果缺失则添加默认值
+                    if "usage" not in result or result["usage"] is None:
+                        result["usage"] = {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0
+                        }
+                    else:
+                        # 确保 usage 中的 token 字段不为 null
+                        if result["usage"].get("prompt_tokens") is None:
+                            result["usage"]["prompt_tokens"] = 0
+                        if result["usage"].get("completion_tokens") is None:
+                            result["usage"]["completion_tokens"] = 0
+                        if result["usage"].get("total_tokens") is None:
+                            result["usage"]["total_tokens"] = (
+                                result["usage"].get("prompt_tokens", 0) +
+                                result["usage"].get("completion_tokens", 0)
+                            )
 
                     # 检查响应中是否包含 content 字段
                     if self._has_valid_content(result):

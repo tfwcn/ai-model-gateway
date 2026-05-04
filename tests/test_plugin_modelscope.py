@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['MODELSCOPE_API_KEY'] = 'test_modelscope_key'
 
 from plugin.modelscope import ModelScopePlugin, ModelScopeModel
-from openai_proxy.core.error_classifier import ErrorType
+from openai_proxy.utils.error_classifier import ErrorType
 
 
 class TestModelScopePluginInit:

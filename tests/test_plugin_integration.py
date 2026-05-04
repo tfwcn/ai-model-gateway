@@ -231,7 +231,7 @@ class TestEndToEnd:
     async def test_full_plugin_workflow(self):
         """测试完整插件工作流"""
         from openai_proxy.core.config_loader import ConfigLoader
-        from openai_proxy.core.model_failover_manager import ModelFailoverManager
+        from openai_proxy.model.failover import ModelFailoverManager
 
         config_data = {
             'openrouter': {
@@ -263,7 +263,7 @@ class TestEndToEnd:
     async def test_multi_platform_integration(self):
         """测试多平台集成"""
         from openai_proxy.core.config_loader import ConfigLoader
-        from openai_proxy.core.model_failover_manager import ModelFailoverManager
+        from openai_proxy.model.failover import ModelFailoverManager
 
         config_data = {
             'openrouter': {

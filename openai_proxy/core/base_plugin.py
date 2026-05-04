@@ -21,6 +21,7 @@ class BasePlugin(ABC):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         cache_ttl: int = 300,
+        plugin_config: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
         """
@@ -30,7 +31,8 @@ class BasePlugin(ABC):
             api_key: API 密钥，如果为 None 则从环境变量获取
             base_url: API 基础URL
             cache_ttl: 缓存有效期（秒），默认300秒（5分钟）
-            **kwargs: 其他插件特定参数
+            plugin_config: 插件配置字典，包含 args 等配置项
+            **kwargs: 其他插件特定参数（保留用于向后兼容）
         """
         self.api_key = api_key
         self.base_url = base_url
@@ -38,8 +40,9 @@ class BasePlugin(ABC):
         self.models_cache: List[Any] = []
         self.last_cache_time = 0
         
-        # 存储插件特定配置
-        self.plugin_config: Dict[str, Any] = kwargs.copy()
+        # 存储插件配置并预解析 args
+        self.plugin_config = plugin_config or {}
+        self._plugin_args = self.plugin_config.get('args', {})
         
         # 解析环境变量（如果存在）
         if self.api_key and isinstance(self.api_key, str):
@@ -47,6 +50,30 @@ class BasePlugin(ABC):
         if self.base_url and isinstance(self.base_url, str):
             self.base_url = self.resolve_env_vars(self.base_url)
             
+    def get_plugin_arg(self, key: str, default=None) -> Any:
+        """
+        统一获取插件参数的方法
+        
+        从预解析的 _plugin_args 中获取指定键的值。
+        
+        Args:
+            key: 参数键名
+            default: 默认值，当键不存在时返回
+            
+        Returns:
+            参数值或默认值
+        """
+        return self._plugin_args.get(key, default)
+    
+    def get_plugin_args(self) -> Dict[str, Any]:
+        """
+        获取所有插件参数的副本
+        
+        Returns:
+            插件参数字典的副本
+        """
+        return self._plugin_args.copy()
+    
     @staticmethod
     def resolve_env_vars(value: Union[str, Any]) -> Union[str, Any]:
         """

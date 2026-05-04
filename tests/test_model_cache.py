@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from openai_proxy.core.model_cache import ModelCacheManager
+from openai_proxy.model.cache import ModelCacheManager
 
 
 class TestModelCacheManager:

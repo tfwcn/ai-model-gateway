@@ -1,7 +1,7 @@
 """
-NVIDIA免费模型专用爬虫
+ModelScope免费模型专用爬虫
 
-从build.nvidia.com抓取免费预览模型列表。
+从modelscope.cn/models页面抓取热门免费模型列表。
 """
 
 import asyncio
@@ -9,21 +9,21 @@ import logging
 from typing import Any, Dict, List, Optional
 from playwright.async_api import Page
 
-from openai_proxy.core.web_scraper import WebScraper
+from openai_proxy.scraper.base import WebScraper
 
 logger = logging.getLogger(__name__)
 
 
-class NVIDIAModelScraper(WebScraper):
+class ModelScopeModelScraper(WebScraper):
     """
-    NVIDIA免费模型专用爬虫
+    ModelScope免费模型专用爬虫
 
-    从build.nvidia.com页面提取免费模型（需要处理JS渲染）
+    从modelscope.cn/models页面提取热门免费模型（需要处理JS渲染）
 
     使用示例:
-        scraper = NVIDIAModelScraper(
-            scrape_url="https://build.nvidia.com/models?filters=nimType%3Anim_type_preview",
-            free_model_count=10,
+        scraper = ModelScopeModelScraper(
+            scrape_url="https://www.modelscope.cn/models?filter=inference_type&page=1&sort=default&tabKey=task",
+            max_models=50,
             timeout=60,
             headless=True
         )
@@ -33,20 +33,20 @@ class NVIDIAModelScraper(WebScraper):
     def __init__(
         self,
         scrape_url: str,
-        free_model_count: int = 10,
+        max_models: int = 50,
         **kwargs
     ):
         """
-        初始化NVIDIA模型爬虫
+        初始化ModelScope模型爬虫
 
         Args:
             scrape_url: 爬虫目标URL（必填）
-            free_model_count: 返回的免费模型数量，默认10
+            max_models: 返回的最大模型数量，默认50
             **kwargs: 传递给父类WebScraper的参数
         """
         super().__init__(url=scrape_url, **kwargs)
 
-        self.free_model_count = free_model_count
+        self.max_models = max_models
         self.scrape_url = scrape_url
 
     async def extract_data(self, page: Page) -> List[Dict[str, Any]]:
@@ -63,7 +63,7 @@ class NVIDIAModelScraper(WebScraper):
 
     async def _extract_from_webpage(self, page: Page) -> List[Dict[str, Any]]:
         """
-        从网页提取模型数据（通过DOM解析）
+        从网页提取模型数据（通过DOM解析和JavaScript评估）
 
         Args:
             page: Playwright页面对象
@@ -71,52 +71,29 @@ class NVIDIAModelScraper(WebScraper):
         Returns:
             免费模型列表（按人气排序）
         """
-        logger.info("从网页提取模型数据...")
+        logger.info("从ModelScope网页提取模型数据...")
 
         try:
-            # 等待页面加载完成
-            await page.wait_for_load_state('domcontentloaded', timeout=self.timeout)
-            await asyncio.sleep(3)  # 等待动态内容渲染
+            # 页面已经在 WebScraper.load_page() 中加载完成
+            # ModelScope 页面需要更多时间加载动态内容
+            logger.info("等待AJAX请求完成 (10秒)...")
+            await asyncio.sleep(10)
 
-            # 从页面链接中提取所有模型ID
-            models_data = await page.evaluate("""
-                () => {
-                    const modelSet = new Set();
-                    const models = [];
+            logger.info("开始提取数据...")
 
-                    // 从所有链接中提取模型ID
-                    const links = document.querySelectorAll('a[href]');
-                    links.forEach(link => {
-                        const href = link.getAttribute('href');
-                        // 匹配 /publisher/model-name 模式
-                        const match = href.match(/^\\/([^\\/]+)\\/([^\\/\\?]+)/);
-                        if (match) {
-                            const publisher = match[1];
-                            const modelName = match[2];
+            # 尝试多种方法提取模型数据
+            models_data = None
 
-                            // 排除非模型路径
-                            const excludePaths = ['explore', 'blueprints', 'models', 'api',
-                                                'community', '_next', 'chat', 'image',
-                                                'video', 'audio', 'embeddings'];
+            # 方法1: 尝试从页面脚本中提取嵌入的JSON数据
+            models_data = await self._extract_embedded_json(page)
 
-                            if (!excludePaths.includes(publisher)) {
-                                const modelId = `${publisher}/${modelName}`;
-                                if (!modelSet.has(modelId)) {
-                                    modelSet.add(modelId);
-                                    models.push({
-                                        model_id: modelId,
-                                        model_name: modelName,
-                                        owner: publisher,
-                                        rank: models.length + 1
-                                    });
-                                }
-                            }
-                        }
-                    });
+            # 方法2: 如果方法1失败，尝试从DOM元素中提取
+            if not models_data:
+                models_data = await self._parse_dom_elements(page)
 
-                    return models;
-                }
-            """)
+            # 方法3: 如果都失败，尝试从链接中提取
+            if not models_data:
+                models_data = await self._extract_from_links(page)
 
             if not models_data:
                 logger.warning("未能从页面提取到模型数据")
@@ -133,13 +110,6 @@ class NVIDIAModelScraper(WebScraper):
         except Exception as e:
             logger.error(f"网页提取失败: {e}", exc_info=True)
             return []
-
-    async def _intercept_api_calls(self, page: Page) -> Optional[List[Dict]]:
-        """拦截页面的API调用以获取模型数据"""
-        # 注意：这个方法需要在load_page之前设置路由拦截
-        # 由于架构限制，这里简化处理，实际使用时可能需要调整
-        logger.debug("API拦截策略：需要在页面加载前设置路由")
-        return None
 
     async def _extract_embedded_json(self, page: Page) -> Optional[List[Dict]]:
         """从页面嵌入的JSON脚本中提取数据"""
@@ -177,12 +147,14 @@ class NVIDIAModelScraper(WebScraper):
     async def _parse_dom_elements(self, page: Page) -> Optional[List[Dict]]:
         """通过DOM解析提取模型卡片信息"""
         try:
-            # 尝试多种选择器
+            # 尝试多种选择器来定位模型卡片
             selectors = [
                 "[data-testid*='model-card']",
                 ".model-card",
                 "article[role='article']",
                 "[class*='ModelCard']",
+                "[class*='model-card']",
+                "div[class*='card']",
             ]
 
             models = []
@@ -205,43 +177,126 @@ class NVIDIAModelScraper(WebScraper):
             logger.debug(f"DOM解析失败: {e}")
             return None
 
+    async def _extract_from_links(self, page: Page) -> Optional[List[Dict]]:
+        """从页面链接中提取模型ID（优化版）"""
+        try:
+            # 直接使用CSS选择器过滤，减少JavaScript处理的数据量
+            models_data = await page.evaluate("""
+                () => {
+                    const modelSet = new Set();
+                    const models = [];
+
+                    // 只获取包含 /models/ 的链接，减少遍历数量
+                    const links = document.querySelectorAll('a[href*="/models/"]');
+
+                    for (let i = 0; i < links.length; i++) {
+                        const href = links[i].getAttribute('href');
+                        if (!href) continue;
+
+                        // 匹配 /models/{organization}/{model-name} 模式
+                        const match = href.match(/^\\/models\\/([^\\/]+)\\/([^\\/\\?]+)/);
+                        if (!match) continue;
+
+                        const organization = match[1];
+                        const modelName = match[2];
+                        const modelId = `${organization}/${modelName}`;
+
+                        // 排除非模型路径
+                        if (organization === 'explore' || organization === 'playground' ||
+                            organization === 'docs' || organization === 'api' ||
+                            organization === 'community' || organization === '_next' ||
+                            organization === 'chat' || organization === 'image' ||
+                            organization === 'video' || organization === 'audio' ||
+                            organization === 'embeddings' || organization === 'pricing' ||
+                            organization === 'labs' || organization === 'rankings' ||
+                            organization === 'apps' || organization === 'enterprise' ||
+                            organization === 'compare') {
+                            continue;
+                        }
+
+                        if (modelName.startsWith('_')) continue;
+
+                        if (!modelSet.has(modelId)) {
+                            modelSet.add(modelId);
+                            models.push({
+                                model_id: modelId,
+                                model_name: modelName,
+                                organization: organization,
+                                rank: models.length + 1
+                            });
+
+                            // 限制最大数量，避免处理过多数据
+                            if (models.length >= 100) break;
+                        }
+                    }
+
+                    return models;
+                }
+            """)
+
+            return models_data if models_data else None
+
+        except Exception as e:
+            logger.debug(f"链接提取失败: {e}")
+            return None
+
     async def _extract_model_from_card(self, card_element, rank: int) -> Optional[Dict]:
         """从单个模型卡片元素提取信息"""
         try:
             # 尝试提取模型ID（通常在链接或data属性中）
-            model_id = await card_element.evaluate("""
+            model_info = await card_element.evaluate("""
                 (el) => {
-                    // 尝试从各种位置提取模型ID
+                    let modelId = null;
+                    let modelName = null;
+                    let organization = null;
+
+                    // 尝试从链接提取模型ID
                     const link = el.querySelector('a[href*="/models/"]');
                     if (link) {
                         const href = link.getAttribute('href');
-                        const match = href.match(/\\/models\\/([^\\/]+)/);
-                        if (match) return match[1];
+                        const match = href.match(/^\\/models\\/([^\\/]+)\\/([^\\/\\?]+)/);
+                        if (match) {
+                            organization = match[1];
+                            const modelNameFromUrl = match[2];
+                            modelId = `${organization}/${modelNameFromUrl}`;
+                            modelName = modelNameFromUrl;
+                        }
                     }
 
-                    // 尝试从data属性
-                    return el.getAttribute('data-model-id') ||
-                           el.getAttribute('data-testid') ||
-                           el.querySelector('[data-model-id]')?.getAttribute('data-model-id');
+                    // 尝试从 data 属性
+                    if (!modelId) {
+                        modelId = el.getAttribute('data-model-id') ||
+                                 el.getAttribute('data-testid') ||
+                                 el.querySelector('[data-model-id]')?.getAttribute('data-model-id');
+                    }
+
+                    // 提取模型名称（优先使用页面显示的名称）
+                    if (!modelName) {
+                        const title = el.querySelector('h1, h2, h3, h4, [class*="title"], [class*="name"]');
+                        if (title) {
+                            modelName = title.textContent.trim();
+                        }
+                    }
+
+                    if (!modelName && modelId) {
+                        modelName = modelId;
+                    }
+
+                    return {
+                        model_id: modelId,
+                        model_name: modelName,
+                        organization: organization
+                    };
                 }
             """)
 
-            if not model_id:
+            if not model_info or not model_info.get('model_id'):
                 return None
 
-            # 提取模型名称
-            model_name = await card_element.evaluate("""
-                (el) => {
-                    // 尝试从标题元素提取
-                    const title = el.querySelector('h1, h2, h3, [class*="title"], [class*="name"]');
-                    return title ? title.textContent.trim() : null;
-                }
-            """)
-
             return {
-                "model_id": model_id,
-                "model_name": model_name or model_id,
-                "owner": model_id.split("/")[0] if "/" in model_id else "unknown",
+                "model_id": model_info['model_id'],
+                "model_name": model_info['model_name'] or model_info['model_id'],
+                "organization": model_info.get('organization'),
                 "rank": rank
             }
 
@@ -271,7 +326,7 @@ class NVIDIAModelScraper(WebScraper):
 
                 elif isinstance(obj, list):
                     # 检查列表中的元素是否是模型对象
-                    if obj and isinstance(obj[0], dict) and 'id' in obj[0]:
+                    if obj and isinstance(obj[0], dict) and ('id' in obj[0] or 'slug' in obj[0]):
                         return obj
 
                     # 递归搜索
@@ -287,13 +342,12 @@ class NVIDIAModelScraper(WebScraper):
                 # 转换为标准格式
                 return [
                     {
-                        "model_id": m.get("id"),
-                        "model_name": m.get("name") or m.get("id"),
-                        "owner": m.get("id", "").split("/")[0] if m.get("id") else "unknown",
+                        "model_id": m.get("id") or m.get("slug"),
+                        "model_name": m.get("name") or m.get("id") or m.get("slug"),
                         "rank": i + 1
                     }
                     for i, m in enumerate(models_list)
-                    if m.get("id")
+                    if m.get("id") or m.get("slug")
                 ]
 
             return None
@@ -327,11 +381,6 @@ class NVIDIAModelScraper(WebScraper):
             if model_id in seen_ids:
                 continue
 
-            # 验证ID格式（应包含 `/`）
-            if "/" not in model_id:
-                logger.warning(f"跳过无效模型ID: {model_id}")
-                continue
-
             seen_ids.add(model_id)
             validated_models.append(model)
 
@@ -339,7 +388,7 @@ class NVIDIAModelScraper(WebScraper):
         validated_models.sort(key=lambda x: x.get("rank", 999999))
 
         # 3. 截取指定数量
-        result = validated_models[:self.free_model_count]
+        result = validated_models[:self.max_models]
 
         logger.info(f"处理后返回 {len(result)} 个模型（总共 {len(validated_models)} 个）")
 

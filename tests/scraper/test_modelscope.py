@@ -9,7 +9,7 @@ import sys
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from openai_proxy.core.modelscope_scraper import ModelScopeModelScraper
+from openai_proxy.scraper.modelscope import ModelScopeModelScraper
 
 
 class TestModelScopeModelScraperInit:

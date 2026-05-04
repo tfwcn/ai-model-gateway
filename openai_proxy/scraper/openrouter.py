@@ -9,7 +9,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from playwright.async_api import Page
 
-from openai_proxy.core.web_scraper import WebScraper
+from openai_proxy.scraper.base import WebScraper
 
 logger = logging.getLogger(__name__)
 

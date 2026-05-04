@@ -11,8 +11,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 
-from openai_proxy.core.nvidia_scraper import NVIDIAModelScraper
-from openai_proxy.core.model_cache import ModelCacheManager
+from openai_proxy.scraper.nvidia import NVIDIAModelScraper
+from openai_proxy.model.cache import ModelCacheManager
 from plugin.nvidia import NVIDIAPlugin
 
 

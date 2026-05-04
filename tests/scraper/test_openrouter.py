@@ -5,7 +5,7 @@ OpenRouter 爬虫测试
 import asyncio
 import logging
 import pytest
-from openai_proxy.core.openrouter_scraper import OpenRouterModelScraper
+from openai_proxy.scraper.openrouter import OpenRouterModelScraper
 
 # 配置日志
 logging.basicConfig(

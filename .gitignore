@@ -1,5 +1,6 @@
 models.yaml
 venv/
+.venv/
 .env
 .env.local
 .env.*.local

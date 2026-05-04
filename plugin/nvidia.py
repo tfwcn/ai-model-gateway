@@ -8,12 +8,15 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import json
 import time
+from datetime import datetime, timezone
 
-from openai_proxy.core.error_classifier import ErrorClassifier, ErrorType
+from openai_proxy.utils.error_classifier import ErrorClassifier, ErrorType
 from openai_proxy.core.base_plugin import BasePlugin
-from openai_proxy.core.nvidia_scraper import NVIDIAModelScraper
-from openai_proxy.core.model_cache import ModelCacheManager
-from openai_proxy.core.scheduled_scraper import ScheduledScraper
+from openai_proxy.scraper.nvidia import NVIDIAModelScraper
+from openai_proxy.model.cache import ModelCacheManager
+from openai_proxy.scraper.scheduled import ScheduledScraper
+from openai_proxy.model.capability.cache import CapabilityCacheManager
+from openai_proxy.model.capability.tester import ToolCapabilityTester
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ class NVIDIAPlugin(BasePlugin):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         cache_ttl: int = 3600,
+        plugin_config: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
         """
@@ -48,7 +52,8 @@ class NVIDIAPlugin(BasePlugin):
             api_key: API 密钥，如果为 None 则从环境变量获取
             base_url: API 基础URL，如果为 None 则使用默认值
             cache_ttl: 缓存有效期（秒），默认3600秒（1小时）
-            **kwargs: 其他插件特定参数，包括爬虫配置
+            plugin_config: 插件配置字典，包含 args 等配置项
+            **kwargs: 其他插件特定参数（保留用于向后兼容）
         """
         # 设置默认值
         if base_url is None:
@@ -59,30 +64,46 @@ class NVIDIAPlugin(BasePlugin):
             api_key=api_key or os.getenv("NVIDIA_API_KEY"),
             base_url=base_url,
             cache_ttl=cache_ttl,
+            plugin_config=plugin_config,
             **kwargs
         )
 
         if not self.api_key:
             logger.warning("NVIDIA API 密钥未配置，插件将无法工作")
 
-        # 解析爬虫配置
-        plugin_config = kwargs.get('plugin_config', {})
-        scraper_args = plugin_config.get('args', {})
-
-        # 爬虫配置参数
-        self.free_model_count = scraper_args.get('free_model_count', 10)
-        self.cache_file = scraper_args.get('cache_file', 'data/nvidia_free_models.json')
-        self.scraper_timeout = scraper_args.get('scraper_timeout', 60)
-        self.headless = scraper_args.get('headless', True)
-        self.schedule_cron = scraper_args.get('schedule_cron', '0 2 * * *')
-        self.enable_scheduled_task = scraper_args.get('enable_scheduled_task', True)
-        self.scrape_url = scraper_args.get('scrape_url', None)  # 可选的自定义爬虫URL
+        # 爬虫配置参数 - 使用统一的 get_plugin_arg 方法
+        self.free_model_count = self.get_plugin_arg('free_model_count', 10)
+        self.cache_file = self.get_plugin_arg('cache_file', 'data/nvidia_free_models.json')
+        self.scraper_timeout = self.get_plugin_arg('scraper_timeout', 60)
+        self.headless = self.get_plugin_arg('headless', True)
+        self.schedule_cron = self.get_plugin_arg('schedule_cron', '0 2 * * *')
+        self.enable_scheduled_task = self.get_plugin_arg('enable_scheduled_task', True)
+        self.scrape_url = self.get_plugin_arg('scrape_url', None)  # 可选的自定义爬虫URL
 
         # 验证和修正配置参数
         self._validate_scraper_config()
 
+        # 工具调用能力测试配置 - 使用统一的 get_plugin_arg 方法
+        self.enable_tool_capability_test = self.get_plugin_arg('enable_tool_capability_test', True)
+        self.max_concurrent_tests = self.get_plugin_arg('max_concurrent_tests', 10)
+        self.test_timeout_seconds = self.get_plugin_arg('test_timeout_seconds', 5)
+
         # 初始化缓存管理器
         self.cache_manager = ModelCacheManager(cache_file=self.cache_file)
+        
+        # 初始化工具调用能力缓存管理器
+        self.capability_cache = CapabilityCacheManager(cache_file="data/tool_capability.json")
+        
+        # 初始化工具调用能力测试器
+        if self.api_key:
+            self.capability_tester = ToolCapabilityTester(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.test_timeout_seconds
+            )
+        else:
+            self.capability_tester = None
+            logger.warning("API 密钥未配置，工具调用能力测试将不可用")
 
         # 初始化爬虫和调度器（始终启用）
         self.scraper: Optional[NVIDIAModelScraper] = None
@@ -287,13 +308,37 @@ class NVIDIAPlugin(BasePlugin):
 
         # 检查是否已完成首次爬虫
         if not self.initial_scrape_completed:
-            logger.warning("首次爬虫任务尚未完成，返回空模型列表。这不应该发生，请检查启动日志。")
+            logger.warning("首次爬虫任务尚未完成，尝试从缓存加载模型...")
+            # 尝试从文件缓存加载（作为降级方案）
+            if self.cache_manager.is_valid():
+                try:
+                    cache_data = self.cache_manager.load()
+                    if cache_data and cache_data.get('models'):
+                        cached_models = cache_data['models']
+                        logger.info(f"✓ 从文件缓存加载 {len(cached_models)} 个免费模型")
+
+                        # 转换为 NVIDIAModel 对象
+                        models = [
+                            NVIDIAModel(
+                                model_id=m['model_id'],
+                                model_name=m.get('model_name', m['model_id']),
+                                capabilities=["text"]
+                            )
+                            for m in cached_models
+                        ]
+                        # 应用能力过滤
+                        return await self._filter_by_capability(models)
+                except Exception as e:
+                    logger.error(f"从缓存加载模型失败: {e}")
+            
+            logger.warning("缓存中没有可用模型，返回空列表")
             return []
 
         # 从内存缓存获取模型（爬虫完成后已更新到内存）
         if self.models_cache and self.is_cache_valid():
             logger.debug(f"从内存缓存返回 {len(self.models_cache)} 个模型")
-            return self.models_cache
+            # 应用能力过滤
+            return await self._filter_by_capability(self.models_cache)
 
         # 如果内存缓存不可用，尝试从文件缓存加载（作为降级方案）
         if self.cache_manager.is_valid():
@@ -315,13 +360,92 @@ class NVIDIAPlugin(BasePlugin):
 
                     # 更新内部缓存
                     self.update_cache(models)
-                    return models
+                    # 应用能力过滤
+                    return await self._filter_by_capability(models)
             except Exception as e:
                 logger.warning(f"从文件缓存加载失败: {e}")
 
         # 最后的降级方案：返回空列表
         logger.warning("无法获取模型列表，返回空列表")
         return []
+
+    async def _filter_by_capability(self, models: List[NVIDIAModel]) -> List[NVIDIAModel]:
+        """
+        根据工具调用能力过滤模型列表
+
+        Args:
+            models: 原始模型列表
+
+        Returns:
+            过滤后的模型列表（只包含支持工具调用的模型）
+        """
+        # 如果禁用能力测试，返回所有模型
+        if not self.enable_tool_capability_test:
+            logger.debug("工具调用能力测试已禁用，返回所有模型")
+            return models
+
+        # 如果没有测试器，返回所有模型并记录警告
+        if not self.capability_tester:
+            logger.warning("能力测试器未初始化，跳过能力测试")
+            return models
+
+        if not models:
+            return models
+
+        logger.info(f"开始对 {len(models)} 个 NVIDIA 模型进行工具调用能力测试")
+
+        # 提取模型 ID 列表
+        model_ids = [m.model_id for m in models]
+
+        # 加载现有缓存
+        cache_data = self.capability_cache.load() or {"models": {}}
+        cached_capabilities = cache_data.get("models", {})
+
+        # 识别需要测试的模型（不在缓存中的）
+        untested_model_ids = [mid for mid in model_ids if mid not in cached_capabilities]
+
+        if untested_model_ids:
+            logger.info(f"发现 {len(untested_model_ids)} 个未测试的模型，开始测试...")
+
+            # 并行测试新模型
+            new_results = await self.capability_tester.test_models_concurrently(
+                models=untested_model_ids,
+                max_concurrent=self.max_concurrent_tests,
+                platform="nvidia"
+            )
+
+            # 构建新的能力数据
+            new_capabilities = {}
+            for model_id, supports_tools in new_results.items():
+                new_capabilities[model_id] = {
+                    "supports_tools": supports_tools,
+                    "tested_at": datetime.now(timezone.utc).isoformat(),
+                    "platform": "nvidia"
+                }
+
+            # 保存新结果到缓存
+            if new_capabilities:
+                self.capability_cache.save(new_capabilities, platform="nvidia")
+
+            # 合并缓存
+            cached_capabilities.update(new_capabilities)
+        else:
+            logger.debug(f"所有 {len(model_ids)} 个模型都已在缓存中，跳过测试")
+
+        # 过滤模型：只保留支持工具调用的
+        filtered_models = []
+        for model in models:
+            capability = cached_capabilities.get(model.model_id)
+            if capability and capability.get("supports_tools"):
+                filtered_models.append(model)
+            else:
+                logger.debug(f"过滤掉模型: {model.model_id} (不支持工具调用或未测试)")
+
+        logger.info(
+            f"能力测试完成: {len(filtered_models)}/{len(models)} 个 NVIDIA 模型支持工具调用"
+        )
+
+        return filtered_models
 
     async def parse_error(self, response_data: Any) -> ErrorType:
         """

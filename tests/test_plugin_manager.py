@@ -78,9 +78,10 @@ class TestPluginManagerLoadPluginModels:
 
         # 创建一个简单的 mock 插件类
         class MockPlugin:
-            def __init__(self, api_key=None, cache_ttl=300):
+            def __init__(self, api_key=None, cache_ttl=300, plugin_config=None):
                 self.api_key = api_key
                 self.cache_ttl = cache_ttl
+                self.plugin_config = plugin_config or {}
             
             async def get_models(self, config):
                 return ['model1:free', 'model2:free']
@@ -163,7 +164,7 @@ class TestPluginManagerLoadPluginModels:
         }
 
         class MockPlugin:
-            def __init__(self, api_key=None, cache_ttl=300):
+            def __init__(self, api_key=None, cache_ttl=300, plugin_config=None):
                 pass
             
             async def get_models(self, config):
@@ -200,7 +201,7 @@ class TestPluginManagerLoadPluginModels:
         }
 
         class MockPlugin:
-            def __init__(self, api_key=None, cache_ttl=300):
+            def __init__(self, api_key=None, cache_ttl=300, plugin_config=None):
                 pass
             
             async def get_models(self, config):
@@ -237,7 +238,7 @@ class TestPluginManagerLoadPluginModels:
         captured_cache_ttl = []
         
         class MockPlugin:
-            def __init__(self, api_key=None, cache_ttl=300):
+            def __init__(self, api_key=None, cache_ttl=300, plugin_config=None):
                 captured_cache_ttl.append(cache_ttl)
             
             async def get_models(self, config):
@@ -274,7 +275,7 @@ class TestPluginManagerLoadPluginModels:
         captured_cache_ttl = []
         
         class MockPlugin:
-            def __init__(self, api_key=None, cache_ttl=300):
+            def __init__(self, api_key=None, cache_ttl=300, plugin_config=None):
                 captured_cache_ttl.append(cache_ttl)
             
             async def get_models(self, config):

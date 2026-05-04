@@ -5,12 +5,15 @@ import os
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import time
+from datetime import datetime, timezone
 
-from openai_proxy.core.error_classifier import ErrorClassifier, ErrorType
+from openai_proxy.utils.error_classifier import ErrorClassifier, ErrorType
 from openai_proxy.core.base_plugin import BasePlugin
-from openai_proxy.core.openrouter_scraper import OpenRouterModelScraper
-from openai_proxy.core.model_cache import ModelCacheManager
-from openai_proxy.core.scheduled_scraper import ScheduledScraper
+from openai_proxy.scraper.openrouter import OpenRouterModelScraper
+from openai_proxy.model.cache import ModelCacheManager
+from openai_proxy.scraper.scheduled import ScheduledScraper
+from openai_proxy.model.capability.cache import CapabilityCacheManager
+from openai_proxy.model.capability.tester import ToolCapabilityTester
 
 logger = logging.getLogger(__name__)
 
@@ -61,41 +64,50 @@ class OpenRouterPlugin(BasePlugin):
         if base_url is None:
             base_url = "https://openrouter.ai/api"
 
-        # 如果提供了 plugin_config，从中提取参数
-        if plugin_config:
-            args = plugin_config.get('args', {})
-            scrape_url = scrape_url or args.get('scrape_url')
-            # 只有当参数为默认值时才从 config 中获取
-            if max_models == 50 and 'max_models' in args:
-                max_models = args['max_models']
-            if scraper_timeout == 60 and 'scraper_timeout' in args:
-                scraper_timeout = args['scraper_timeout']
-            headless = args.get('headless', headless)
-
         # 调用父类初始化
         super().__init__(
             api_key=api_key or os.getenv("OPENROUTER_API_KEY"),
             base_url=base_url,
             cache_ttl=cache_ttl,
+            plugin_config=plugin_config,
             **kwargs
         )
 
-        # 爬虫配置
-        self.scrape_url = scrape_url
-        self.max_models = max_models
-        self.scraper_timeout = scraper_timeout
-        self.headless = headless
+        # 爬虫配置 - 优先使用参数，其次使用 plugin_config
+        self.scrape_url = scrape_url or self.get_plugin_arg('scrape_url')
+        self.max_models = max_models if max_models != 50 else self.get_plugin_arg('max_models', 50)
+        self.scraper_timeout = scraper_timeout if scraper_timeout != 60 else self.get_plugin_arg('scraper_timeout', 60)
+        self.headless = self.get_plugin_arg('headless', headless)
 
-        # 定时任务配置
-        self.cache_file = kwargs.get('cache_file', 'data/openrouter_free_models.json')
-        self.schedule_cron = kwargs.get('schedule_cron', '0 2 * * *')
-        self.enable_scheduled_task = kwargs.get('enable_scheduled_task', True)
+        # 定时任务配置 - 使用统一的 get_plugin_arg 方法
+        self.cache_file = self.get_plugin_arg('cache_file', 'data/openrouter_free_models.json')
+        self.schedule_cron = self.get_plugin_arg('schedule_cron', '0 2 * * *')
+        self.enable_scheduled_task = self.get_plugin_arg('enable_scheduled_task', True)
+
+        # 工具调用能力测试配置 - 使用统一的 get_plugin_arg 方法
+        self.enable_tool_capability_test = self.get_plugin_arg('enable_tool_capability_test', True)
+        self.max_concurrent_tests = self.get_plugin_arg('max_concurrent_tests', 10)
+        self.test_timeout_seconds = self.get_plugin_arg('test_timeout_seconds', 5)
 
         if not self.api_key and not self.scrape_url:
             logger.warning("OpenRouter API 密钥和爬虫URL都未配置，插件将无法工作")
 
         # 初始化缓存管理器
         self.cache_manager = ModelCacheManager(cache_file=self.cache_file)
+        
+        # 初始化工具调用能力缓存管理器
+        self.capability_cache = CapabilityCacheManager(cache_file="data/tool_capability.json")
+        
+        # 初始化工具调用能力测试器
+        if self.api_key:
+            self.capability_tester = ToolCapabilityTester(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.api_key,
+                timeout=self.test_timeout_seconds
+            )
+        else:
+            self.capability_tester = None
+            logger.warning("API 密钥未配置，工具调用能力测试将不可用")
 
         # 初始化爬虫和调度器
         self.scraper: Optional[OpenRouterModelScraper] = None
@@ -274,13 +286,37 @@ class OpenRouterPlugin(BasePlugin):
 
         # 检查是否已完成首次爬虫
         if not self.initial_scrape_completed:
-            logger.warning("首次爬虫任务尚未完成，返回空模型列表。这不应该发生，请检查启动日志。")
+            logger.warning("首次爬虫任务尚未完成，尝试从缓存加载模型...")
+            # 尝试从文件缓存加载（作为降级方案）
+            if self.cache_manager.is_valid():
+                try:
+                    cache_data = self.cache_manager.load()
+                    if cache_data and cache_data.get('models'):
+                        cached_models = cache_data['models']
+                        logger.info(f"✓ 从文件缓存加载 {len(cached_models)} 个免费模型")
+
+                        # 转换为 OpenRouterModel 对象
+                        models = [
+                            OpenRouterModel(
+                                model_id=m['model_id'],
+                                model_name=m.get('model_name', m['model_id']),
+                                capabilities=["text"]
+                            )
+                            for m in cached_models
+                        ]
+                        # 应用能力过滤
+                        return await self._filter_by_capability(models)
+                except Exception as e:
+                    logger.error(f"从缓存加载模型失败: {e}")
+            
+            logger.warning("缓存中没有可用模型，返回空列表")
             return []
 
         # 从内存缓存获取模型（爬虫完成后已更新到内存）
         if self.models_cache and self.is_cache_valid():
             logger.debug(f"从内存缓存返回 {len(self.models_cache)} 个模型")
-            return self.models_cache
+            # 应用能力过滤
+            return await self._filter_by_capability(self.models_cache)
 
         # 如果内存缓存不可用，尝试从文件缓存加载（作为降级方案）
         if self.cache_manager.is_valid():
@@ -302,13 +338,92 @@ class OpenRouterPlugin(BasePlugin):
 
                     # 更新内部缓存
                     self.update_cache(models)
-                    return models
+                    # 应用能力过滤
+                    return await self._filter_by_capability(models)
             except Exception as e:
                 logger.warning(f"从文件缓存加载失败: {e}")
 
         # 最后的降级方案：返回空列表
         logger.warning("无法获取模型列表，返回空列表")
         return []
+
+    async def _filter_by_capability(self, models: List[OpenRouterModel]) -> List[OpenRouterModel]:
+        """
+        根据工具调用能力过滤模型列表
+
+        Args:
+            models: 原始模型列表
+
+        Returns:
+            过滤后的模型列表（只包含支持工具调用的模型）
+        """
+        # 如果禁用能力测试，返回所有模型
+        if not self.enable_tool_capability_test:
+            logger.debug("工具调用能力测试已禁用，返回所有模型")
+            return models
+
+        # 如果没有测试器，返回所有模型并记录警告
+        if not self.capability_tester:
+            logger.warning("能力测试器未初始化，跳过能力测试")
+            return models
+
+        if not models:
+            return models
+
+        logger.info(f"开始对 {len(models)} 个 OpenRouter 模型进行工具调用能力测试")
+
+        # 提取模型 ID 列表
+        model_ids = [m.model_id for m in models]
+
+        # 加载现有缓存
+        cache_data = self.capability_cache.load() or {"models": {}}
+        cached_capabilities = cache_data.get("models", {})
+
+        # 识别需要测试的模型（不在缓存中的）
+        untested_model_ids = [mid for mid in model_ids if mid not in cached_capabilities]
+
+        if untested_model_ids:
+            logger.info(f"发现 {len(untested_model_ids)} 个未测试的模型，开始测试...")
+
+            # 并行测试新模型
+            new_results = await self.capability_tester.test_models_concurrently(
+                models=untested_model_ids,
+                max_concurrent=self.max_concurrent_tests,
+                platform="openrouter"
+            )
+
+            # 构建新的能力数据
+            new_capabilities = {}
+            for model_id, supports_tools in new_results.items():
+                new_capabilities[model_id] = {
+                    "supports_tools": supports_tools,
+                    "tested_at": datetime.now(timezone.utc).isoformat(),
+                    "platform": "openrouter"
+                }
+
+            # 保存新结果到缓存
+            if new_capabilities:
+                self.capability_cache.save(new_capabilities, platform="openrouter")
+
+            # 合并缓存
+            cached_capabilities.update(new_capabilities)
+        else:
+            logger.debug(f"所有 {len(model_ids)} 个模型都已在缓存中，跳过测试")
+
+        # 过滤模型：只保留支持工具调用的
+        filtered_models = []
+        for model in models:
+            capability = cached_capabilities.get(model.model_id)
+            if capability and capability.get("supports_tools"):
+                filtered_models.append(model)
+            else:
+                logger.debug(f"过滤掉模型: {model.model_id} (不支持工具调用或未测试)")
+
+        logger.info(
+            f"能力测试完成: {len(filtered_models)}/{len(models)} 个 OpenRouter 模型支持工具调用"
+        )
+
+        return filtered_models
 
     async def _get_models_from_scraper(self) -> List[OpenRouterModel]:
         """

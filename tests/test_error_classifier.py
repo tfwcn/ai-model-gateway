@@ -1,7 +1,7 @@
 """错误分类器单元测试"""
 
 import unittest
-from openai_proxy.core.error_classifier import ErrorClassifier, ErrorType
+from openai_proxy.utils.error_classifier import ErrorClassifier, ErrorType
 
 
 class TestErrorClassifier(unittest.TestCase):

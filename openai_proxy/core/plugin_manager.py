@@ -91,6 +91,10 @@ class PluginManager:
 
             # 创建新的插件实例
             logger.debug(f"创建新的插件实例: {plugin_code}")
+            logger.debug(f"plugin_config keys: {list(plugin_config.keys()) if plugin_config else 'None'}")
+            if plugin_config and 'args' in plugin_config:
+                logger.debug(f"plugin_config args keys: {list(plugin_config['args'].keys())}")
+            logger.debug(f"调用 plugin_class with api_key={api_key is not None}, cache_ttl={cache_timeout}, plugin_config type={type(plugin_config)}")
             plugin_instance = plugin_class(api_key=api_key, cache_ttl=cache_timeout, plugin_config=plugin_config)
             # 存储插件实例
             self._plugins[plugin_module_name] = plugin_instance

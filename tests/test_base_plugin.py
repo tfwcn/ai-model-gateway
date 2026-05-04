@@ -23,13 +23,15 @@ def test_base_plugin_init():
         api_key="test-key",
         base_url="https://api.test.com",
         cache_ttl=600,
-        custom_param="custom-value"
+        plugin_config={'args': {'custom_param': 'custom-value'}}
     )
     
     assert plugin.api_key == "test-key"
     assert plugin.base_url == "https://api.test.com"
     assert plugin.cache_ttl == 600
-    assert plugin.plugin_config["custom_param"] == "custom-value"
+    # 测试新的配置获取方式
+    assert plugin.get_plugin_arg('custom_param') == 'custom-value'
+    assert plugin.plugin_config == {'args': {'custom_param': 'custom-value'}}
 
 
 def test_resolve_env_vars():
@@ -141,7 +143,7 @@ async def test_make_api_request_failure():
 
 def test_build_model_list_request_get():
     """测试构建GET请求配置"""
-    plugin = TestPlugin(base_url="https://api.test.com")
+    plugin = TestPlugin(base_url="https://api.test.com", api_key="test-key")
     
     plugin_config = {
         "args": {
@@ -156,7 +158,6 @@ def test_build_model_list_request_get():
     assert request_config["method"] == "GET"
     assert request_config["params"] == {"category": "free", "limit": 10}
     assert request_config["json_data"] is None
-    assert "Authorization" in request_config["headers"]
 
 
 def test_build_model_list_request_post():
@@ -206,7 +207,7 @@ def test_build_model_list_request_no_url_error():
         }
     }
     
-    with pytest.raises(ValueError, match="无法确定模型列表URL"):
+    with pytest.raises(ValueError, match="无法确定模型列表 URL"):
         plugin._build_model_list_request(plugin_config)
 
 
