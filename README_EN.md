@@ -1,14 +1,14 @@
-# 🤖 AI Free Model Proxy Service
+# 🤖 AI Model Gateway
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Downloads](https://pepy.tech/badge/openai-proxy)](https://pepy.tech/project/openai-proxy)
+[![Downloads](https://pepy.tech/badge/ai-model-gateway)](https://pepy.tech/project/ai-model-gateway)
 
-> **Smart Multi-Platform Free AI Model Proxy** - Auto failover, load balancing, OpenAI-compatible API
+> **Smart Multi-Platform Free AI Model Gateway** - Auto failover, load balancing, OpenAI-compatible API
 > 
-> **智能多平台免费 AI 模型代理服务** - 自动切换、负载均衡、OpenAI 兼容接口
+> **智能多平台免费 AI 模型网关服务** - 自动切换、负载均衡、OpenAI 兼容接口
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
