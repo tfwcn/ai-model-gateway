@@ -572,7 +572,17 @@ class ModelFailoverManager:
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         """
         logger.debug("DEBUG: 开始处理非流式聊天完成请求")
-        logger.debug(f"DEBUG: 原始请求数据: {request_data}")
+        # 记录完整请求数据，但精简messages以避免日志阻塞
+        safe_request_data = request_data.copy()
+        if "messages" in safe_request_data:
+            # 每条消息只显示前10个字符
+            safe_messages = []
+            for msg in safe_request_data["messages"]:
+                role = msg.get("role", "unknown")
+                content = str(msg.get("content", ""))[:10]
+                safe_messages.append({"role": role, "content": f"{content}..."})
+            safe_request_data["messages"] = safe_messages
+        logger.debug(f"DEBUG: 原始请求数据: {safe_request_data}")
 
         # 处理可选参数的默认值
         model_group = request_data.get("model")
@@ -644,7 +654,17 @@ class ModelFailoverManager:
         注意：流式请求必须在开始传输前完成所有模型选择，不能在流式过程中切换
         """
         logger.debug("DEBUG: 开始处理流式聊天完成请求")
-        logger.debug(f"DEBUG: 原始请求数据: {request_data}")
+        # 记录完整请求数据，但精简messages以避免日志阻塞
+        safe_request_data = request_data.copy()
+        if "messages" in safe_request_data:
+            # 每条消息只显示前10个字符
+            safe_messages = []
+            for msg in safe_request_data["messages"]:
+                role = msg.get("role", "unknown")
+                content = str(msg.get("content", ""))[:10]
+                safe_messages.append({"role": role, "content": f"{content}..."})
+            safe_request_data["messages"] = safe_messages
+        logger.debug(f"DEBUG: 原始请求数据: {safe_request_data}")
 
         # 处理可选参数的默认值
         model_group = request_data.get("model")
