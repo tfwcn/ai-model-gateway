@@ -2,6 +2,10 @@
 
 set -e  # 如果任何命令失败，则立即退出
 
+if [ -d "/app" ]; then
+    cd /app
+fi
+
 # 设置虚拟环境路径
 VENV_PATH="$(pwd)/.venv"
 APP_PATH="$(pwd)"
