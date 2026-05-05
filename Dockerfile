@@ -27,7 +27,11 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # 安装Playwright浏览器及其系统依赖（自动安装所有必需的库）
-RUN playwright install --with-deps chromium
+RUN playwright install --with-deps chromium && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    playwright cache clear && \
+    rm -rf /root/.cache/playwright
 
 # 复制应用代码
 COPY . .
