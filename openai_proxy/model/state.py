@@ -48,7 +48,6 @@ class ModelStateManager:
         async with self.lock:
             expiry_time = self._get_period_expiry(model_config.quota_period)
             self.disabled_models[model_config.name] = expiry_time
-            logger.debug(f"DEBUG: 模型 {model_config.name} 已被标记为周期内用完，失效时间: {expiry_time}")
 
     async def is_model_available(self, model_config: ModelConfig) -> bool:
         """检查模型是否可用（未被标记为周期内用完）"""
@@ -65,8 +64,7 @@ class ModelStateManager:
 
             for model_name in expired_models:
                 del self.disabled_models[model_name]
-                logger.debug(f"DEBUG: 模型 {model_name} 的禁用状态已过期，重新启用")
 
             is_available = model_config.name not in self.disabled_models
-            logger.debug(f"DEBUG: 模型 {model_config.name} 可用性检查结果: {is_available}")
+
             return is_available

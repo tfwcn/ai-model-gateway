@@ -38,12 +38,12 @@ class OpenAIProxyService:
         3. 爬虫完成后加载完整的配置（包含模型列表）
 
         这样只会加载一次配置，避免重复。
-        
+
         如果设置了 SKIP_PLUGIN_SCRAPER 环境变量，则跳过爬虫步骤，直接使用缓存。
         """
         # 检查是否跳过插件爬虫
         skip_scraper = os.getenv("SKIP_PLUGIN_SCRAPER", "false").lower() == "true"
-        
+
         if skip_scraper:
             logger.info("=" * 60)
             logger.info("检测到 SKIP_PLUGIN_SCRAPER=true，跳过插件爬虫，直接使用缓存")
@@ -65,7 +65,7 @@ class OpenAIProxyService:
 
         # 第四步：初始化故障转移管理器
         self.failover_manager = ModelFailoverManager(self.models)
-        
+
         # 第五步：初始化 Responses API 适配器和会话存储
         self.session_store = RedisSessionStore()
         self.responses_adapter = ResponsesAdapter(session_store=self.session_store)
@@ -185,69 +185,38 @@ class OpenAIProxyService:
             """
             OpenAI兼容的聊天完成接口 - 支持完全参数透传
             """
-            logger.debug("DEBUG: 接收到新的聊天完成请求")
-            logger.debug(f"DEBUG: 请求客户端IP: {request.client.host if request.client else 'unknown'}")
-            logger.debug(f"DEBUG: 请求头: {dict(request.headers)}")
 
             try:
                 request_data = await request.json()
-                logger.debug("DEBUG: 请求JSON解析成功")
+
             except Exception as e:
-                logger.error(f"DEBUG: 请求JSON解析失败: {str(e)}")
+
                 raise HTTPException(status_code=400, detail=f"无效的JSON请求体: {str(e)}")
 
             # 验证必要参数
             if not request_data.get("messages"):
-                logger.error("DEBUG: 请求缺少messages参数")
-                raise HTTPException(status_code=400, detail="messages参数是必需的")
 
-            logger.debug(f"DEBUG: 请求是否为流式: {request_data.get('stream', False)}")
+                raise HTTPException(status_code=400, detail="messages参数是必需的")
 
             if request_data.get("stream", False):
                 # 流式响应处理
                 async def stream_generator():
-                    logger.debug("DEBUG: 开始流式响应生成器")
+
                     try:
                         result = await self.failover_manager.chat_completion_stream(request_data)
                         if hasattr(result, '__aiter__'):
                             # 处理支持异步迭代的对象（包括StreamResponseWrapper和aiohttp.ClientResponse）
-                            logger.debug("DEBUG: 流式响应 - 使用异步迭代器")
+
                             async for chunk in result:
                                 if chunk:
-                                    chunk_size = len(chunk)
-                                    logger.debug(f"DEBUG: 流式响应 - 转发数据块，大小: {chunk_size}字节")
-
-                                    # 打印响应内容（进行脱敏和截断处理）
-                                    try:
-                                        chunk_str = chunk.decode('utf-8', errors='replace')
-                                        # 截断过长的内容以避免日志过大
-                                        if len(chunk_str) > 500:
-                                            chunk_preview = chunk_str[:500] + "..."
-                                        else:
-                                            chunk_preview = chunk_str
-
-                                        # 检查是否包含敏感信息（如API密钥等），如果有则脱敏
-                                        if "api_key" in chunk_preview.lower() or "secret" in chunk_preview.lower():
-                                            chunk_preview = "[SENSITIVE DATA REDACTED]"
-
-                                        logger.debug(f"DEBUG: 流式响应内容预览: {chunk_preview}")
-                                    except Exception as decode_error:
-                                        logger.debug(f"DEBUG: 无法解码响应内容为UTF-8: {decode_error}")
 
                                     yield chunk
                         else:
                             # 如果返回的是普通响应但请求是流式的，转换为流式格式
-                            logger.debug("DEBUG: 流式响应 - 转换普通响应为流式")
-                            result_str = json.dumps(result)
-                            # 打印转换后的响应内容
-                            if len(result_str) > 500:
-                                result_preview = result_str[:500] + "..."
-                            else:
-                                result_preview = result_str
-                            logger.debug(f"DEBUG: 转换后的流式响应内容: {result_preview}")
+
                             yield result_str.encode() + b"\n"
                     except Exception as e:
-                        logger.error(f"DEBUG: 流式响应生成器异常: {str(e)}", exc_info=True)
+
                         error_response = {
                             "error": {
                                 "message": str(e),
@@ -257,16 +226,15 @@ class OpenAIProxyService:
                             }
                         }
                         error_str = json.dumps(error_response)
-                        logger.debug(f"DEBUG: 流式错误响应内容: {error_str}")
+
                         yield error_str.encode() + b"\n"
 
-                logger.debug("DEBUG: 返回流式响应")
                 return StreamingResponse(stream_generator(), media_type="text/plain")
             else:
                 # 普通响应
-                logger.debug("DEBUG: 处理普通（非流式）响应")
+
                 result = await self.failover_manager.chat_completion_non_stream(request_data)
-                logger.debug("DEBUG: 返回普通响应")
+
                 return result
 
         @app.post("/v1/responses")
@@ -280,16 +248,16 @@ class OpenAIProxyService:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
             # 1. 转换请求体 (Responses -> Chat)
-            chat_payload = await self.responses_adapter.convert_request(responses_payload)
-            
+            chat_payload, request_id = await self.responses_adapter.convert_request(responses_payload)
+
             is_stream = chat_payload.get("stream", False)
-            
+
             if is_stream:
                 async def stream_generator():
                     try:
                         # 2. 调用上游 Chat API
                         upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
-                        
+
                         # 3. 转换流式事件并转发
                         async for chunk in upstream_stream:
                             if chunk:
@@ -304,24 +272,24 @@ class OpenAIProxyService:
                                     logger.error(f"Stream conversion error: {e}")
                     except Exception as e:
                         logger.error(f"Upstream stream error: {e}")
-                        
+
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:
                 # 非流式处理逻辑
                 chat_response = await self.failover_manager.chat_completion_non_stream(chat_payload)
-                
+
                 # 1. 包装响应对象
-                response_obj, new_id = self.responses_adapter.build_response_object(chat_response, responses_payload)
-                
+                response_obj, new_id = self.responses_adapter.build_response_object(chat_response, responses_payload, request_id)
+
                 # 2. 更新会话状态 (将当前请求和回复存入 Redis)
                 # 提取当前请求的 input 转换为 messages
                 current_messages = self.responses_adapter._convert_input_to_messages(responses_payload.get("input", []))
                 if responses_payload.get("instructions"):
                     current_messages.insert(0, {"role": "system", "content": responses_payload["instructions"]})
-                
+
                 # 构造完整的对话历史并保存
                 history = await self.session_store.get_history(responses_payload.get("previous_response_id", "")) if responses_payload.get("previous_response_id") else []
-                
+
                 # 提取助手响应内容（支持message和function_call类型）
                 assistant_message = {"role": "assistant"}
                 if response_obj["output"] and len(response_obj["output"]) > 0:
@@ -339,10 +307,10 @@ class OpenAIProxyService:
                                 "arguments": first_output.get("arguments", "{}")
                             }
                         }]
-                
+
                 full_history = history + current_messages + [assistant_message]
                 await self.session_store.save_session(new_id, full_history)
-                
+
                 return response_obj
 
         @app.get("/health")

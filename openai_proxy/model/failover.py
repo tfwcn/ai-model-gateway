@@ -33,9 +33,8 @@ class ModelFailoverManager:
             self.session = aiohttp.ClientSession(
                 headers={"Content-Type": "application/json"}
             )
-            logger.debug("DEBUG: 创建了新的HTTP会话（无总超时）")
         else:
-            logger.debug("DEBUG: 复用现有的HTTP会话")
+            pass
         return self.session
 
     def _has_valid_content(self, response_data: Any) -> bool:
@@ -69,7 +68,7 @@ class ModelFailoverManager:
                     # 检查 tool_calls（工具调用也是有效响应，优先级最高）
                     if "tool_calls" in message and message["tool_calls"]:
                         return True
-                    
+
                     # 检查 content
                     if "content" in message:
                         content = message["content"]
@@ -80,7 +79,7 @@ class ModelFailoverManager:
                                     return True
                             else:
                                 return True  # 非字符串类型（如数字、布尔值等）认为有效
-                    
+
                     # 检查 reasoning_content（某些模型如 minimax 使用此字段）
                     if "reasoning_content" in message:
                         reasoning_content = message["reasoning_content"]
@@ -103,7 +102,7 @@ class ModelFailoverManager:
                                 return len(content.strip()) > 0
                             else:
                                 return True  # 非字符串类型认为有效
-                    
+
                     # 检查 tool_calls（工具调用也是有效响应）
                     if "tool_calls" in delta and delta["tool_calls"]:
                         return True
@@ -112,7 +111,7 @@ class ModelFailoverManager:
             return False
 
         except Exception as e:
-            logger.debug(f"DEBUG: 检查 content 字段时发生异常: {e}")
+            pass
             return False
 
     async def call_model_stream(self, model_config: ModelConfig, request_data: Dict[str, Any]) -> tuple[bool, Any]:
@@ -139,38 +138,32 @@ class ModelFailoverManager:
         if "messages" in safe_request_data and len(str(safe_request_data["messages"])) > 200:
             safe_request_data["messages"] = f"[{len(safe_request_data['messages'])} messages, truncated]"
 
-        logger.debug(f"DEBUG: 准备调用模型 {model_config.name} (流式)")
-        logger.debug(f"DEBUG: 请求URL: {url}")
-        logger.debug(f"DEBUG: 请求超时: {model_config.timeout}秒")
-        logger.debug(f"DEBUG: 请求数据: {safe_request_data}")
-
         try:
             start_time = time.time()
             logger.info(f"调用模型: {model_config.name} ({model_config.model}) - 流式")
-            
+
             # 流式响应 - 设置精确的超时控制
             # connect: 连接建立超时
-            # sock_connect: socket连接超时  
+            # sock_connect: socket连接超时
             # total: None 表示无总超时限制（一旦开始接收数据就不会超时）
             # sock_read: None 表示流式数据读取无超时限制
             response = await session.post(
-                url, 
-                json=request_body, 
+                url,
+                json=request_body,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(
                     connect=model_config.timeout,      # 连接建立超时
-                    sock_connect=model_config.timeout, # socket连接超时
+                    sock_connect=model_config.timeout,  # socket连接超时
                     total=None,                        # 无总超时限制
                     sock_read=None                     # 流式数据读取无超时
                 )
             )
             elapsed_time = time.time() - start_time
-            logger.debug(f"DEBUG: 模型 {model_config.name} 流式请求完成，耗时: {elapsed_time:.2f}秒")
-            
+
             # 读取第一个数据块来检查是否是错误响应
             try:
                 first_chunk = await asyncio.wait_for(
-                    response.content.read(1024), 
+                    response.content.read(1024),
                     timeout=min(10, model_config.timeout)  # 设置较短的超时来读取首块数据
                 )
                 if first_chunk:
@@ -188,7 +181,7 @@ class ModelFailoverManager:
                                     # 关闭响应以释放资源
                                     response.close()
                                     return False, error_msg
-                                
+
                                 # 对于非错误的JSON响应，检查是否有有效的content字段
                                 # 注意：SSE格式通常不会进入这个分支
                                 if not self._has_valid_content(json_data):
@@ -197,13 +190,13 @@ class ModelFailoverManager:
                                     # 关闭响应以释放资源
                                     response.close()
                                     return False, error_msg
-                                    
+
                         except (json.JSONDecodeError, ValueError):
                             # 不是有效的JSON，可能是正常的流式数据（如SSE格式）
                             # 对于SSE格式，我们不进行content验证，直接认为有效
                             pass
                     # 如果不是以{开头，很可能是SSE格式，直接认为有效
-                
+
                 # 创建一个包装对象包含原始响应和预读取的数据
                 class StreamResponseWrapper:
                     def __init__(self, original_response, preloaded_data):
@@ -212,13 +205,13 @@ class ModelFailoverManager:
                         self.first_chunk_sent = False
                         # 【新增】初始化工具调用缓冲器（如果启用）
                         self.tool_call_buffer = StreamingToolCallBuffer() if model_config.enable_tool_call_conversion else None
-                    
+
                     async def __aiter__(self):
                         """使用iter_any()避免readuntil()超时问题，并支持工具调用转换"""
                         if self.preloaded_data and not self.first_chunk_sent:
                             self.first_chunk_sent = True
                             yield self.preloaded_data
-                        
+
                         # 使用iter_any()而不是按行读取，避免readuntil()超时
                         async for chunk in self.original_response.content.iter_any():
                             if chunk:
@@ -247,7 +240,7 @@ class ModelFailoverManager:
                                 else:
                                     # 未启用转换，直接转发
                                     yield chunk
-                
+
                 wrapped_response = StreamResponseWrapper(response, first_chunk)
                 return True, wrapped_response
 
@@ -258,10 +251,10 @@ class ModelFailoverManager:
                 response.close()
                 return False, error_msg
             except Exception as e:
-                logger.debug(f"DEBUG: 检查流式响应时发生异常: {e}")
+
                 # 如果检查失败，假设是正常的流式响应
                 return True, response
-                
+
         except asyncio.TimeoutError:
             elapsed_time = time.time() - start_time
             # 使用错误分类器进行分类
@@ -283,7 +276,7 @@ class ModelFailoverManager:
             # 使用错误分类器分类未知错误
             classified_error = ErrorClassifier.classify_unknown_error(e, model_config.name, elapsed_time)
             logger.warning(classified_error.message)
-            logger.debug(f"DEBUG: 异常详细信息: {repr(e)}", exc_info=True)
+
             logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
             return False, classified_error
 
@@ -311,11 +304,6 @@ class ModelFailoverManager:
         if "messages" in safe_request_data and len(str(safe_request_data["messages"])) > 200:
             safe_request_data["messages"] = f"[{len(safe_request_data['messages'])} messages, truncated]"
 
-        logger.debug(f"DEBUG: 准备调用模型 {model_config.name} (非流式)")
-        logger.debug(f"DEBUG: 请求URL: {url}")
-        logger.debug(f"DEBUG: 请求超时: {model_config.timeout}秒")
-        logger.debug(f"DEBUG: 请求数据: {safe_request_data}")
-
         try:
             start_time = time.time()
             logger.info(f"调用模型: {model_config.name} ({model_config.model}) - 非流式")
@@ -328,11 +316,9 @@ class ModelFailoverManager:
                 timeout=aiohttp.ClientTimeout(total=model_config.timeout)
             ) as response:
                 elapsed_time = time.time() - start_time
-                logger.debug(f"DEBUG: 模型 {model_config.name} 请求完成，状态码: {response.status}, 耗时: {elapsed_time:.2f}秒")
 
                 if response.status == 200:
                     result = await response.json()
-                    logger.debug(f"DEBUG: 模型 {model_config.name} 返回成功响应")
 
                     # 确保响应中包含 usage 字段，如果缺失则添加默认值
                     if "usage" not in result or result["usage"] is None:
@@ -365,14 +351,14 @@ class ModelFailoverManager:
                                         message = first_choice["message"]
                                         content = message.get("content", "")
                                         existing_tool_calls = message.get("tool_calls", [])
-                                        
+
                                         # 当 tool_calls 为空且 content 非空时，尝试转换
                                         if (not existing_tool_calls or len(existing_tool_calls) == 0) and content:
                                             converted_tool_calls, remaining_content = ToolCallConverter.convert_to_standard_format(
                                                 content=content,
                                                 existing_tool_calls=existing_tool_calls
                                             )
-                                            
+
                                             if converted_tool_calls and len(converted_tool_calls) > 0:
                                                 # 转换成功，更新 message
                                                 message["tool_calls"] = converted_tool_calls
@@ -389,7 +375,7 @@ class ModelFailoverManager:
                                 )
                         else:
                             logger.debug(f"Tool call conversion disabled for model {model_config.name}")
-                        
+
                         return True, result
                     else:
                         error_msg = f"模型 {model_config.name} 返回的响应缺少有效的 content 字段"
@@ -408,9 +394,9 @@ class ModelFailoverManager:
                     classified_error = ErrorClassifier.classify_http_error(
                         response.status, error_text, model_config.name
                     )
-                    
+
                     logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
-                    
+
                     return False, classified_error
 
         except asyncio.TimeoutError:
@@ -434,7 +420,7 @@ class ModelFailoverManager:
             # 使用错误分类器分类未知错误
             classified_error = ErrorClassifier.classify_unknown_error(e, model_config.name, elapsed_time)
             logger.warning(classified_error.message)
-            logger.debug(f"DEBUG: 异常详细信息: {repr(e)}", exc_info=True)
+
             logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
             return False, classified_error
 
@@ -447,24 +433,20 @@ class ModelFailoverManager:
                 available_models.append(model_config)
 
         if not available_models:
-            logger.debug(f"DEBUG: 平台 {platform_name} 无可用模型（非流式）")
+
             return {"success": False, "error": f"平台 {platform_name} 无可用模型", "data": None}
 
         # 故障转移模式：总是从索引0开始尝试（最高优先级）
         models_to_try = available_models  # 保持原始顺序，索引0为首选
 
-        logger.debug(f"DEBUG: 平台 {platform_name} 有 {len(models_to_try)} 个模型待尝试（非流式）: {[m.name for m in models_to_try]}")
-        logger.debug(f"DEBUG: 平台 {platform_name} 故障转移机制: 启用（优先级顺序）")
-
         # 按顺序尝试每个模型
         for i, model_config in enumerate(models_to_try):
-            logger.debug(f"DEBUG: 平台 {platform_name} 尝试第 {i+1}/{len(models_to_try)} 个模型（非流式）: {model_config.name}")
 
             success, result = await self.call_model_non_stream(model_config, request_data)
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（非流式）")
-                logger.debug(f"DEBUG: 成功返回结果，类型: {type(result)}")
+
                 return {"success": True, "data": result, "error": None}
             else:
                 # 根据错误分类决定是否禁用模型
@@ -472,7 +454,7 @@ class ModelFailoverManager:
                     classified_error = result
                     error_summary = ErrorClassifier.get_error_summary(classified_error)
                     logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
-                    
+
                     # 如果错误分类建议禁用模型，则禁用
                     if classified_error.should_disable_model:
                         if model_config.quota_period is not None:
@@ -481,9 +463,9 @@ class ModelFailoverManager:
                             await self.model_state_manager.disable_model_for_period(model_config)
                         else:
                             # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
-                            logger.debug(f"DEBUG: 模型 {model_config.name} 临时禁用（无quota_period配置）")
+                            pass
                     else:
-                        logger.debug(f"DEBUG: 模型 {model_config.name} 不禁用（错误类型: {classified_error.category.value}，可重试）")
+                        pass
                 else:
                     # 兼容旧版本的字符串错误
                     logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
@@ -491,14 +473,14 @@ class ModelFailoverManager:
                         logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
                         await self.model_state_manager.disable_model_for_period(model_config)
                     else:
-                        logger.debug(f"DEBUG: 模型 {model_config.name} 失败，临时禁用（无quota_period配置）")
+                        pass
 
                 # 如果是最后一个模型，返回错误
                 if i == len(models_to_try) - 1:
                     error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
                     return {"success": False, "error": error_message, "data": None}
                 else:
-                    logger.debug(f"DEBUG: 继续尝试下一个模型...")
+                    pass
 
         return {"success": False, "error": "未知错误", "data": None}
 
@@ -511,24 +493,20 @@ class ModelFailoverManager:
                 available_models.append(model_config)
 
         if not available_models:
-            logger.debug(f"DEBUG: 平台 {platform_name} 无可用模型（流式）")
+
             return {"success": False, "error": f"平台 {platform_name} 无可用模型", "data": None}
 
         # 故障转移模式：总是从索引0开始尝试（最高优先级）
         models_to_try = available_models  # 保持原始顺序，索引0为首选
 
-        logger.debug(f"DEBUG: 平台 {platform_name} 有 {len(models_to_try)} 个模型待尝试（流式）: {[m.name for m in models_to_try]}")
-        logger.debug(f"DEBUG: 平台 {platform_name} 故障转移机制: 启用（优先级顺序）")
-
         # 按顺序尝试每个模型
         for i, model_config in enumerate(models_to_try):
-            logger.debug(f"DEBUG: 平台 {platform_name} 尝试第 {i+1}/{len(models_to_try)} 个模型（流式）: {model_config.name}")
 
             success, result = await self.call_model_stream(model_config, request_data)
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（流式）")
-                logger.debug(f"DEBUG: 成功返回结果，类型: {type(result)}")
+
                 return {"success": True, "data": result, "error": None}
             else:
                 # 根据错误分类决定是否禁用模型
@@ -536,7 +514,7 @@ class ModelFailoverManager:
                     classified_error = result
                     error_summary = ErrorClassifier.get_error_summary(classified_error)
                     logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
-                    
+
                     # 如果错误分类建议禁用模型，则禁用
                     if classified_error.should_disable_model:
                         if model_config.quota_period is not None:
@@ -545,9 +523,9 @@ class ModelFailoverManager:
                             await self.model_state_manager.disable_model_for_period(model_config)
                         else:
                             # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
-                            logger.debug(f"DEBUG: 模型 {model_config.name} 临时禁用（无quota_period配置）")
+                            pass
                     else:
-                        logger.debug(f"DEBUG: 模型 {model_config.name} 不禁用（错误类型: {classified_error.category.value}，可重试）")
+                        pass
                 else:
                     # 兼容旧版本的字符串错误
                     logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
@@ -555,14 +533,14 @@ class ModelFailoverManager:
                         logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
                         await self.model_state_manager.disable_model_for_period(model_config)
                     else:
-                        logger.debug(f"DEBUG: 模型 {model_config.name} 失败，临时禁用（无quota_period配置）")
+                        pass
 
                 # 如果是最后一个模型，返回错误
                 if i == len(models_to_try) - 1:
                     error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
                     return {"success": False, "error": error_message, "data": None}
                 else:
-                    logger.debug(f"DEBUG: 继续尝试下一个模型...")
+                    pass
 
         return {"success": False, "error": "未知错误", "data": None}
 
@@ -571,21 +549,14 @@ class ModelFailoverManager:
         执行非流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         """
-        logger.debug("DEBUG: 开始处理非流式聊天完成请求")
-        # 只记录关键信息，避免日志阻塞
-        logger.debug(f"DEBUG: 模型={request_data.get('model')}, 消息数={len(request_data.get('messages', []))}, 流式={request_data.get('stream', False)}")
-
         # 处理可选参数的默认值
         model_group = request_data.get("model")
         messages = request_data.get("messages")
 
         # 验证必要参数
         if not messages:
-            logger.error("DEBUG: 请求缺少messages参数")
-            raise HTTPException(status_code=400, detail="messages参数是必需的")
 
-        logger.debug(f"DEBUG: 请求模型组: {model_group}")
-        logger.debug(f"DEBUG: 消息数量: {len(messages)}")
+            raise HTTPException(status_code=400, detail="messages参数是必需的")
 
         if model_group is None or model_group == "all":
             # 获取所有平台并按权重排序（weight值越大优先级越高）
@@ -609,8 +580,6 @@ class ModelFailoverManager:
                 all_platforms,
                 key=lambda x: (-platform_weights.get(x, 0), all_platforms.index(x))
             )
-
-            logger.debug(f"DEBUG: 平台权重排序结果: {[(p, platform_weights.get(p, 0)) for p in platforms_to_try]}")
 
             # 尝试每个平台
             last_error = None
@@ -644,21 +613,14 @@ class ModelFailoverManager:
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         注意：流式请求必须在开始传输前完成所有模型选择，不能在流式过程中切换
         """
-        logger.debug("DEBUG: 开始处理流式聊天完成请求")
-        # 只记录关键信息，避免日志阻塞
-        logger.debug(f"DEBUG: 模型={request_data.get('model')}, 消息数={len(request_data.get('messages', []))}, 流式={request_data.get('stream', False)}")
-
         # 处理可选参数的默认值
         model_group = request_data.get("model")
         messages = request_data.get("messages")
 
         # 验证必要参数
         if not messages:
-            logger.error("DEBUG: 请求缺少messages参数")
-            raise HTTPException(status_code=400, detail="messages参数是必需的")
 
-        logger.debug(f"DEBUG: 请求模型组: {model_group}")
-        logger.debug(f"DEBUG: 消息数量: {len(messages)}")
+            raise HTTPException(status_code=400, detail="messages参数是必需的")
 
         if model_group is None or model_group == "all":
             # 获取所有平台并按权重排序（weight值越大优先级越高）
@@ -682,8 +644,6 @@ class ModelFailoverManager:
                 all_platforms,
                 key=lambda x: (-platform_weights.get(x, 0), all_platforms.index(x))
             )
-
-            logger.debug(f"DEBUG: 平台权重排序结果: {[(p, platform_weights.get(p, 0)) for p in platforms_to_try]}")
 
             # 尝试每个平台
             last_error = None
@@ -715,4 +675,3 @@ class ModelFailoverManager:
         """关闭会话"""
         if self.session and not self.session.closed:
             await self.session.close()
-            logger.debug("DEBUG: HTTP会话已关闭")
