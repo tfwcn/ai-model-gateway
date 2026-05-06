@@ -30,7 +30,6 @@ RUN pip install --upgrade pip && \
 RUN playwright install --with-deps chromium && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
-    playwright cache clear && \
     rm -rf /root/.cache/playwright
 
 # 复制应用代码
