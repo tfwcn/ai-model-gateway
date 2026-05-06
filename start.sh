@@ -14,7 +14,7 @@ echo "检查虚拟环境是否存在..."
 
 if [ ! -d "$VENV_PATH" ]; then
     echo "虚拟环境不存在，正在创建..."
-    python3.12 -m venv "$VENV_PATH"
+    python -m venv "$VENV_PATH"
     echo "虚拟环境创建完成"
     
     echo "激活虚拟环境并安装依赖..."
