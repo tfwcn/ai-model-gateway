@@ -168,8 +168,8 @@ class ResponsesAdapter:
         # 记录被转换的 custom tool,用于响应时的反向转换
         converted_custom_tools[name] = custom_tool
 
-        logger.info(f"🔧 [TOOL CONVERT] Custom Tool '{name}' -> Function Tool")
-        logger.info(f"   Original: {json.dumps(custom_tool, indent=2, ensure_ascii=False)}")
+        logger.debug(f"🔧 [TOOL CONVERT] Custom Tool '{name}' -> Function Tool")
+        logger.debug(f"   Original: {json.dumps(custom_tool, indent=2, ensure_ascii=False)}")
 
         # 构建 input 字段的 description
         # 如果存在 format.definition，直接使用它作为 input.description
@@ -202,7 +202,7 @@ class ResponsesAdapter:
             }
         }
 
-        logger.info(f"   Converted: {json.dumps(chat_tool, indent=2, ensure_ascii=False)}")
+        logger.debug(f"   Converted: {json.dumps(chat_tool, indent=2, ensure_ascii=False)}")
 
         return chat_tool
 
@@ -709,9 +709,9 @@ class ResponsesAdapter:
                     arguments_obj = json.loads(arguments_str)
                     # 提取 input 字段的值（纯文本）
                     input_value = arguments_obj.get("input", arguments_str)
-                    logger.info(f"🔄 [REVERSE CONVERT] Function call '{tool_name}' -> Custom tool call")
-                    logger.info(f"   Arguments: {arguments_str}")
-                    logger.info(f"   Extracted input: {input_value}")
+                    logger.debug(f"🔄 [REVERSE CONVERT] Function call '{tool_name}' -> Custom tool call")
+                    logger.debug(f"   Arguments: {arguments_str}")
+                    logger.debug(f"   Extracted input: {input_value}")
                 except (json.JSONDecodeError, AttributeError) as e:
                     # 如果解析失败，直接使用原始 arguments
                     input_value = arguments_str
