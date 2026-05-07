@@ -13,7 +13,7 @@ from openai_proxy.models import ModelConfig
 from openai_proxy.core.config_loader import ConfigLoader
 from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
-from openai_proxy.utils.session import RedisSessionStore
+from openai_proxy.utils.session import DualModeSessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class OpenAIProxyService:
         self.failover_manager = ModelFailoverManager(self.models)
 
         # 第五步：初始化 Responses API 适配器和会话存储
-        self.session_store = RedisSessionStore()
+        self.session_store = DualModeSessionStore()
         self.responses_adapter = ResponsesAdapter(session_store=self.session_store)
 
     async def _start_plugin_schedulers_for_platforms(self, platforms: Dict[str, Any]):
@@ -82,7 +82,7 @@ class OpenAIProxyService:
             # 遍历所有平台，查找并启动插件调度器
             for platform_name, platform_config in platforms.items():
                 if not isinstance(platform_config, dict):
-                    logger.debug(f"平台 [{platform_name}] 配置不是字典，跳过")
+                    logger.info(f"平台 [{platform_name}] 配置不是字典，跳过")
                     continue
 
                 logger.info(f"检查平台 [{platform_name}] 的插件...")
@@ -128,7 +128,7 @@ class OpenAIProxyService:
                         logger.error(f"✗ 启动平台 [{platform_name}] 的插件调度器失败: {e}")
                 else:
                     if not plugin:
-                        logger.debug(f"平台 [{platform_name}] 没有关联的插件")
+                        logger.info(f"平台 [{platform_name}] 没有关联的插件")
         except Exception as e:
             logger.error(f"启动插件调度器时出错: {e}")
 
@@ -244,11 +244,20 @@ class OpenAIProxyService:
             """
             try:
                 responses_payload = await request.json()
+                logger.debug("=" * 80)
+                logger.debug("📥 [RECEIVED] Responses API Request:")
+                logger.debug(json.dumps(responses_payload, indent=2, ensure_ascii=False))
+                logger.debug("=" * 80)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
             # 1. 转换请求体 (Responses -> Chat)
             chat_payload, request_id = await self.responses_adapter.convert_request(responses_payload)
+
+            logger.debug("=" * 80)
+            logger.debug("🔄 [CONVERTED] Chat Completions Request:")
+            logger.debug(json.dumps(chat_payload, indent=2, ensure_ascii=False))
+            logger.debug("=" * 80)
 
             is_stream = chat_payload.get("stream", False)
 
@@ -278,8 +287,18 @@ class OpenAIProxyService:
                 # 非流式处理逻辑
                 chat_response = await self.failover_manager.chat_completion_non_stream(chat_payload)
 
+                logger.debug("=" * 80)
+                logger.debug("📤 [UPSTREAM RESPONSE] Chat Completions Response:")
+                logger.debug(json.dumps(chat_response, indent=2, ensure_ascii=False))
+                logger.debug("=" * 80)
+
                 # 1. 包装响应对象
                 response_obj, new_id = self.responses_adapter.build_response_object(chat_response, responses_payload, request_id)
+
+                logger.debug("=" * 80)
+                logger.debug("📦 [FINAL] Responses API Response:")
+                logger.debug(json.dumps(response_obj, indent=2, ensure_ascii=False))
+                logger.debug("=" * 80)
 
                 # 2. 更新会话状态 (将当前请求和回复存入 Redis)
                 # 提取当前请求的 input 转换为 messages
@@ -309,7 +328,8 @@ class OpenAIProxyService:
                         }]
 
                 full_history = history + current_messages + [assistant_message]
-                await self.session_store.save_session(new_id, full_history)
+                # 保存会话时同时传递原始 output 数组
+                await self.session_store.save_session(new_id, full_history, original_output=response_obj.get("output"))
 
                 return response_obj
 

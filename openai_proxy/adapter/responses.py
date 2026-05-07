@@ -2,7 +2,7 @@ import json
 import logging
 import uuid
 from typing import Dict, List, Any, Optional
-from ..utils.session import RedisSessionStore
+from ..utils.session import SessionStore
 from ..utils.tool_call_converter import ToolCallConverter
 
 logger = logging.getLogger(__name__)
@@ -14,8 +14,8 @@ class ResponsesAdapter:
     负责将 /v1/responses 的请求格式转换为 /v1/chat/completions 兼容的格式。
     """
 
-    def __init__(self, session_store: Optional[RedisSessionStore] = None):
-        self.session_store = session_store or RedisSessionStore()
+    def __init__(self, session_store: Optional[SessionStore] = None):
+        self.session_store = session_store
         # 流式工具调用状态缓存：{index: {"call_id": str, "name": str}}
         self._streaming_tool_call_state: Dict[int, Dict[str, str]] = {}
         # 请求级别的 custom tools 转换记录：{request_id: {tool_name: original_tool}}
@@ -25,6 +25,7 @@ class ResponsesAdapter:
         """
         将 Responses API 请求体转换为 Chat API 请求体。
         """
+
         # 初始化流式工具调用状态
         self._streaming_tool_call_state = {}
         # 生成请求ID，用于隔离并发请求的转换记录
@@ -46,7 +47,6 @@ class ResponsesAdapter:
 
         # 3. 转换当前 input 为 messages
         input_items = responses_payload.get("input", [])
-
         current_messages = self._convert_input_to_messages(input_items)
 
         # 4. 合并历史消息与当前消息
@@ -72,10 +72,34 @@ class ResponsesAdapter:
         # 7. 映射其他可选参数 (字段名标准化)
         if "max_output_tokens" in responses_payload:
             chat_payload["max_tokens"] = responses_payload["max_output_tokens"]
+
+        # GPT-5 参数适配
+        is_gpt5 = model and (model.startswith("gpt-5") or model == "gpt-5")
         if "temperature" in responses_payload:
-            chat_payload["temperature"] = responses_payload["temperature"]
+            temp = responses_payload["temperature"]
+            # GPT-5 要求 temperature 必须为 1 或不传
+            if is_gpt5 and temp != 1:
+                logger.warning(f"Model {model} requires temperature=1, overriding from {temp}")
+                chat_payload["temperature"] = 1
+            else:
+                chat_payload["temperature"] = temp
+        elif is_gpt5:
+            # 如果没传 temperature，GPT-5 默认为 1
+            chat_payload["temperature"] = 1
+
         if "top_p" in responses_payload:
             chat_payload["top_p"] = responses_payload["top_p"]
+
+        # 处理 reasoning.effort
+        if "reasoning" in responses_payload and isinstance(responses_payload["reasoning"], dict):
+            effort = responses_payload["reasoning"].get("effort")
+            if effort:
+                # 记录 reasoning effort，下游 Chat API 可能不支持，但至少记录下来
+                logger.info(f"Reasoning effort: {effort}")
+        elif is_gpt5:
+            # 如果没有显式指定 reasoning.effort，根据模型类型推断
+            # 这里简化处理，默认使用 minimal
+            logger.info("Auto-setting reasoning.effort to 'minimal' for GPT-5")
 
         # 处理工具选择
         if "tool_choice" in responses_payload:
@@ -84,6 +108,26 @@ class ResponsesAdapter:
         # 处理工具定义 - 将 Responses API tools 转换为 Chat API tools
         if "tools" in responses_payload:
             chat_payload["tools"] = self._convert_tools(responses_payload["tools"], converted_custom_tools)
+
+        # 处理结构化输出：text.format (Responses) -> response_format (Chat)
+        if "text" in responses_payload and isinstance(responses_payload["text"], dict):
+            text_config = responses_payload["text"]
+            if "format" in text_config:
+                fmt = text_config["format"]
+                # 检查是否是 json_schema 格式
+                if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+                    json_schema = fmt.get("json_schema", {})
+                    # 构建 Chat API 的 response_format
+                    chat_payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": json_schema.get("name", "Output"),
+                            "strict": json_schema.get("strict", True),
+                            "schema": json_schema.get("schema", {})
+                        }
+                    }
+                    logger.info(f"Converted text.format to response_format with schema name: {json_schema.get('name', 'Output')}")
+
         return chat_payload, request_id
 
     def _convert_custom_to_function(self, custom_tool: dict, converted_custom_tools: Dict[str, dict]) -> dict:
@@ -103,13 +147,13 @@ class ResponsesAdapter:
             "type": "function",
             "function": {
                 "name": "apply_patch",
-                "description": "...\n\n注意：此工具接受纯文本输入（而非 JSON 格式）。",
+                "description": "...",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": "工具的纯文本输入内容"
+                            "description": "<format.definition 内容>"
                         }
                     },
                     "required": ["input"]
@@ -121,14 +165,20 @@ class ResponsesAdapter:
         description = custom_tool.get("description", "")
         has_format = "format" in custom_tool
 
-        # 如果存在 format 字段，在 description 末尾添加提示
-        if has_format:
-            description = description + "\n\n注意：此工具接受纯文本输入（而非 JSON 格式）。"
-
-            logger.debug(f"Discarding format field for custom tool: {name}")
-
-        # 记录被转换的 custom tool，用于响应时的反向转换
+        # 记录被转换的 custom tool,用于响应时的反向转换
         converted_custom_tools[name] = custom_tool
+
+        logger.info(f"🔧 [TOOL CONVERT] Custom Tool '{name}' -> Function Tool")
+        logger.info(f"   Original: {json.dumps(custom_tool, indent=2, ensure_ascii=False)}")
+
+        # 构建 input 字段的 description
+        # 如果存在 format.definition，直接使用它作为 input.description
+        if has_format and "format" in custom_tool and "definition" in custom_tool["format"]:
+            input_description = custom_tool["format"]["definition"]
+            logger.debug(f"Using format.definition as input description for: {name}")
+        else:
+            # 没有 format.definition 时，使用空字符串或简单说明
+            input_description = ""
 
         # 构建 function tool
         chat_tool = {
@@ -136,18 +186,23 @@ class ResponsesAdapter:
             "function": {
                 "name": name,
                 "description": description,
+                "strict": False,
                 "parameters": {
                     "type": "object",
+                    "title": f"{name.title().replace('_', '')}Args",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": "工具的纯文本输入内容"
+                            "title": "Input",
+                            "description": input_description
                         }
                     },
                     "required": ["input"]
                 }
             }
         }
+
+        logger.info(f"   Converted: {json.dumps(chat_tool, indent=2, ensure_ascii=False)}")
 
         return chat_tool
 
@@ -206,7 +261,7 @@ class ResponsesAdapter:
                 # 转换 custom tool 为 function tool
                 chat_tool = self._convert_custom_to_function(tool, converted_custom_tools)
                 chat_tools.append(chat_tool)
-                logger.debug(f"Converted custom tool to function tool: {tool.get('name')}")
+                logger.info(f"✓ Converted custom tool to function tool: {tool.get('name')}")
             else:
                 # 其他类型的工具直接传递（如果有）
                 logger.warning(f"Unknown tool type: {tool_type}, passing through")
@@ -217,9 +272,15 @@ class ResponsesAdapter:
     def _convert_input_to_messages(self, input_items: list) -> list:
         """
         将 Responses API 的 input 数组转换为 Chat API 的 messages 数组。
-        支持两种格式：
+        支持多种格式：
         1. 完整格式: {"type": "message", "role": "user", "content": "..."}
         2. 简化格式: {"role": "user", "content": "..."}
+        3. 带 output 字段的格式: {"role": "assistant", "output": [{"type": "custom_tool_call", ...}]}
+        4. 多模态内容: {"role": "user", "content": [{"type": "input_image", ...}]}
+        5. 顶层 custom_tool_call: {"type": "custom_tool_call", "call_id": "...", "name": "...", "input": "..."}
+        6. 顶层 custom_tool_call_output: {"type": "custom_tool_call_output", "call_id": "...", "output": "..."}
+        7. 顶层 function_call: {"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}
+        8. 顶层 function_call_output: {"type": "function_call_output", "call_id": "...", "output": "..."}
         """
         messages = []
         for item in input_items:
@@ -231,16 +292,133 @@ class ResponsesAdapter:
             role = item.get("role")
             content = item.get("content", "")
 
+            # 处理带 output 字段的格式（Responses API 标准格式）
+            if "output" in item and isinstance(item["output"], list):
+                # 遍历 output 数组中的每个元素
+                for output_item in item["output"]:
+                    if not isinstance(output_item, dict):
+                        continue
+
+                    output_type = output_item.get("type")
+
+                    # 处理 custom_tool_call
+                    if output_type == "custom_tool_call":
+                        call_id = output_item.get("call_id")
+                        name = output_item.get("name", "")
+                        raw_input = output_item.get("input", "")
+                        if call_id:
+                            messages.append({
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": raw_input
+                                    }
+                                }]
+                            })
+
+                    # 处理 custom_tool_call_output
+                    elif output_type == "custom_tool_call_output":
+                        call_id = output_item.get("call_id")
+                        output = output_item.get("output", "")
+                        if call_id:
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": output
+                            })
+
+                    # 处理 function_call
+                    elif output_type == "function_call":
+                        call_id = output_item.get("call_id")
+                        name = output_item.get("name", "")
+                        arguments = output_item.get("arguments", "{}")
+                        if call_id:
+                            messages.append({
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": arguments
+                                    }
+                                }]
+                            })
+
+                    # 处理 function_call_output
+                    elif output_type == "function_call_output":
+                        call_id = output_item.get("call_id")
+                        output = output_item.get("output", "")
+                        if call_id:
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": output
+                            })
+
+                # 已经处理完 output 数组，跳过后续的逻辑
+                continue
+
             # 如果是简化格式（有role但没有type）
             if role and not item_type:
                 if role in ["user", "assistant", "system"]:
-                    messages.append({"role": role, "content": content})
+                    # 检查 content 是否为多模态数组
+                    if isinstance(content, list):
+                        converted_content = self._convert_content_array(content)
+                        messages.append({"role": role, "content": converted_content})
+                    else:
+                        messages.append({"role": role, "content": content})
                 continue
 
             # 处理消息类型
             if item_type == "message":
+                # 检查是否是 assistant message 且包含工具调用信息（扁平格式）
+                if role == "assistant":
+                    # SDK 可能发送扁平格式的 custom_tool_call
+                    # 格式: {"type": "message", "role": "assistant", "content": "...",
+                    #        "call_id": "...", "name": "...", "input": "..."}
+                    call_id = item.get("call_id")
+                    name = item.get("name")
+                    tool_input = item.get("input")
+
+                    if call_id and name and tool_input is not None:
+                        # 这是扁平格式的 custom_tool_call，转换为 Chat API 格式
+                        messages.append({
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": tool_input if isinstance(tool_input, str) else json.dumps(tool_input)
+                                }
+                            }]
+                        })
+                        logger.info(f"Converted flat custom_tool_call to tool_calls: {name}")
+                        continue
+
+                    # 检查是否是 custom_tool_call_output（扁平格式）
+                    output_value = item.get("output")
+                    if call_id and output_value is not None and not name:
+                        # 这是扁平格式的 custom_tool_call_output
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": output_value if isinstance(output_value, str) else json.dumps(output_value)
+                        })
+                        logger.info(f"Converted flat custom_tool_call_output to tool result")
+                        continue
+
+                # 普通的文本消息或多模态消息
                 if role in ["user", "assistant", "system"]:
-                    messages.append({"role": role, "content": content})
+                    if isinstance(content, list):
+                        converted_content = self._convert_content_array(content)
+                        messages.append({"role": role, "content": converted_content})
+                    else:
+                        messages.append({"role": role, "content": content})
 
             # 处理工具调用 (function_call) - 转换为 assistant 消息
             elif item_type == "function_call":
@@ -271,7 +449,75 @@ class ResponsesAdapter:
                         "content": output
                     })
 
+            # 处理顶层的 custom_tool_call（独立元素格式）
+            elif item_type == "custom_tool_call":
+                call_id = item.get("call_id")
+                name = item.get("name", "")
+                raw_input = item.get("input", "")
+                if call_id:
+                    messages.append({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": raw_input if isinstance(raw_input, str) else json.dumps(raw_input)
+                            }
+                        }]
+                    })
+                    logger.info(f"Converted top-level custom_tool_call to tool_calls: {name}")
+
+            # 处理顶层的 custom_tool_call_output（独立元素格式）
+            elif item_type == "custom_tool_call_output":
+                call_id = item.get("call_id")
+                output = item.get("output", "")
+                if call_id:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output if isinstance(output, str) else json.dumps(output)
+                    })
+                    logger.info(f"Converted top-level custom_tool_call_output to tool result")
+
         return messages
+
+    def _convert_content_array(self, content_array: list) -> list:
+        """
+        将 Responses API 的 content 数组转换为 Chat API 兼容的格式。
+        主要处理：
+        - input_text -> text
+        - input_image -> image_url
+        - output_text -> text
+        """
+        converted = []
+        for part in content_array:
+            if not isinstance(part, dict):
+                continue
+
+            part_type = part.get("type")
+
+            if part_type == "input_text" or part_type == "output_text":
+                # 转换为 Chat API 的 text 类型
+                converted.append({
+                    "type": "text",
+                    "text": part.get("text", "")
+                })
+            elif part_type == "input_image":
+                # 转换为 Chat API 的 image_url 类型
+                image_url = part.get("image_url")
+                if image_url:
+                    converted.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url if isinstance(image_url, str) else image_url.get("url", "")
+                        }
+                    })
+            else:
+                # 其他类型直接透传
+                converted.append(part)
+
+        return converted
 
     def convert_stream_event(self, event_line: str) -> Optional[str]:
         """
@@ -463,6 +709,9 @@ class ResponsesAdapter:
                     arguments_obj = json.loads(arguments_str)
                     # 提取 input 字段的值（纯文本）
                     input_value = arguments_obj.get("input", arguments_str)
+                    logger.info(f"🔄 [REVERSE CONVERT] Function call '{tool_name}' -> Custom tool call")
+                    logger.info(f"   Arguments: {arguments_str}")
+                    logger.info(f"   Extracted input: {input_value}")
                 except (json.JSONDecodeError, AttributeError) as e:
                     # 如果解析失败，直接使用原始 arguments
                     input_value = arguments_str
