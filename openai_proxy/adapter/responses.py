@@ -528,12 +528,21 @@ class ResponsesAdapter:
 
         try:
             data_str = event_line[6:]  # 去掉 "data: " 前缀
+            logger.debug(f"Parsing SSE data: {data_str[:200]}...")  # 只记录前200字符
+
             if data_str.strip() == "[DONE]":
                 # 清理流式工具调用状态（流式响应结束）
                 self._streaming_tool_call_state.clear()
                 return "event: response.completed\ndata: {\"status\": \"completed\"}\n\n"
 
-            data = json.loads(data_str)
+            # 尝试解析 JSON
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error in SSE data: {e}")
+                logger.error(f"Problematic data: {data_str}")
+                logger.error(f"Data length: {len(data_str)}, Error position: {e.pos}")
+                raise
 
             choices = data.get("choices", [])
             if not choices:
@@ -623,7 +632,7 @@ class ResponsesAdapter:
                     return "".join(events)
 
         except (json.JSONDecodeError, IndexError, KeyError) as e:
-            logger.debug(f"Failed to parse stream event: {event_line[:100]} Error: {e}")
+            logger.error(f"Failed to parse stream event: {event_line[:200]} Error: {e}", exc_info=True)
 
         return None
 

@@ -268,19 +268,27 @@ class OpenAIProxyService:
                         upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
 
                         # 3. 转换流式事件并转发
+                        chunk_count = 0
                         async for chunk in upstream_stream:
+                            chunk_count += 1
                             if chunk:
                                 try:
                                     chunk_str = chunk.decode('utf-8', errors='replace')
+                                    logger.debug(f"[{chunk_count}] Raw chunk received: {chunk_str[:200]}...")  # 只记录前200字符
+
                                     for line in chunk_str.splitlines():
                                         if line.strip():
+                                            logger.debug(f"[{chunk_count}] Processing line: {line[:150]}...")  # 只记录前150字符
+
                                             converted_line = self.responses_adapter.convert_stream_event(line)
                                             if converted_line:
+                                                logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")  # 只记录前150字符
                                                 yield converted_line.encode('utf-8')
                                 except Exception as e:
-                                    logger.error(f"Stream conversion error: {e}")
+                                    logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
+                                    logger.error(f"Problematic chunk: {chunk_str if 'chunk_str' in locals() else 'N/A'}")
                     except Exception as e:
-                        logger.error(f"Upstream stream error: {e}")
+                        logger.error(f"Upstream stream error: {e}", exc_info=True)
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:

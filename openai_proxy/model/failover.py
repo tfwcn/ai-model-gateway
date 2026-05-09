@@ -207,39 +207,15 @@ class ModelFailoverManager:
                         self.tool_call_buffer = StreamingToolCallBuffer() if model_config.enable_tool_call_conversion else None
 
                     async def __aiter__(self):
-                        """使用iter_any()避免readuntil()超时问题，并支持工具调用转换"""
+                        """使用iter_any()读取数据块，由上层按行处理"""
                         if self.preloaded_data and not self.first_chunk_sent:
                             self.first_chunk_sent = True
                             yield self.preloaded_data
 
-                        # 使用iter_any()而不是按行读取，避免readuntil()超时
+                        # 使用iter_any()读取原始数据块
                         async for chunk in self.original_response.content.iter_any():
                             if chunk:
-                                # 【新增】尝试解析并转换工具调用（如果启用）
-                                if self.tool_call_buffer:
-                                    try:
-                                        chunk_str = chunk.decode('utf-8', errors='replace')
-                                        # 解析 SSE 格式
-                                        if chunk_str.startswith('data: '):
-                                            import json
-                                            try:
-                                                data = json.loads(chunk_str[6:])
-                                                # 处理工具调用转换
-                                                events = self.tool_call_buffer.process_chunk(data, ToolCallConverter)
-                                                if events:
-                                                    for event in events:
-                                                        yield event.encode('utf-8')
-                                                    continue
-                                            except json.JSONDecodeError:
-                                                pass
-                                        # 如果不是 SSE 格式或转换失败，原样发送
-                                        yield chunk
-                                    except Exception as e:
-                                        logger.debug(f"Chunk processing error: {e}, forwarding as-is")
-                                        yield chunk
-                                else:
-                                    # 未启用转换，直接转发
-                                    yield chunk
+                                yield chunk
 
                 wrapped_response = StreamResponseWrapper(response, first_chunk)
                 return True, wrapped_response
