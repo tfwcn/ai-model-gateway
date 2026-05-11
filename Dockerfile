@@ -32,8 +32,7 @@ RUN playwright install --with-deps chromium && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /root/.cache/playwright
 
-# 复制应用代码
-COPY . .
+# 注意：所有应用代码（包括run.py和start.sh）将在运行时通过卷挂载提供
 
 # 创建非root用户以提高安全性
 RUN adduser --disabled-password --gecos '' appuser && \
@@ -43,5 +42,5 @@ USER appuser
 # 暴露端口（根据FastAPI默认端口）
 EXPOSE 8000
 
-# 启动命令
-CMD ["python", "run.py"]
+# 启动命令 - 使用start.sh脚本
+CMD ["bash", "start.sh"]

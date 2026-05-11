@@ -27,6 +27,20 @@ logs
 .git/
 .gitignore
 
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Documentation
+README.md
+LICENSE
+
+# Test files
+test_*.py
+*_test.py
+tests/
+
 # Other
 .DS_Store
 Thumbs.db
