@@ -14,6 +14,7 @@ from openai_proxy.core.config_loader import ConfigLoader
 from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
+from openai_proxy.utils.sse_parser import SSEEventParser
 
 logger = logging.getLogger(__name__)
 
@@ -206,11 +207,29 @@ class OpenAIProxyService:
                         result = await self.failover_manager.chat_completion_stream(request_data)
                         if hasattr(result, '__aiter__'):
                             # 处理支持异步迭代的对象（包括StreamResponseWrapper和aiohttp.ClientResponse）
-
+                            # 创建 SSE 事件解析器
+                            parser = SSEEventParser(normalize=True)
+                            logger.info("SSE normalization enabled for /v1/chat/completions")
                             async for chunk in result:
                                 if chunk:
-
-                                    yield chunk
+                                    try:
+                                        chunk_str = chunk.decode('utf-8', errors='replace')
+                                        
+                                        # 使用 SSEEventParser 处理 chunk
+                                        events = parser.feed(chunk_str)
+                                        
+                                        # 处理所有完整的事件
+                                        for event in events:
+                                            if not event.strip():
+                                                continue
+                                            
+                                            # SSEEventParser 已经标准化了事件，直接 yield
+                                            yield (event + '\n\n').encode('utf-8')
+                                            
+                                    except Exception as e:
+                                        logger.error(f"SSE normalization error: {e}", exc_info=True)
+                                        # 如果标准化失败，直接透传原始 chunk
+                                        yield chunk
                         else:
                             # 如果返回的是普通响应但请求是流式的，转换为流式格式
 
@@ -229,7 +248,7 @@ class OpenAIProxyService:
 
                         yield error_str.encode() + b"\n"
 
-                return StreamingResponse(stream_generator(), media_type="text/plain")
+                return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:
                 # 普通响应
 
@@ -269,26 +288,75 @@ class OpenAIProxyService:
 
                         # 3. 转换流式事件并转发
                         chunk_count = 0
+                        # 创建 SSE 事件解析器
+                        parser = SSEEventParser(normalize=True)
+                        
                         async for chunk in upstream_stream:
                             chunk_count += 1
                             if chunk:
                                 try:
                                     chunk_str = chunk.decode('utf-8', errors='replace')
                                     logger.debug(f"[{chunk_count}] Raw chunk received: {chunk_str[:200]}...")  # 只记录前200字符
-
-                                    for line in chunk_str.splitlines():
-                                        if line.strip():
-                                            logger.debug(f"[{chunk_count}] Processing line: {line[:150]}...")  # 只记录前150字符
-
-                                            converted_line = self.responses_adapter.convert_stream_event(line)
+                                    
+                                    # 使用 SSEEventParser 处理 chunk
+                                    events = parser.feed(chunk_str)
+                                    
+                                    # 处理所有完整的事件
+                                    for event in events:
+                                        if not event.strip():
+                                            continue
+                                        
+                                        # 每个事件可能有多行（event: 行 + data: 行）
+                                        # 按行处理，重建完整的事件
+                                        lines = event.split('\n')
+                                        event_type = ""
+                                        full_data = ""
+                                        for line in lines:
+                                            stripped = line.strip()
+                                            if not stripped:
+                                                continue
+                                            if stripped.startswith('event:'):
+                                                # 提取 event 类型
+                                                event_type = stripped[6:].strip()
+                                            elif stripped.startswith('data:'):
+                                                # 新的 data 行（包括 "data: " 和 "data:" 两种格式）
+                                                if full_data:
+                                                    # 处理之前累积的数据
+                                                    converted_line = self.responses_adapter.convert_stream_event(full_data)
+                                                    if converted_line:
+                                                        logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
+                                                        yield converted_line.encode('utf-8')
+                                                # 标准化为 "data: " 格式
+                                                if stripped == 'data:':
+                                                    full_data = 'data: '
+                                                elif stripped.startswith('data: '):
+                                                    full_data = stripped
+                                                else:
+                                                    # 处理 "data:[something]" 的情况
+                                                    full_data = 'data: ' + stripped[5:].lstrip()
+                                            elif full_data:
+                                                # 续行（没有 data: 前缀，是前一个 data 行的延续）
+                                                full_data += stripped
+                                        
+                                        # 处理最后累积的数据
+                                        if full_data:
+                                            converted_line = self.responses_adapter.convert_stream_event(full_data)
                                             if converted_line:
-                                                logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")  # 只记录前150字符
+                                                # 对于关键事件（completed, output_item.done等），输出完整日志
+                                                if 'response.completed' in converted_line or 'output_item.done' in converted_line or 'function_call' in converted_line:
+                                                    logger.debug(f"[{chunk_count}] Converted line (FULL): {converted_line}")
+                                                else:
+                                                    logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
                                                 yield converted_line.encode('utf-8')
+                                            
                                 except Exception as e:
                                     logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
                                     logger.error(f"Problematic chunk: {chunk_str if 'chunk_str' in locals() else 'N/A'}")
                     except Exception as e:
                         logger.error(f"Upstream stream error: {e}", exc_info=True)
+                        # 异常时清理上下文状态
+                        if self.responses_adapter.context:
+                            self.responses_adapter.context.cleanup()
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:

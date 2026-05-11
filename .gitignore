@@ -13,3 +13,4 @@ venv/
 openspec/
 __pycache__/
 data/
+logs/
