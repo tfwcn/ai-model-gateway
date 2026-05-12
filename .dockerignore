@@ -14,6 +14,11 @@ pip-delete-this-directory.txt
 logs
 *.log
 
+# Data directories
+data/
+*.rdb
+*.aof
+
 # Environment variables
 .env
 

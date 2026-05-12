@@ -72,6 +72,13 @@ else
 fi
 echo "依赖安装完成"
 
+# 启动 Redis 服务器
+echo "启动 Redis 服务器..."
+REDIS_DATA_DIR="$APP_PATH/data/redis"
+mkdir -p "$REDIS_DATA_DIR"
+redis-server --dir "$REDIS_DATA_DIR" --dbfilename dump.rdb --daemonize yes
+echo "Redis 服务器已启动，数据目录: $REDIS_DATA_DIR"
+
 # 检查并终止已存在的进程
 echo "检查是否存在正在运行的实例..."
 # 构建搜索模式，匹配所有可能的参数组合

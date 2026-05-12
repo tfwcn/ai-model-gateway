@@ -174,12 +174,12 @@ class ToolCapabilityTester:
                         # 检查是否有标准工具调用
                         if tool_calls and len(tool_calls) > 0:
                             return True
-                        
+
                         # 使用转换器检测非标准格式
                         if content and ToolCallConverter.is_non_standard_format(content):
                             logger.debug(f"检测到非标准工具调用格式: {model_id}")
                             return True
-                        
+
                         return False
 
             except asyncio.TimeoutError:
@@ -262,11 +262,12 @@ class ToolCapabilityTester:
                         # 读取流式响应，检查是否有 tool_calls
                         has_tool_calls = False
                         accumulated_content = ""  # 累积content内容用于后续检查
-                        
+
                         async for line in response.content:
                             line = line.decode('utf-8').strip()
-                            if line.startswith('data: '):
-                                data_str = line[6:]
+                            if line.lower().startswith('data:'):
+                                # 提取数据内容并去除前后空格
+                                data_str = line[5:].strip()
                                 if data_str == '[DONE]':
                                     break
 
@@ -278,17 +279,17 @@ class ToolCapabilityTester:
                                         delta = choices[0].get("delta", {})
                                         tool_calls = delta.get("tool_calls")
                                         content = delta.get("content", "")
-                                        
+
                                         # 累积content内容
                                         if content:
                                             accumulated_content += content
-                                        
+
                                         if tool_calls and len(tool_calls) > 0:
                                             has_tool_calls = True
                                             break
                                 except json.JSONDecodeError:
                                     continue
-                        
+
                         # 如果没有检测到标准tool_calls，检查累积的content是否包含非标准格式
                         if not has_tool_calls and accumulated_content:
                             if ToolCallConverter.is_non_standard_format(accumulated_content):
@@ -343,14 +344,14 @@ class ToolCapabilityTester:
                 result = await self.test_single_model(model_id, platform)
                 completed += 1
                 progress = f"{completed}/{total}"
-                
+
                 if result is True:
                     logger.info(f"[{progress}] ✓ {model_id} 支持工具调用")
                 elif result is False:
                     logger.debug(f"[{progress}] ✗ {model_id} 不支持工具调用")
                 else:
                     logger.warning(f"[{progress}] ⚠ {model_id} 测试失败")
-                
+
                 return (model_id, result)
 
         # 创建所有测试任务

@@ -214,18 +214,18 @@ class OpenAIProxyService:
                                 if chunk:
                                     try:
                                         chunk_str = chunk.decode('utf-8', errors='replace')
-                                        
+
                                         # 使用 SSEEventParser 处理 chunk
                                         events = parser.feed(chunk_str)
-                                        
+
                                         # 处理所有完整的事件
                                         for event in events:
                                             if not event.strip():
                                                 continue
-                                            
+
                                             # SSEEventParser 已经标准化了事件，直接 yield
                                             yield (event + '\n\n').encode('utf-8')
-                                            
+
                                     except Exception as e:
                                         logger.error(f"SSE normalization error: {e}", exc_info=True)
                                         # 如果标准化失败，直接透传原始 chunk
@@ -290,22 +290,22 @@ class OpenAIProxyService:
                         chunk_count = 0
                         # 创建 SSE 事件解析器
                         parser = SSEEventParser(normalize=True)
-                        
+
                         async for chunk in upstream_stream:
                             chunk_count += 1
                             if chunk:
                                 try:
                                     chunk_str = chunk.decode('utf-8', errors='replace')
                                     logger.debug(f"[{chunk_count}] Raw chunk received: {chunk_str[:200]}...")  # 只记录前200字符
-                                    
+
                                     # 使用 SSEEventParser 处理 chunk
                                     events = parser.feed(chunk_str)
-                                    
+
                                     # 处理所有完整的事件
                                     for event in events:
                                         if not event.strip():
                                             continue
-                                        
+
                                         # 每个事件可能有多行（event: 行 + data: 行）
                                         # 按行处理，重建完整的事件
                                         lines = event.split('\n')
@@ -326,18 +326,13 @@ class OpenAIProxyService:
                                                     if converted_line:
                                                         logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
                                                         yield converted_line.encode('utf-8')
-                                                # 标准化为 "data: " 格式
-                                                if stripped == 'data:':
-                                                    full_data = 'data: '
-                                                elif stripped.startswith('data: '):
-                                                    full_data = stripped
-                                                else:
-                                                    # 处理 "data:[something]" 的情况
-                                                    full_data = 'data: ' + stripped[5:].lstrip()
+                                                # 标准化为 "data: <content>" 格式，去除 content 前后空格
+                                                data_content = stripped[5:].strip()
+                                                full_data = f"data: {data_content}"
                                             elif full_data:
                                                 # 续行（没有 data: 前缀，是前一个 data 行的延续）
                                                 full_data += stripped
-                                        
+
                                         # 处理最后累积的数据
                                         if full_data:
                                             converted_line = self.responses_adapter.convert_stream_event(full_data)
@@ -348,7 +343,7 @@ class OpenAIProxyService:
                                                 else:
                                                     logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
                                                 yield converted_line.encode('utf-8')
-                                            
+
                                 except Exception as e:
                                     logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
                                     logger.error(f"Problematic chunk: {chunk_str if 'chunk_str' in locals() else 'N/A'}")

@@ -26,13 +26,13 @@ class ResponsesAdapter:
         """
         # 生成请求ID
         request_id = str(uuid.uuid4())
-        
+
         # 创建流式上下文
         self.context = StreamingContext(request_id=request_id)
-        
+
         # 保存模型名称（从请求中提取）
         self.context.model_name = responses_payload.get("model", "unknown")
-        
+
         # 创建请求级别的 custom tools 转换记录（存储在 context 中）
         converted_custom_tools: Dict[str, dict] = {}
 
@@ -506,22 +506,28 @@ class ResponsesAdapter:
         将上游 Chat API 的 SSE 事件转换为 Responses API 格式的事件。
         按照 OpenAI Responses API 标准协议发送完整的事件序列。
         """
+        # 确保 context 已初始化（如果没有通过 convert_request 初始化）
+        if self.context is None:
+            import uuid
+            request_id = str(uuid.uuid4())
+            self.context = StreamingContext(request_id=request_id)
+
         # 处理空行或空白行
         if not event_line or not event_line.strip():
             return None
-        
-        # 必须以 "data: " 开头
-        if not event_line.startswith("data: "):
+
+        # 必须以 "data:" 开头（支持多种格式）
+        stripped_line = event_line.strip()
+        if not stripped_line.lower().startswith("data:"):
             logger.debug(f"Skipping non-data line: {event_line[:100]}...")
             return None
 
         try:
-            data_str = event_line[6:]  # 去掉 "data: " 前缀
-            # 处理可能的多余空格（如 "data:  [DONE]" 有两个空格）
-            data_str = data_str.lstrip()
+            # 提取数据内容并去除前后空格
+            data_str = stripped_line[5:].strip()
             logger.debug(f"Parsing SSE data: {data_str[:200]}...")  # 只记录前200字符
 
-            if data_str.strip() == "[DONE]":
+            if data_str == "[DONE]":
                 # 流式响应结束，发送完成事件序列
                 return self._build_completion_events()
 
@@ -532,12 +538,13 @@ class ResponsesAdapter:
                 logger.error(f"JSON decode error in SSE data: {e}")
                 logger.error(f"Problematic data: {data_str}")
                 logger.error(f"Data length: {len(data_str)}, Error position: {e.pos}")
-                raise
+                # 遇到非正常事件时，打印错误并跳过
+                return None
 
             # 提取 response_id（从第一个chunk中）
             if not self.context.response_id:
                 self.context.response_id = data.get("id", f"resp_{uuid.uuid4().hex}")
-            
+
             # 生成 item_id（如果还没有）
             if not self.context.item_id:
                 self.context.item_id = f"msg_{uuid.uuid4().hex}"
@@ -552,7 +559,7 @@ class ResponsesAdapter:
                         "output_tokens": usage_data.get("completion_tokens") or usage_data.get("output_tokens") or 0,
                     }
                     self.context.usage["total_tokens"] = (
-                        self.context.usage["input_tokens"] + 
+                        self.context.usage["input_tokens"] +
                         self.context.usage["output_tokens"]
                     )
                 return None
@@ -579,7 +586,7 @@ class ResponsesAdapter:
             if content is not None:
                 # 累积文本
                 self.context.accumulated_text += content
-                
+
                 # 发送文本增量事件（使用正确的命名：response.text.delta）
                 seq = self.context.next_sequence()
                 delta_event = {
@@ -594,13 +601,13 @@ class ResponsesAdapter:
             if tool_calls is not None and isinstance(tool_calls, list):
                 # 标记发生了工具调用
                 self.context.has_tool_calls = True
-                
+
                 for tc in tool_calls:
                     if not isinstance(tc, dict):
                         continue
 
                     index = tc.get("index", 0)
-                    
+
                     # 提取完整信息（id, name）
                     has_complete_info = "id" in tc or ("function" in tc and isinstance(tc["function"], dict) and "name" in tc["function"])
 
@@ -622,7 +629,7 @@ class ResponsesAdapter:
                     call_id = cached_state.get("call_id", "")
                     name = cached_state.get("name", "")
                     arguments = tc.get("function", {}).get("arguments", "") if isinstance(tc.get("function"), dict) else ""
-                    
+
                     # 累积参数（delta 是增量，需要拼接到之前的参数上）
                     if index not in self.context.tool_call_states:
                         self.context.tool_call_states[index] = {"call_id": call_id, "name": name, "arguments": arguments}
@@ -635,12 +642,12 @@ class ResponsesAdapter:
                     is_custom_tool = self.context.is_custom_tool(name)
 
                     seq = self.context.next_sequence()
-                    
+
                     if is_custom_tool:
                         # Custom tool: 使用 custom_tool_call_input 事件
                         # 注意：custom tool 的 arguments 是 {"input": "..."} 格式，需要提取 input 字段
                         input_value = self.context.extract_custom_tool_input(arguments)
-                        
+
                         tool_call_event = {
                             "type": "response.custom_tool_call_input.delta",
                             "item_id": self.context.item_id,
@@ -679,7 +686,7 @@ class ResponsesAdapter:
     def build_response_object(self, chat_response: dict, responses_payload: dict, request_id: str) -> tuple:
         """
         将上游 Chat API 的非流式响应转换为 Responses API 格式。
-        
+
         Chat API Response:
         {
             "id": "chatcmpl-xxx",
@@ -689,7 +696,7 @@ class ResponsesAdapter:
             }],
             "usage": {...}
         }
-        
+
         Responses API Response:
         {
             "id": "resp_xxx",
@@ -704,11 +711,11 @@ class ResponsesAdapter:
         """
         # 生成新的 response ID
         new_id = f"resp_{uuid.uuid4().hex}"
-        
+
         # 提取 Chat API 响应内容
         choices = chat_response.get("choices", [])
         usage = chat_response.get("usage", {})
-        
+
         # 构建 output 数组
         output_items = []
         for choice in choices:
@@ -716,7 +723,7 @@ class ResponsesAdapter:
             role = message.get("role", "assistant")
             content = message.get("content", "")
             tool_calls = message.get("tool_calls", [])
-            
+
             if tool_calls:
                 # 工具调用响应
                 for tc in tool_calls:
@@ -724,17 +731,17 @@ class ResponsesAdapter:
                     function_info = tc.get("function", {})
                     name = function_info.get("name", "")
                     arguments = function_info.get("arguments", "{}")
-                    
+
                     # 尝试从 context 中判断是否为 custom tool
                     is_custom_tool = self.context.is_custom_tool(name) if self.context else False
-                    
+
                     if is_custom_tool:
                         # 这是 custom tool，使用 extract_custom_tool_input 提取 input 字段
                         input_value = self.context.extract_custom_tool_input(arguments)
                         logger.debug(f"🔄 [REVERSE CONVERT] Function call '{name}' -> Custom tool call")
                         logger.debug(f"   Arguments: {arguments}")
                         logger.debug(f"   Extracted input: {input_value}")
-                        
+
                         # 转换为 custom_tool_call 格式，使用提取的 input 值
                         output_items.append({
                             "type": "custom_tool_call",
@@ -763,7 +770,7 @@ class ResponsesAdapter:
                         }
                     ]
                 })
-        
+
         # 构建完整的 Responses API 响应对象
         response_obj = {
             "id": new_id,
@@ -792,16 +799,16 @@ class ResponsesAdapter:
             },
             "user": None
         }
-        
+
         # 清理请求级别的转换记录（通过 context.cleanup 自动完成）
         if self.context:
             self.context.cleanup()
-        
+
         return response_obj, new_id
 
     def _build_initial_events(self, for_tool_call: bool = False) -> List[str]:
         """构建初始事件序列（response.queued, created, in_progress, output_item.added, content_part.added）
-        
+
         Args:
             for_tool_call: 如果是为工具调用构建初始事件，则使用 function_call 类型
         """
@@ -901,20 +908,20 @@ class ResponsesAdapter:
         if has_tool_calls:
             # 工具调用的完成事件
             seq = self.context.next_sequence()
-            
+
             # 收集所有工具调用的信息，并检查是否是 custom tool
             tool_calls_info = []
             for index, state in sorted(self.context.tool_call_states.items()):
                 name = state.get("name", "")
                 arguments = state.get("arguments", "")
-                
+
                 # 检查是否是 custom tool
                 is_custom_tool = self.context.is_custom_tool(name)
-                
+
                 if is_custom_tool:
                     # Custom tool: 提取 input 字段
                     input_value = self.context.extract_custom_tool_input(arguments)
-                    
+
                     tool_calls_info.append({
                         "id": state.get("call_id", ""),
                         "type": "custom_tool_call",
@@ -929,7 +936,7 @@ class ResponsesAdapter:
                         "name": name,
                         "arguments": arguments
                     })
-            
+
             # 构建 output_item.done 事件（使用第一个工具的信息）
             first_tool = tool_calls_info[0] if tool_calls_info else {}
             item_done_event = {
@@ -1004,7 +1011,7 @@ class ResponsesAdapter:
 
         # response.completed
         seq = self.context.next_sequence()
-        
+
         # 构建 output 数组（根据是否有工具调用决定类型）
         has_tool_calls = self.context.has_tool_calls
         if has_tool_calls and self.context.tool_call_states:
@@ -1013,14 +1020,14 @@ class ResponsesAdapter:
             for index, state in sorted(self.context.tool_call_states.items()):
                 name = state.get("name", "")
                 arguments = state.get("arguments", "")
-                
+
                 # 检查是否是 custom tool
                 is_custom_tool = self.context.is_custom_tool(name)
-                
+
                 if is_custom_tool:
                     # Custom tool: 提取 input 字段
                     input_value = self.context.extract_custom_tool_input(arguments)
-                    
+
                     output_items.append({
                         "id": self.context.item_id,
                         "type": "custom_tool_call",
@@ -1055,7 +1062,7 @@ class ResponsesAdapter:
                     "status": "completed"
                 }
             ]
-        
+
         # 构建 Response 对象（嵌套在 response 字段中）
         response_obj = {
             "id": response_id,
@@ -1080,7 +1087,7 @@ class ResponsesAdapter:
             "usage": usage,
             "user": None
         }
-        
+
         # 构建 completed 事件（包含 response 字段）
         completed_event = {
             "type": "response.completed",
@@ -1096,4 +1103,3 @@ class ResponsesAdapter:
         self.context.cleanup()
 
         return "".join(events)
-
