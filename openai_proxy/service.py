@@ -306,43 +306,21 @@ class OpenAIProxyService:
                                         if not event.strip():
                                             continue
 
-                                        # 每个事件可能有多行（event: 行 + data: 行）
-                                        # 按行处理，重建完整的事件
+                                        # SSEEventParser 已经标准化了事件格式
+                                        # 从事件中提取 data: 行进行协议转换
                                         lines = event.split('\n')
-                                        event_type = ""
-                                        full_data = ""
                                         for line in lines:
                                             stripped = line.strip()
-                                            if not stripped:
-                                                continue
-                                            if stripped.startswith('event:'):
-                                                # 提取 event 类型
-                                                event_type = stripped[6:].strip()
-                                            elif stripped.startswith('data:'):
-                                                # 新的 data 行（包括 "data: " 和 "data:" 两种格式）
-                                                if full_data:
-                                                    # 处理之前累积的数据
-                                                    converted_line = self.responses_adapter.convert_stream_event(full_data)
-                                                    if converted_line:
+                                            if stripped.lower().startswith('data:'):
+                                                # 提取 data: 行并进行协议转换 (Chat API → Responses API)
+                                                converted_line = self.responses_adapter.convert_stream_event(stripped)
+                                                if converted_line:
+                                                    # 对于关键事件（completed, output_item.done等），输出完整日志
+                                                    if 'response.completed' in converted_line or 'output_item.done' in converted_line or 'function_call' in converted_line:
+                                                        logger.debug(f"[{chunk_count}] Converted line (FULL): {converted_line}")
+                                                    else:
                                                         logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
-                                                        yield converted_line.encode('utf-8')
-                                                # 标准化为 "data: <content>" 格式，去除 content 前后空格
-                                                data_content = stripped[5:].strip()
-                                                full_data = f"data: {data_content}"
-                                            elif full_data:
-                                                # 续行（没有 data: 前缀，是前一个 data 行的延续）
-                                                full_data += stripped
-
-                                        # 处理最后累积的数据
-                                        if full_data:
-                                            converted_line = self.responses_adapter.convert_stream_event(full_data)
-                                            if converted_line:
-                                                # 对于关键事件（completed, output_item.done等），输出完整日志
-                                                if 'response.completed' in converted_line or 'output_item.done' in converted_line or 'function_call' in converted_line:
-                                                    logger.debug(f"[{chunk_count}] Converted line (FULL): {converted_line}")
-                                                else:
-                                                    logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
-                                                yield converted_line.encode('utf-8')
+                                                    yield converted_line.encode('utf-8')
 
                                 except Exception as e:
                                     logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
