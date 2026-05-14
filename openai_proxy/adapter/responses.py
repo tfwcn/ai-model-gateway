@@ -508,7 +508,6 @@ class ResponsesAdapter:
         """
         # 确保 context 已初始化（如果没有通过 convert_request 初始化）
         if self.context is None:
-            import uuid
             request_id = str(uuid.uuid4())
             self.context = StreamingContext(request_id=request_id)
 
