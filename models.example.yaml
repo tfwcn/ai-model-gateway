@@ -7,20 +7,26 @@ modelscope:
     code: "plugin.modelscope"
     cache_timeout: 3600 # 缓存过期时间（秒），默认1小时
     args:
-      # 爬虫配置（必填）
+      # ModelScope 免费模型爬虫配置
       scrape_url: "https://www.modelscope.cn/models?filter=inference_type&page=1&sort=default&tabKey=task" # 爬虫URL（必填）
-      max_models: 50 # 获取的最大模型数量
+      max_models: 10 # 获取的最大模型数量
       scraper_timeout: 60 # 爬虫超时时间（秒）
       headless: true # 无头模式运行浏览器
 
       # 定时任务配置
       enable_scheduled_task: true # 是否启用定时任务
       schedule_cron: "0 2 * * *" # cron表达式，每天凌晨2点执行
-  models: [] # 静态配置的模型（可选，会追加到爬虫获取的模型后面）
-  timeout: 30
-  weight: 10 # 权重较高，优先使用
+
+      # 工具调用能力测试配置
+      enable_tool_capability_test: true
+      max_concurrent_tests: 1 # 串行测试，避免限流
+      test_timeout_seconds: 60
+  models: [] # 静态配置的模型（可选）
+  timeout: 10
+  weight: 1
   enabled: true
   quota_period: "daily" # 每日额度刷新
+  retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
 
 # openai:
 #   baseUrl: "https://api.openai.com/v1"
@@ -32,6 +38,7 @@ modelscope:
 #   weight: 5 # 权重较低，作为备选
 #   enabled: true
 #   quota_period: "monthly" # 月度额度刷新
+#   retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
 
 # OpenRouter 免费模型配置示例
 # 使用网页爬虫从 openrouter.ai 获取免费模型列表
@@ -40,23 +47,29 @@ openrouter:
   apiKey: "${OPENROUTER_API_KEY}"
   plugin:
     code: "plugin.openrouter"
-    cache_timeout: 300 # 缓存过期时间（秒），默认5分钟
+    cache_timeout: 3600 # 缓存过期时间（秒），默认1小时
     args:
-      # 爬虫配置（必填）
+      # OpenRouter 免费模型爬虫配置
       scrape_url: "https://openrouter.ai/models?fmt=cards&input_modalities=text&max_price=0&order=most-popular&output_modalities=text" # 爬虫URL（必填）
-      max_models: 50 # 获取的最大模型数量
+      max_models: 10 # 获取的最大模型数量
       scraper_timeout: 60 # 爬虫超时时间（秒）
       headless: true # 无头模式运行浏览器
 
       # 定时任务配置
       enable_scheduled_task: true # 是否启用定时任务
       schedule_cron: "0 2 * * *" # cron表达式，每天凌晨2点执行
+
+      # 工具调用能力测试配置
+      enable_tool_capability_test: true
+      max_concurrent_tests: 1 # 串行测试，避免限流
+      test_timeout_seconds: 60
   models:
     # 静态配置的模型会放在插件返回的模型后面（可选）
     - openrouter/free
   timeout: 10
   weight: 1
   enabled: true
+  retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
 
 # NVIDIA NIM 免费模型配置示例
 # 使用网页爬虫从 build.nvidia.com 获取免费预览模型列表
@@ -77,10 +90,16 @@ nvidia:
       # 定时任务配置
       enable_scheduled_task: true # 是否启用定时任务
       schedule_cron: "0 2 * * *" # cron表达式，每天凌晨2点执行
-  models: [] # 静态配置的模型（可选，会追加到爬虫获取的模型后面）
-  timeout: 30
-  weight: 5
+
+      # 工具调用能力测试配置
+      enable_tool_capability_test: true
+      max_concurrent_tests: 1 # 串行测试，避免限流
+      test_timeout_seconds: 60
+  models: [] # 静态配置的模型（可选）
+  timeout: 60
+  weight: 1
   enabled: true
+  retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
 
 # azure:
 #   baseUrl: "https://your-resource.openai.azure.com/openai/deployments"
@@ -92,6 +111,7 @@ nvidia:
 #   weight: 8 # 权重中等
 #   enabled: true
 #   quota_period: "weekly" # 周度额度刷新
+#   retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
 
 # local:
 #   baseUrl: "http://localhost:11434/v1"
@@ -101,4 +121,5 @@ nvidia:
 #   timeout: 120
 #   weight: 1 # 权重最低，最后使用
 #   enabled: true
+#   retry_count: 1 # 本地模型无需重试，设为1
 #   # 无quota_period配置，表示无额度限制，始终可用

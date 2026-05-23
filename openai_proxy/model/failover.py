@@ -426,6 +426,80 @@ class ModelFailoverManager:
             logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
             return False, classified_error
 
+    async def _try_single_model_with_retry(
+        self,
+        model_config: ModelConfig,
+        request_data: Dict[str, Any],
+        is_stream: bool,
+    ) -> Dict[str, Any]:
+        max_retries = model_config.retry_count
+        """
+        尝试单个模型调用，支持基于错误类型的智能重试
+
+        Args:
+            model_config: 模型配置
+            request_data: 请求数据
+            is_stream: 是否为流式调用
+            max_retries: 最大重试次数，默认3次
+
+        Returns:
+            Dict: {"success": bool, "data": Any, "error": str}
+        """
+        for attempt in range(1, max_retries + 1):
+            if is_stream:
+                success, result = await self.call_model_stream(model_config, request_data)
+            else:
+                success, result = await self.call_model_non_stream(model_config, request_data)
+
+            if success:
+                logger.info(f"模型 {model_config.name} 调用成功（{'流式' if is_stream else '非流式'}）")
+                return {"success": True, "data": result, "error": None}
+
+            # 根据错误类型决定是否重试
+            if isinstance(result, ClassifiedError):
+                classified_error = result
+                error_summary = ErrorClassifier.get_error_summary(classified_error)
+                logger.warning(
+                    f"模型 {model_config.name} 第 {attempt}/{max_retries} 次尝试失败: {error_summary}"
+                )
+
+                # 如果错误分类建议禁用模型，则禁用
+                if classified_error.should_disable_model:
+                    if model_config.quota_period is not None:
+                        logger.warning(
+                            f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）"
+                        )
+                        await self.model_state_manager.disable_model_for_period(model_config)
+                    # 配置了 quota_period 的模型禁用后不再重试
+                    return {"success": False, "error": classified_error.message, "data": None}
+
+                # 如果错误不可重试，直接返回失败
+                if not classified_error.is_retryable:
+                    return {"success": False, "error": classified_error.message, "data": None}
+
+                # 可重试的错误，等待延迟后继续
+                if attempt < max_retries:
+                    delay = classified_error.retry_delay_seconds
+                    logger.info(f"将在 {delay:.1f} 秒后进行第 {attempt + 1} 次重试...")
+                    await asyncio.sleep(delay)
+            else:
+                # 兼容旧版本的字符串错误
+                error_msg = str(result)
+                logger.warning(f"模型 {model_config.name} 第 {attempt}/{max_retries} 次尝试失败: {error_msg}")
+                if model_config.quota_period is not None:
+                    logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
+                    await self.model_state_manager.disable_model_for_period(model_config)
+                    return {"success": False, "error": error_msg, "data": None}
+
+                # 旧版字符串错误，等待后重试
+                if attempt < max_retries:
+                    await asyncio.sleep(2)
+
+        # 所有重试均失败
+        last_error = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+        logger.error(f"模型 {model_config.name} 在 {max_retries} 次尝试后仍失败: {last_error}")
+        return {"success": False, "error": last_error, "data": None}
+
     async def _try_platform_models_non_stream(self, platform_name: str, platform_models: List[ModelConfig], request_data: Dict[str, Any]) -> Dict[str, Any]:
         """尝试平台内的模型（非流式），支持轮询机制"""
         # 过滤启用且当前周期内可用的模型
@@ -631,13 +705,15 @@ class ModelFailoverManager:
                     logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
                     raise HTTPException(status_code=400, detail=f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
 
-                # 只尝试指定的单个模型
-                success, result = await self.call_model_non_stream(target_model, request_data)
-                if success:
+                # 模式3: 指定单个模型，使用带重试的方法调用
+                retry_result = await self._try_single_model_with_retry(
+                    target_model, request_data, is_stream=False
+                )
+                if retry_result["success"]:
                     logger.info(f"模型 {target_model.name} 调用成功（非流式）")
-                    return result
+                    return retry_result["data"]
                 else:
-                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+                    error_message = retry_result["error"]
                     logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
                     raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
 
@@ -727,13 +803,15 @@ class ModelFailoverManager:
                     logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
                     raise HTTPException(status_code=400, detail=f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
 
-                # 只尝试指定的单个模型
-                success, result = await self.call_model_stream(target_model, request_data)
-                if success:
+                # 模式3: 指定单个模型，使用带重试的方法调用
+                retry_result = await self._try_single_model_with_retry(
+                    target_model, request_data, is_stream=True
+                )
+                if retry_result["success"]:
                     logger.info(f"模型 {target_model.name} 调用成功（流式）")
-                    return result
+                    return retry_result["data"]
                 else:
-                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+                    error_message = retry_result["error"]
                     logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
                     raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
 
