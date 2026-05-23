@@ -9,7 +9,8 @@ from typing import Dict, List, Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from openai_proxy.models import ModelConfig
+from openai_proxy.core.cache import MemoryCache
+from openai_proxy.models import ModelConfig, list_available_models
 from openai_proxy.core.config_loader import ConfigLoader
 from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
@@ -29,6 +30,9 @@ class OpenAIProxyService:
         self.failover_manager = None
         self.responses_adapter = None
         self.session_store = None
+
+        cache_ttl = int(os.getenv("MODELS_API_CACHE_TTL", "300"))
+        self.model_list_cache = MemoryCache(default_ttl=cache_ttl)
 
     async def initialize(self):
         """异步初始化服务
@@ -381,6 +385,53 @@ class OpenAIProxyService:
                 await self.session_store.save_session(new_id, full_history, original_output=response_obj.get("output"))
 
                 return response_obj
+
+        @app.get("/v1/models")
+        async def get_models(request: Request):
+            """返回代理当前可用模型列表"""
+            try:
+                provider = request.query_params.get("provider")
+                capability = request.query_params.get("capability")
+                q = request.query_params.get("q")
+                limit = int(request.query_params.get("limit", 50))
+                offset = int(request.query_params.get("offset", 0))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="limit 和 offset 必须是整数")
+
+            if limit < 0 or offset < 0:
+                raise HTTPException(status_code=400, detail="limit 和 offset 必须为非负整数")
+
+            cache_key = json.dumps({
+                "provider": provider,
+                "capability": capability,
+                "q": q,
+                "limit": limit,
+                "offset": offset
+            }, sort_keys=True, ensure_ascii=False)
+
+            cached_response = await self.model_list_cache.get(cache_key)
+            if cached_response is not None:
+                return cached_response
+
+            try:
+                items, total = list_available_models(
+                    self.models,
+                    provider=provider,
+                    capability=capability,
+                    q=q,
+                    limit=limit,
+                    offset=offset,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"无法获取模型列表: {str(e)}")
+
+            response = {
+                "data": items,
+                "meta": {"total": total, "limit": limit, "offset": offset}
+            }
+
+            await self.model_list_cache.set(cache_key, response)
+            return response
 
         @app.get("/health")
         async def health_check():

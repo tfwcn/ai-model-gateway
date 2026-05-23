@@ -26,6 +26,32 @@ class ModelFailoverManager:
         self.session: Optional[aiohttp.ClientSession] = None
         self.model_state_manager = ModelStateManager()
 
+    def _parse_model_selector(self, model_selector: str) -> Tuple[str, Optional[str]]:
+        """
+        解析模型选择器，支持三种格式：
+        1. "all" - 所有平台所有模型
+        2. "{platform}|all" - 指定平台的所有模型
+        3. "{platform}|{model_name}" - 指定平台的指定模型
+
+        Returns:
+            Tuple[str, Optional[str]]: (platform_or_all, model_name_or_none)
+            - 如果是 "all"，返回 ("all", None)
+            - 如果是 "{platform}|all"，返回 ("{platform}", None)
+            - 如果是 "{platform}|{model_name}"，返回 ("{platform}", "{model_name}")
+        """
+        if model_selector == "all":
+            return ("all", None)
+
+        parts = model_selector.split("|", 1)
+        if len(parts) == 2:
+            platform = parts[0].strip()
+            model_part = parts[1].strip()
+            if model_part == "all":
+                return (platform, None)
+            return (platform, model_part)
+
+        return (model_selector, None)
+
     async def get_session(self) -> aiohttp.ClientSession:
         """获取HTTP会话"""
         if self.session is None or self.session.closed:
@@ -524,18 +550,25 @@ class ModelFailoverManager:
         """
         执行非流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
+
+        支持三种模型选择器格式：
+        1. "all" - 所有平台所有模型
+        2. "{platform}|all" - 指定平台的所有模型
+        3. "{platform}|{model_name}" - 指定平台的指定模型
         """
         # 处理可选参数的默认值
-        model_group = request_data.get("model")
+        model_selector = request_data.get("model", "all")
         messages = request_data.get("messages")
 
         # 验证必要参数
         if not messages:
-
             raise HTTPException(status_code=400, detail="messages参数是必需的")
 
-        if model_group is None or model_group == "all":
-            # 获取所有平台并按权重排序（weight值越大优先级越高）
+        # 解析模型选择器
+        platform_or_all, model_name = self._parse_model_selector(model_selector)
+
+        if platform_or_all == "all":
+            # 模式1: all - 所有平台所有模型
             all_platforms = list(self.models.keys())
 
             if not all_platforms:
@@ -570,36 +603,68 @@ class ModelFailoverManager:
             logger.error(f"所有平台都失败了，最后错误: {last_error}")
             raise HTTPException(status_code=500, detail=f"所有模型都不可用: {last_error}")
         else:
-            # 指定特定平台
-            if model_group not in self.models or not self.models[model_group]:
-                logger.error(f"DEBUG: 模型组 '{model_group}' 未配置或无可用模型")
-                raise HTTPException(status_code=400, detail=f"模型组 '{model_group}' 未配置或无可用模型")
+            # 模式2或模式3: 指定平台
+            platform_name = platform_or_all
+            if platform_name not in self.models or not self.models[platform_name]:
+                logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
+                raise HTTPException(status_code=400, detail=f"平台 '{platform_name}' 未配置或无可用模型")
 
-            platform_models = self.models[model_group]
-            result = await self._try_platform_models_non_stream(model_group, platform_models, request_data)
-            if result["success"]:
-                return result["data"]
+            if model_name is None:
+                # 模式2: {platform}|all - 指定平台的所有模型
+                platform_models = self.models[platform_name]
+                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data)
+                if result["success"]:
+                    return result["data"]
+                else:
+                    logger.error(f"指定平台 '{platform_name}' 所有模型都失败了: {result['error']}")
+                    raise HTTPException(status_code=500, detail=f"平台 '{platform_name}' 所有模型都不可用: {result['error']}")
             else:
-                logger.error(f"指定平台 '{model_group}' 所有模型都失败了: {result['error']}")
-                raise HTTPException(status_code=500, detail=f"模型组 '{model_group}' 所有模型都不可用: {result['error']}")
+                # 模式3: {platform}|{model_name} - 指定平台的指定模型
+                platform_models = self.models[platform_name]
+                target_model = None
+                for model_config in platform_models:
+                    if model_config.name == model_name or model_config.model == model_name:
+                        target_model = model_config
+                        break
+
+                if target_model is None:
+                    logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
+                    raise HTTPException(status_code=400, detail=f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
+
+                # 只尝试指定的单个模型
+                success, result = await self.call_model_non_stream(target_model, request_data)
+                if success:
+                    logger.info(f"模型 {target_model.name} 调用成功（非流式）")
+                    return result
+                else:
+                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+                    logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
+                    raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
 
     async def chat_completion_stream(self, request_data: Dict[str, Any]) -> Any:
         """
         执行流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         注意：流式请求必须在开始传输前完成所有模型选择，不能在流式过程中切换
+
+        支持三种模型选择器格式：
+        1. "all" - 所有平台所有模型
+        2. "{platform}|all" - 指定平台的所有模型
+        3. "{platform}|{model_name}" - 指定平台的指定模型
         """
         # 处理可选参数的默认值
-        model_group = request_data.get("model")
+        model_selector = request_data.get("model", "all")
         messages = request_data.get("messages")
 
         # 验证必要参数
         if not messages:
-
             raise HTTPException(status_code=400, detail="messages参数是必需的")
 
-        if model_group is None or model_group == "all":
-            # 获取所有平台并按权重排序（weight值越大优先级越高）
+        # 解析模型选择器
+        platform_or_all, model_name = self._parse_model_selector(model_selector)
+
+        if platform_or_all == "all":
+            # 模式1: all - 所有平台所有模型
             all_platforms = list(self.models.keys())
 
             if not all_platforms:
@@ -634,18 +699,43 @@ class ModelFailoverManager:
             logger.error(f"所有平台都失败了，最后错误: {last_error}")
             raise HTTPException(status_code=500, detail=f"所有模型都不可用: {last_error}")
         else:
-            # 指定特定平台
-            if model_group not in self.models or not self.models[model_group]:
-                logger.error(f"DEBUG: 模型组 '{model_group}' 未配置或无可用模型")
-                raise HTTPException(status_code=400, detail=f"模型组 '{model_group}' 未配置或无可用模型")
+            # 模式2或模式3: 指定平台
+            platform_name = platform_or_all
+            if platform_name not in self.models or not self.models[platform_name]:
+                logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
+                raise HTTPException(status_code=400, detail=f"平台 '{platform_name}' 未配置或无可用模型")
 
-            platform_models = self.models[model_group]
-            result = await self._try_platform_models_stream(model_group, platform_models, request_data)
-            if result["success"]:
-                return result["data"]
+            if model_name is None:
+                # 模式2: {platform}|all - 指定平台的所有模型
+                platform_models = self.models[platform_name]
+                result = await self._try_platform_models_stream(platform_name, platform_models, request_data)
+                if result["success"]:
+                    return result["data"]
+                else:
+                    logger.error(f"指定平台 '{platform_name}' 所有模型都失败了: {result['error']}")
+                    raise HTTPException(status_code=500, detail=f"平台 '{platform_name}' 所有模型都不可用: {result['error']}")
             else:
-                logger.error(f"指定平台 '{model_group}' 所有模型都失败了: {result['error']}")
-                raise HTTPException(status_code=500, detail=f"模型组 '{model_group}' 所有模型都不可用: {result['error']}")
+                # 模式3: {platform}|{model_name} - 指定平台的指定模型
+                platform_models = self.models[platform_name]
+                target_model = None
+                for model_config in platform_models:
+                    if model_config.name == model_name or model_config.model == model_name:
+                        target_model = model_config
+                        break
+
+                if target_model is None:
+                    logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
+                    raise HTTPException(status_code=400, detail=f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
+
+                # 只尝试指定的单个模型
+                success, result = await self.call_model_stream(target_model, request_data)
+                if success:
+                    logger.info(f"模型 {target_model.name} 调用成功（流式）")
+                    return result
+                else:
+                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
+                    logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
+                    raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
 
     async def close(self):
         """关闭会话"""

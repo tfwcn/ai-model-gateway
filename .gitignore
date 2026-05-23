@@ -9,6 +9,9 @@ venv/
 .opencode/
 .lingma/
 .trae/
+.codex/
+.github/
+.qoder/
 .cache/
 openspec/
 __pycache__/

@@ -54,21 +54,53 @@ pip install --upgrade pip
 pip install -r "$APP_PATH/requirements.txt"
 export PLAYWRIGHT_BROWSERS_PATH="$APP_PATH/.cache/ms-playwright"
 mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
-# 安装 Chromium 浏览器及其系统依赖（仅在未安装时执行）
-CHROMIUM_INSTALLED=false
-for dir in $PLAYWRIGHT_BROWSERS_PATH/chromium-*; do
-    if [ -d "$dir" ]; then
-        CHROMIUM_INSTALLED=true
-        break
-    fi
-done
 
-if [ "$CHROMIUM_INSTALLED" = false ]; then
-    echo "Chromium 浏览器未安装，正在安装..."
-    playwright install --with-deps chromium
-    echo "Chromium 浏览器安装完成"
+# 检查 Chromium 浏览器及其依赖是否完整可用
+check_chromium_installed() {
+    # 1. 检查浏览器目录是否存在
+    CHROMIUM_DIR_EXISTS=false
+    for dir in $PLAYWRIGHT_BROWSERS_PATH/chromium-*; do
+        if [ -d "$dir" ]; then
+            CHROMIUM_DIR_EXISTS=true
+            break
+        fi
+    done
+    
+    if [ "$CHROMIUM_DIR_EXISTS" = false ]; then
+        echo "Chromium 浏览器目录不存在"
+        return 1
+    fi
+    
+    # 2. 检查关键运行库是否可用（以 libglib-2.0 为例）
+    if ! ldconfig -p | grep -q "libglib-2.0"; then
+        echo "关键运行库 libglib-2.0 未找到"
+        return 1
+    fi
+    
+    # 3. 尝试运行 chromium 检查是否能正常加载
+    CHROMIUM_BINARY="$(find $PLAYWRIGHT_BROWSERS_PATH/chromium-*/chrome-linux* -name 'chrome' -o -name 'chrome-headless-shell' 2>/dev/null | head -1)"
+    if [ -n "$CHROMIUM_BINARY" ] && [ -f "$CHROMIUM_BINARY" ]; then
+        if ! ldd "$CHROMIUM_BINARY" 2>/dev/null | grep -q "not found"; then
+            echo "Chromium 浏览器及依赖检查通过"
+            return 0
+        else
+            echo "Chromium 浏览器存在但缺少依赖库"
+            return 1
+        fi
+    fi
+    
+    echo "Chromium 浏览器可执行文件未找到"
+    return 1
+}
+
+echo "检查 Chromium 浏览器状态..."
+if check_chromium_installed; then
+    echo "Chromium 浏览器已安装且可用，跳过安装步骤"
 else
-    echo "Chromium 浏览器已安装，跳过安装步骤"
+    echo "Chromium 浏览器不完整或不可用，正在安装..."
+    playwright install --with-deps chromium
+    playwright install --with-deps chromium-headless-shell
+    echo "Chromium 浏览器安装完成"
 fi
 echo "依赖安装完成"
 

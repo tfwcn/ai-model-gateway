@@ -5,7 +5,8 @@ WORKDIR /app
 
 # 设置环境变量
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright
 
 # 安装系统基础依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,11 +14,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     ca-certificates \
     redis-server \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
-# 注意：所有应用代码、虚拟环境和依赖将在运行时通过start.sh安装
+# 复制依赖文件并安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 注意：所有应用代码（包括run.py和start.sh）将在运行时通过卷挂载提供
+# 创建浏览器缓存目录并安装 Playwright 浏览器
+RUN mkdir -p /app/.cache/ms-playwright && \
+    playwright install --with-deps chromium && \
+    playwright install --with-deps chromium-headless-shell && \
+    # 清理 Playwright 下载缓存以减小镜像体积
+    rm -rf /root/.cache/ms-playwright/download-archives && \
+    rm -rf /root/.cache/pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# 复制应用代码
+COPY . .
 
 # 临时使用root用户启动（调试用）
 # 创建非root用户以提高安全性
