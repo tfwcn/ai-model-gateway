@@ -79,6 +79,7 @@ class StreamingContext:
         self.accumulated_text: str = ""
         self.usage: Optional[Dict[str, int]] = None
         self.has_tool_calls: bool = False
+        self.has_received_done: bool = False  # 上游是否发送了 [DONE]
         self.model_name: str = "unknown"  # 从请求或上游响应动态获取
         
         # 工具调用状态（对应原 _streaming_tool_call_state）

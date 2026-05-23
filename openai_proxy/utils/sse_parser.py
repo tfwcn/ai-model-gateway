@@ -4,7 +4,7 @@ SSE Event Parser - 统一的 SSE 事件解析和缓冲管理工具类
 提供跨 chunk 的事件拼接和标准化功能,消除 service.py 中重复的 SSE 缓冲区管理逻辑。
 
 设计动机:
-- 在重构前,/v1/chat/completions 和 /v1/responses 两个端点各自实现了几乎相同的 
+- 在重构前,/v1/chat/completions 和 /v1/responses 两个端点各自实现了几乎相同的
   SSE 事件缓冲区管理逻辑(约 80% 代码重复)
 - 将此逻辑提取为独立工具类后,消除了重复代码,提高了可维护性和可测试性
 - 支持事件格式标准化,统一 event: 和 data: 行的格式

@@ -528,6 +528,7 @@ class ResponsesAdapter:
 
             if data_str == "[DONE]":
                 # 流式响应结束，发送完成事件序列
+                self.context.has_received_done = True
                 return self._build_completion_events()
 
             # 尝试解析 JSON

@@ -214,6 +214,7 @@ class OpenAIProxyService:
                             # 创建 SSE 事件解析器
                             parser = SSEEventParser(normalize=True)
                             logger.info("SSE normalization enabled for /v1/chat/completions")
+                            done_sent = False
                             async for chunk in result:
                                 if chunk:
                                     try:
@@ -229,6 +230,8 @@ class OpenAIProxyService:
 
                                             # SSEEventParser 已经标准化了事件，直接 yield
                                             yield (event + '\n\n').encode('utf-8')
+                                            if "[DONE]" in event:
+                                                done_sent = True
 
                                     except Exception as e:
                                         logger.error(f"SSE normalization error: {e}", exc_info=True)
@@ -236,8 +239,32 @@ class OpenAIProxyService:
                                         yield chunk
                         else:
                             # 如果返回的是普通响应但请求是流式的，转换为流式格式
+                            try:
+                                if isinstance(result, (bytes, bytearray)):
+                                    payload = bytes(result)
+                                elif isinstance(result, str):
+                                    payload = result.encode('utf-8')
+                                else:
+                                    # 兼容 aiohttp.ClientResponse 等对象
+                                    if hasattr(result, 'text'):
+                                        payload = (await result.text()).encode('utf-8')
+                                    elif hasattr(result, 'read'):
+                                        raw = await result.read()
+                                        payload = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode('utf-8')
+                                    else:
+                                        payload = json.dumps(result, ensure_ascii=False).encode('utf-8')
+                            except Exception as e:
+                                logger.error(f"Stream fallback serialization error: {e}", exc_info=True)
+                                payload = str(result).encode('utf-8')
 
-                            yield result_str.encode() + b"\n"
+                            yield payload + b"\n"
+
+                        # 上游流结束,确保发送 [DONE] 终止标记
+                        # 对于某些上游(如 ModelScope)不发 [DONE] 的情况,需要手动补发
+                        if not done_sent:
+                            logger.info("Upstream did not send [DONE], appending termination marker")
+                            yield b"data: [DONE]\n\n"
+
                     except Exception as e:
 
                         error_response = {
@@ -329,6 +356,15 @@ class OpenAIProxyService:
                                 except Exception as e:
                                     logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
                                     logger.error(f"Problematic chunk: {chunk_str if 'chunk_str' in locals() else 'N/A'}")
+
+                        # 上游流结束,检查是否已发出完成事件
+                        # 对于某些上游(如 ModelScope)不发 [DONE] 的情况,需要手动补发
+                        if self.responses_adapter.context and not self.responses_adapter.context.has_received_done:
+                            logger.info("Upstream did not send [DONE], emitting completion events")
+                            completion_events = self.responses_adapter._build_completion_events()
+                            if completion_events:
+                                yield completion_events.encode('utf-8')
+
                     except Exception as e:
                         logger.error(f"Upstream stream error: {e}", exc_info=True)
                         # 异常时清理上下文状态
