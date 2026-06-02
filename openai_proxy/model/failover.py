@@ -30,13 +30,13 @@ class ModelFailoverManager:
         """
         解析模型选择器，支持三种格式：
         1. "all" - 所有平台所有模型
-        2. "{platform}|all" - 指定平台的所有模型
+        2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
 
         Returns:
             Tuple[str, Optional[str]]: (platform_or_all, model_name_or_none)
             - 如果是 "all"，返回 ("all", None)
-            - 如果是 "{platform}|all"，返回 ("{platform}", None)
+            - 如果是 "{platform}"，返回 ("{platform}", None)
             - 如果是 "{platform}|{model_name}"，返回 ("{platform}", "{model_name}")
         """
         if model_selector == "all":
@@ -46,8 +46,6 @@ class ModelFailoverManager:
         if len(parts) == 2:
             platform = parts[0].strip()
             model_part = parts[1].strip()
-            if model_part == "all":
-                return (platform, None)
             return (platform, model_part)
 
         return (model_selector, None)
@@ -627,7 +625,7 @@ class ModelFailoverManager:
 
         支持三种模型选择器格式：
         1. "all" - 所有平台所有模型
-        2. "{platform}|all" - 指定平台的所有模型
+        2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
         """
         # 处理可选参数的默认值
@@ -684,7 +682,7 @@ class ModelFailoverManager:
                 raise HTTPException(status_code=400, detail=f"平台 '{platform_name}' 未配置或无可用模型")
 
             if model_name is None:
-                # 模式2: {platform}|all - 指定平台的所有模型
+                # 模式2: {platform} - 指定平台的所有模型
                 platform_models = self.models[platform_name]
                 result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data)
                 if result["success"]:
@@ -725,7 +723,7 @@ class ModelFailoverManager:
 
         支持三种模型选择器格式：
         1. "all" - 所有平台所有模型
-        2. "{platform}|all" - 指定平台的所有模型
+        2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
         """
         # 处理可选参数的默认值
@@ -782,7 +780,7 @@ class ModelFailoverManager:
                 raise HTTPException(status_code=400, detail=f"平台 '{platform_name}' 未配置或无可用模型")
 
             if model_name is None:
-                # 模式2: {platform}|all - 指定平台的所有模型
+                # 模式2: {platform} - 指定平台的所有模型
                 platform_models = self.models[platform_name]
                 result = await self._try_platform_models_stream(platform_name, platform_models, request_data)
                 if result["success"]:

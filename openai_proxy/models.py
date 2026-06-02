@@ -65,7 +65,7 @@ def list_available_models(
 
     返回三种格式的模型：
     1. "all" - 所有平台所有模型
-    2. "{platform}|all" - 指定平台的所有模型
+    2. "{platform}" - 指定平台的所有模型
     3. "{platform}|{model_name}" - 指定平台的指定模型
     """
     all_items: List[Dict[str, Any]] = []
@@ -86,9 +86,9 @@ def list_available_models(
         if provider and platform.lower() != provider.lower():
             continue
 
-        # 添加平台级别的 "{platform}|all" 选项
+        # 添加平台级别的 "{platform}" 选项
         all_items.append({
-            "id": f"{platform}|all",
+            "id": platform,
             "name": f"{platform} 平台所有模型",
             "provider": platform,
             "capabilities": ["chat", "completion"],
