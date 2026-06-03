@@ -1,3 +1,8 @@
+# "all" 的别名配置 - 使用这些别名同样会遍历所有平台的所有模型
+# all_aliases:
+#   - "全部"
+#   - "everything"
+
 # ModelScope 免费模型配置示例
 # 使用网页爬虫从 modelscope.cn 获取热门免费模型列表
 modelscope:
@@ -22,6 +27,11 @@ modelscope:
       max_concurrent_tests: 1 # 串行测试，避免限流
       test_timeout_seconds: 60
   models: [] # 静态配置的模型（可选）
+  # 黑名单：爬虫抓取但无法使用的模型，支持 * 通配符匹配
+  # 示例：
+  #   - "Qwen/Qwen2.5-7B-Instruct"  # 精确匹配
+  #   - "iic/*"                       # 匹配 iic/ 开头的所有模型
+  blacklist: []
   timeout: 10
   weight: 1
   enabled: true
@@ -66,6 +76,8 @@ openrouter:
   models:
     # 静态配置的模型会放在插件返回的模型后面（可选）
     - openrouter/free
+  # 黑名单：爬虫抓取但无法使用的模型，支持 * 通配符匹配
+  blacklist: []
   timeout: 10
   weight: 1
   enabled: true
@@ -96,6 +108,8 @@ nvidia:
       max_concurrent_tests: 1 # 串行测试，避免限流
       test_timeout_seconds: 60
   models: [] # 静态配置的模型（可选）
+  # 黑名单：爬虫抓取但无法使用的模型，支持 * 通配符匹配
+  blacklist: []
   timeout: 60
   weight: 1
   enabled: true

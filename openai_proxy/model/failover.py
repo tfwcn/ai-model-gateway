@@ -21,8 +21,9 @@ logger = logging.getLogger(__name__)
 class ModelFailoverManager:
     """模型故障转移管理器 - 负责模型选择、调用和故障转移"""
 
-    def __init__(self, models: Dict[str, List[ModelConfig]]):
+    def __init__(self, models: Dict[str, List[ModelConfig]], all_aliases: Optional[List[str]] = None):
         self.models = models
+        self.all_aliases = all_aliases or []
         self.session: Optional[aiohttp.ClientSession] = None
         self.model_state_manager = ModelStateManager()
 
@@ -39,7 +40,7 @@ class ModelFailoverManager:
             - 如果是 "{platform}"，返回 ("{platform}", None)
             - 如果是 "{platform}|{model_name}"，返回 ("{platform}", "{model_name}")
         """
-        if model_selector == "all":
+        if model_selector == "all" or model_selector in self.all_aliases:
             return ("all", None)
 
         parts = model_selector.split("|", 1)

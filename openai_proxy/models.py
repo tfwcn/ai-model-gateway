@@ -60,6 +60,7 @@ def list_available_models(
     q: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    all_aliases: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """按筛选条件聚合可用模型列表
 
@@ -68,19 +69,24 @@ def list_available_models(
     2. "{platform}" - 指定平台的所有模型
     3. "{platform}|{model_name}" - 指定平台的指定模型
     """
+    all_aliases = all_aliases or []
     all_items: List[Dict[str, Any]] = []
 
-    # 先添加 "all" 选项
-    all_items.append({
-        "id": "all",
-        "name": "所有平台所有模型",
-        "provider": "all",
-        "capabilities": ["chat", "completion"],
-        "metadata": {
-            "type": "group",
-            "description": "遍历所有平台的所有模型，按权重排序"
-        }
-    })
+    # 构造所有可用的别名ID列表
+    all_ids = ["all"] + all_aliases
+
+    # 为每个别名添加 "all" 选项
+    for alias_id in all_ids:
+        all_items.append({
+            "id": alias_id,
+            "name": "所有平台所有模型",
+            "provider": "all",
+            "capabilities": ["chat", "completion"],
+            "metadata": {
+                "type": "group",
+                "description": "遍历所有平台的所有模型，按权重排序"
+            }
+        })
 
     for platform, model_configs in models.items():
         if provider and platform.lower() != provider.lower():

@@ -1,5 +1,6 @@
 import os
 import json
+import fnmatch
 import yaml
 import logging
 from typing import Dict, List, Any
@@ -15,6 +16,7 @@ class ConfigLoader:
     def __init__(self, config_file: str = "models.yaml"):
         self.config_file = config_file
         self.plugin_manager = PluginManager()
+        self.all_aliases: List[str] = []
 
     async def load_config(self) -> Dict[str, List[ModelConfig]]:
         """加载模型配置"""
@@ -42,6 +44,9 @@ class ConfigLoader:
                         config_data = json.load(f)
 
                 # 解析新格式的配置
+                self.all_aliases = config_data.pop('all_aliases', []) or []
+                if not isinstance(self.all_aliases, list):
+                    self.all_aliases = []
                 models = {}
                 for platform_name, platform_config in config_data.items():
                     if not isinstance(platform_config, dict):
@@ -88,6 +93,18 @@ class ConfigLoader:
                     else:
                         # 不加载模型，只记录平台存在
                         models_list = []
+
+                    # 应用黑名单过滤
+                    blacklist = platform_config.get('blacklist', [])
+                    if blacklist and load_models and models_list:
+                        filtered = [
+                            m for m in models_list
+                            if not any(fnmatch.fnmatch(m, p) for p in blacklist)
+                        ]
+                        removed = len(models_list) - len(filtered)
+                        if removed > 0:
+                            logger.info(f"平台 {platform_name} 黑名单过滤: 移除 {removed} 个模型")
+                        models_list = filtered
 
                     timeout = platform_config.get('timeout', 30)
                     weight = platform_config.get('weight', 1)

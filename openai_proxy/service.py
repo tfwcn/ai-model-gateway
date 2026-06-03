@@ -69,7 +69,10 @@ class OpenAIProxyService:
             self.models = await self.config_loader.load_config()
 
         # 第四步：初始化故障转移管理器
-        self.failover_manager = ModelFailoverManager(self.models)
+        self.failover_manager = ModelFailoverManager(
+            self.models,
+            all_aliases=self.config_loader.all_aliases
+        )
 
         # 第五步：初始化 Responses API 适配器和会话存储
         self.session_store = DualModeSessionStore()
@@ -457,6 +460,7 @@ class OpenAIProxyService:
                     q=q,
                     limit=limit,
                     offset=offset,
+                    all_aliases=self.config_loader.all_aliases,
                 )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"无法获取模型列表: {str(e)}")
