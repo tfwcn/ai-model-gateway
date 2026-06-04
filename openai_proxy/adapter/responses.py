@@ -641,16 +641,38 @@ class ResponsesAdapter:
                     # 检查是否是 custom tool
                     is_custom_tool = self.context.is_custom_tool(name)
 
+                    # 如果是新的 tool call index，发送 output_item.added
+                    if index not in self.context.tool_call_item_ids:
+                        tool_call_item_id = self.context.get_or_create_tool_call_item_id(index)
+                        output_index = index
+                        seq = self.context.next_sequence()
+                        item_added_event = {
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "id": tool_call_item_id,
+                                "type": "function_call" if not is_custom_tool else "custom_tool_call",
+                                "call_id": call_id or "",
+                                "name": name or "",
+                                **({"input": ""} if is_custom_tool else {"arguments": ""}),
+                                "status": "in_progress"
+                            },
+                            "sequence_number": seq
+                        }
+                        events.append(f"event: response.output_item.added\ndata: {json.dumps(item_added_event)}\n\n")
+
+                    tool_call_item_id = self.context.get_or_create_tool_call_item_id(index)
+
                     seq = self.context.next_sequence()
 
                     if is_custom_tool:
                         # Custom tool: 使用 custom_tool_call_input 事件
-                        # 注意：custom tool 的 arguments 是 {"input": "..."} 格式，需要提取 input 字段
                         input_value = self.context.extract_custom_tool_input(arguments)
 
                         tool_call_event = {
                             "type": "response.custom_tool_call_input.delta",
-                            "item_id": self.context.item_id,
+                            "item_id": tool_call_item_id,
+                            "output_index": index,
                             "delta": input_value if isinstance(input_value, str) else str(input_value),
                             "sequence_number": seq
                         }
@@ -659,7 +681,8 @@ class ResponsesAdapter:
                         # Function tool: 使用 function_call_arguments 事件
                         tool_call_event = {
                             "type": "response.function_call_arguments.delta",
-                            "item_id": self.context.item_id,  # 使用 item_id 而不是 call_id
+                            "item_id": tool_call_item_id,
+                            "output_index": index,
                             "delta": arguments,  # 使用 delta 字段（增量）
                             "sequence_number": seq
                         }
@@ -848,24 +871,10 @@ class ResponsesAdapter:
         }
         events.append(f"event: response.in_progress\ndata: {json.dumps(in_progress_event)}\n\n")
 
-        # 4. response.output_item.added
-        seq = self.context.next_sequence()
-        if for_tool_call:
-            # 工具调用类型的 output_item
-            item_added_event = {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "id": item_id,
-                    "type": "function_call",
-                    "call_id": "",  # 将在后续 delta 事件中填充
-                    "name": "",
-                    "arguments": "",
-                    "status": "in_progress"
-                },
-                "sequence_number": seq
-            }
-        else:
+        # 4. response.output_item.added - only for non-tool-call (text) responses
+        # For tool calls, per-index output_item.added is emitted in convert_stream_event
+        if not for_tool_call:
+            seq = self.context.next_sequence()
             # 文本消息类型的 output_item
             item_added_event = {
                 "type": "response.output_item.added",
@@ -879,10 +888,9 @@ class ResponsesAdapter:
                 },
                 "sequence_number": seq
             }
-        events.append(f"event: response.output_item.added\ndata: {json.dumps(item_added_event)}\n\n")
+            events.append(f"event: response.output_item.added\ndata: {json.dumps(item_added_event)}\n\n")
 
-        # 5. 对于文本类型，发送 response.content_part.added
-        if not for_tool_call:
+            # 5. response.content_part.added
             seq = self.context.next_sequence()
             part_added_event = {
                 "type": "response.content_part.added",
@@ -906,11 +914,7 @@ class ResponsesAdapter:
         has_tool_calls = self.context.has_tool_calls
 
         if has_tool_calls:
-            # 工具调用的完成事件
-            seq = self.context.next_sequence()
-
-            # 收集所有工具调用的信息，并检查是否是 custom tool
-            tool_calls_info = []
+            # 为每个 tool call 发送: arguments_done/custom_input_done + output_item.done
             for index, state in sorted(self.context.tool_call_states.items()):
                 name = state.get("name", "")
                 arguments = state.get("arguments", "")
@@ -918,41 +922,66 @@ class ResponsesAdapter:
                 # 检查是否是 custom tool
                 is_custom_tool = self.context.is_custom_tool(name)
 
+                # 获取该 index 对应的独立 item_id
+                tool_call_item_id = self.context.tool_call_item_ids.get(index, item_id or f"msg_{uuid.uuid4().hex}")
+
                 if is_custom_tool:
-                    # Custom tool: 提取 input 字段
+                    # 1. response.custom_tool_call_input.done
                     input_value = self.context.extract_custom_tool_input(arguments)
 
-                    tool_calls_info.append({
-                        "id": state.get("call_id", ""),
-                        "type": "custom_tool_call",
-                        "name": name,
-                        "input": input_value if isinstance(input_value, str) else str(input_value)
-                    })
+                    seq = self.context.next_sequence()
+                    input_done_event = {
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": tool_call_item_id,
+                        "output_index": index,
+                        "input": input_value if isinstance(input_value, str) else str(input_value),
+                        "sequence_number": seq
+                    }
+                    events.append(f"event: response.custom_tool_call_input.done\ndata: {json.dumps(input_done_event)}\n\n")
                 else:
-                    # Function tool
-                    tool_calls_info.append({
-                        "id": state.get("call_id", ""),
-                        "type": "function_call",
+                    # 1. response.function_call_arguments.done
+                    seq = self.context.next_sequence()
+                    args_done_event = {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": tool_call_item_id,
+                        "output_index": index,
                         "name": name,
-                        "arguments": arguments
-                    })
+                        "arguments": arguments,
+                        "sequence_number": seq
+                    }
+                    events.append(f"event: response.function_call_arguments.done\ndata: {json.dumps(args_done_event)}\n\n")
 
-            # 构建 output_item.done 事件（使用第一个工具的信息）
-            first_tool = tool_calls_info[0] if tool_calls_info else {}
-            item_done_event = {
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "id": item_id,
-                    "type": first_tool.get("type", "function_call"),
-                    "call_id": first_tool.get("id", ""),
-                    "name": first_tool.get("name", ""),
-                    **({"input": first_tool.get("input", "")} if first_tool.get("type") == "custom_tool_call" else {"arguments": first_tool.get("arguments", "")}),
-                    "status": "completed"
-                },
-                "sequence_number": seq
-            }
-            events.append(f"event: response.output_item.done\ndata: {json.dumps(item_done_event)}\n\n")
+                # 2. response.output_item.done
+                seq = self.context.next_sequence()
+                if is_custom_tool:
+                    item_done_event = {
+                        "type": "response.output_item.done",
+                        "output_index": index,
+                        "item": {
+                            "id": tool_call_item_id,
+                            "type": "custom_tool_call",
+                            "call_id": state.get("call_id", ""),
+                            "name": name,
+                            "input": input_value if isinstance(input_value, str) else str(input_value),
+                            "status": "completed"
+                        },
+                        "sequence_number": seq
+                    }
+                else:
+                    item_done_event = {
+                        "type": "response.output_item.done",
+                        "output_index": index,
+                        "item": {
+                            "id": tool_call_item_id,
+                            "type": "function_call",
+                            "call_id": state.get("call_id", ""),
+                            "name": name,
+                            "arguments": arguments,
+                            "status": "completed"
+                        },
+                        "sequence_number": seq
+                    }
+                events.append(f"event: response.output_item.done\ndata: {json.dumps(item_done_event)}\n\n")
         else:
             # 文本消息的完成事件
             # 1. response.text.done (使用正确的命名)
@@ -1024,12 +1053,17 @@ class ResponsesAdapter:
                 # 检查是否是 custom tool
                 is_custom_tool = self.context.is_custom_tool(name)
 
+                # 使用该 index 对应的独立 item_id
+                item_id_for_index = self.context.tool_call_item_ids.get(
+                    index, self.context.item_id or f"msg_{uuid.uuid4().hex}"
+                )
+
                 if is_custom_tool:
                     # Custom tool: 提取 input 字段
                     input_value = self.context.extract_custom_tool_input(arguments)
 
                     output_items.append({
-                        "id": self.context.item_id,
+                        "id": item_id_for_index,
                         "type": "custom_tool_call",
                         "call_id": state.get("call_id", ""),
                         "name": name,
@@ -1039,7 +1073,7 @@ class ResponsesAdapter:
                 else:
                     # Function tool
                     output_items.append({
-                        "id": self.context.item_id,
+                        "id": item_id_for_index,
                         "type": "function_call",
                         "call_id": state.get("call_id", ""),
                         "name": name,

@@ -19,6 +19,7 @@ Streaming Context - 流式响应上下文管理器
 """
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -85,9 +86,17 @@ class StreamingContext:
         # 工具调用状态（对应原 _streaming_tool_call_state）
         self.tool_call_states: Dict[int, Dict[str, str]] = {}
         
+        # 每个 tool call index 对应的独立 item_id（用于多 tool call 场景）
+        self.tool_call_item_ids: Dict[int, str] = {}
+        
         # Custom tools 映射（对应原 _request_custom_tools）
         self.custom_tools_map: Dict[str, dict] = {}
     
+    def get_or_create_tool_call_item_id(self, index: int) -> str:
+        if index not in self.tool_call_item_ids:
+            self.tool_call_item_ids[index] = f"msg_{uuid.uuid4().hex}"
+        return self.tool_call_item_ids[index]
+
     def next_sequence(self) -> int:
         """
         获取下一个序列号并自增
@@ -114,6 +123,7 @@ class StreamingContext:
         self.has_tool_calls = False
         self.model_name = "unknown"
         self.tool_call_states.clear()
+        self.tool_call_item_ids.clear()
         self.custom_tools_map.clear()
     
     def cleanup(self):
@@ -124,6 +134,7 @@ class StreamingContext:
         注意：此方法不会重置基本状态字段，因为响应已经结束。
         """
         self.tool_call_states.clear()
+        self.tool_call_item_ids.clear()
         self.custom_tools_map.clear()
         logger.debug(f"StreamingContext cleaned up for request {self.request_id}")
     

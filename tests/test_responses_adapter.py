@@ -158,12 +158,12 @@ class TestResponseBuilding:
         }
 
         # Register the custom tool conversion
-        request_id = "req_test"
-        adapter._request_custom_tools[request_id] = {
-            "apply_patch": {"type": "custom", "name": "apply_patch"}
-        }
+        if not adapter.context:
+            from openai_proxy.utils.streaming_context import StreamingContext
+            adapter.context = StreamingContext(request_id="req_test")
+        adapter.context.register_custom_tool("apply_patch", {"type": "custom", "name": "apply_patch"})
 
-        response_obj, new_id = adapter.build_response_object(chat_response, {}, request_id)
+        response_obj, new_id = adapter.build_response_object(chat_response, {}, "req_test")
 
         assert response_obj["id"].startswith("resp_")
         assert len(response_obj["output"]) == 1

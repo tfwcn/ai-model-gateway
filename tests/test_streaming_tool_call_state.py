@@ -29,18 +29,40 @@ def test_streaming_tool_call_state_management():
     # 验证第一个chunk正确建立了状态缓存
     assert result is not None
     assert "response.function_call_arguments.delta" in result
+    assert "response.output_item.added" in result
     
-    # 解析返回的事件
-    event_lines = result.strip().split('\n')
-    event_type_line = event_lines[0]
-    data_line = event_lines[1]
+    # 查找 response.output_item.added 事件，验证 call_id 和 name
+    sse_blocks = result.strip().split('\n\n')
+    added_found = False
+    for block in sse_blocks:
+        lines = block.strip().split('\n')
+        for i, line in enumerate(lines):
+            if line.strip() == "event: response.output_item.added":
+                data_line = lines[i + 1].strip()
+                event_data = json.loads(data_line[6:])
+                assert event_data["item"]["call_id"] == "call-123"
+                assert event_data["item"]["name"] == "exec_command"
+                assert event_data["item"]["type"] == "function_call"
+                added_found = True
+                break
+        if added_found:
+            break
+    assert added_found, "response.output_item.added event not found"
     
-    assert event_type_line == "event: response.function_call_arguments.delta"
-    
-    event_data = json.loads(data_line[6:])  # 去掉 "data: " 前缀
-    assert event_data["call_id"] == "call-123"
-    assert event_data["name"] == "exec_command"
-    assert event_data["arguments"] == ""
+    # 查找 function_call_arguments.delta 事件，验证 item_id 与 added 一致
+    delta_found = False
+    for block in sse_blocks:
+        lines = block.strip().split('\n')
+        for i, line in enumerate(lines):
+            if line.strip() == "event: response.function_call_arguments.delta":
+                data_line = lines[i + 1].strip()
+                event_data = json.loads(data_line[6:])
+                assert event_data["delta"] == ""
+                delta_found = True
+                break
+        if delta_found:
+            break
+    assert delta_found, "function_call_arguments.delta event not found"
     
     print("✓ 第一个chunk正确建立状态缓存")
     
@@ -71,13 +93,23 @@ def test_streaming_tool_call_state_management():
         assert result is not None
         assert "response.function_call_arguments.delta" in result
         
-        event_lines = result.strip().split('\n')
-        data_line = event_lines[1]
-        event_data = json.loads(data_line[6:])
-        
-        assert event_data["call_id"] == "call-123", f"Chunk {i+1}: call_id should be from cache"
-        assert event_data["name"] == "exec_command", f"Chunk {i+1}: name should be from cache"
-        assert event_data["arguments"] == chunk_data["function"]["arguments"]
+        sse_blocks = result.strip().split('\n\n')
+        delta_found = False
+        for block in sse_blocks:
+            lines = block.strip().split('\n')
+            for j, line in enumerate(lines):
+                if line.strip() == "event: response.function_call_arguments.delta":
+                    data_line = lines[j + 1].strip()
+                    event_data = json.loads(data_line[6:])
+                    # 验证 item_id 来自缓存（第一个 chunk 中生成的 item_id）
+                    expected_item_id = adapter.context.tool_call_item_ids[0]
+                    assert event_data["item_id"] == expected_item_id, f"Chunk {i+1}: item_id should be from cache"
+                    assert event_data["delta"] == chunk_data["function"]["arguments"]
+                    delta_found = True
+                    break
+            if delta_found:
+                break
+        assert delta_found, f"Chunk {i+1}: function_call_arguments.delta not found"
         
         print(f"✓ 后续chunk {i+1} 正确使用缓存状态")
     
@@ -89,7 +121,8 @@ def test_streaming_tool_call_state_management():
     assert "response.completed" in result
     
     # 验证状态已被清理
-    assert len(adapter._streaming_tool_call_state) == 0
+    assert len(adapter.context.tool_call_states) == 0
+    assert len(adapter.context.tool_call_item_ids) == 0
     print("✓ [DONE]事件后状态正确清理")
     
     print("\n🎉 所有流式工具调用状态管理测试通过！")
@@ -135,12 +168,17 @@ def test_multiple_parallel_tool_calls():
         result = adapter.convert_stream_event(chunk_event)
         
         # 验证两个工具调用的状态都被正确缓存
-        assert 0 in adapter._streaming_tool_call_state
-        assert 1 in adapter._streaming_tool_call_state
-        assert adapter._streaming_tool_call_state[0]["call_id"] == "call-1"
-        assert adapter._streaming_tool_call_state[0]["name"] == "tool_a"
-        assert adapter._streaming_tool_call_state[1]["call_id"] == "call-2"
-        assert adapter._streaming_tool_call_state[1]["name"] == "tool_b"
+        assert 0 in adapter.context.tool_call_states
+        assert 1 in adapter.context.tool_call_states
+        assert adapter.context.tool_call_states[0]["call_id"] == "call-1"
+        assert adapter.context.tool_call_states[0]["name"] == "tool_a"
+        assert adapter.context.tool_call_states[1]["call_id"] == "call-2"
+        assert adapter.context.tool_call_states[1]["name"] == "tool_b"
+        
+        # 验证每个工具调用都有独立的 item_id
+        assert 0 in adapter.context.tool_call_item_ids
+        assert 1 in adapter.context.tool_call_item_ids
+        assert adapter.context.tool_call_item_ids[0] != adapter.context.tool_call_item_ids[1]
         
         print("✓ 多个并行工具调用状态正确缓存")
     
@@ -163,17 +201,26 @@ def test_multiple_parallel_tool_calls():
         result = adapter.convert_stream_event(chunk_event)
         
         assert result is not None
-        event_lines = result.strip().split('\n')
-        data_line = event_lines[1]
-        event_data = json.loads(data_line[6:])
+        assert "response.function_call_arguments.delta" in result
         
-        # 验证每个工具调用都能从缓存中获取正确的元数据
-        if chunk_info["index"] == 0:
-            assert event_data["call_id"] == "call-1"
-            assert event_data["name"] == "tool_a"
-        else:
-            assert event_data["call_id"] == "call-2"
-            assert event_data["name"] == "tool_b"
+        # 验证 delta 事件使用了正确的 item_id（每个 index 独立）
+        sse_blocks = result.strip().split('\n\n')
+        delta_found = False
+        for block in sse_blocks:
+            lines = block.strip().split('\n')
+            for j, line in enumerate(lines):
+                if line.strip() == "event: response.function_call_arguments.delta":
+                    data_line = lines[j + 1].strip()
+                    event_data = json.loads(data_line[6:])
+                    # 验证 delta 使用该 index 对应的 item_id
+                    expected_item_id = adapter.context.tool_call_item_ids[chunk_info["index"]]
+                    assert event_data["item_id"] == expected_item_id
+                    assert event_data["delta"] == chunk_info["function"]["arguments"]
+                    delta_found = True
+                    break
+            if delta_found:
+                break
+        assert delta_found
             
         print(f"✓ 工具调用 index={chunk_info['index']} 正确使用缓存状态")
     
