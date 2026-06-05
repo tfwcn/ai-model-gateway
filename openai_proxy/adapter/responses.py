@@ -275,7 +275,10 @@ class ResponsesAdapter:
             content = item.get("content", "")
 
             # 处理带 output 字段的格式（Responses API 标准格式）
-            if "output" in item and isinstance(item["output"], list):
+            # 注意：function_call_output 和 custom_tool_call_output 的 output 字段
+            # 是结果内容数组，不是嵌套子项，需要排除
+            is_output_result_type = item_type in ("function_call_output", "custom_tool_call_output")
+            if "output" in item and isinstance(item["output"], list) and not is_output_result_type:
                 # 遍历 output 数组中的每个元素
                 for output_item in item["output"]:
                     if not isinstance(output_item, dict):
@@ -425,6 +428,8 @@ class ResponsesAdapter:
                 call_id = item.get("call_id")
                 output = item.get("output", "")
                 if call_id:
+                    if isinstance(output, list):
+                        output = self._extract_text_content(output)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -500,6 +505,15 @@ class ResponsesAdapter:
                 converted.append(part)
 
         return converted
+
+    def _extract_text_content(self, content_array: list) -> str:
+        parts = []
+        for part in content_array:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("input_text", "output_text"):
+                parts.append(part.get("text", ""))
+        return "\n".join(parts)
 
     def convert_stream_event(self, event_line: str) -> Optional[str]:
         """
