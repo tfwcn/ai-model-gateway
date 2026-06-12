@@ -1,7 +1,7 @@
 import json
 import logging
 import uuid
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from ..utils.session import SessionStore
 from ..utils.tool_call_converter import ToolCallConverter
 from ..utils.streaming_context import StreamingContext
@@ -33,9 +33,9 @@ class ResponsesAdapter:
     def __init__(self, session_store: Optional[SessionStore] = None):
         self.session_store = session_store
         # 流式响应上下文（统一管理所有流式状态）
-        self.context: Optional[StreamingContext] = None
+        self.context: StreamingContext = StreamingContext(request_id="")
 
-    async def convert_request(self, responses_payload: dict) -> dict:
+    async def convert_request(self, responses_payload: dict) -> Tuple[dict, str]:
         """
         将 Responses API 请求体转换为 Chat API 请求体。
         """
@@ -489,7 +489,20 @@ class ResponsesAdapter:
                     })
                     logger.info(f"Converted top-level custom_tool_call_output to tool result")
 
-        return messages
+        return self._merge_consecutive_tool_calls(messages)
+
+    def _merge_consecutive_tool_calls(self, messages: list) -> list:
+        merged = []
+        for msg in messages:
+            if (merged and
+                msg.get("role") == "assistant" and
+                "tool_calls" in msg and
+                merged[-1].get("role") == "assistant" and
+                "tool_calls" in merged[-1]):
+                merged[-1]["tool_calls"].extend(msg["tool_calls"])
+            else:
+                merged.append(msg)
+        return merged
 
     def _convert_content_array(self, content_array: list) -> list:
         """
@@ -546,6 +559,7 @@ class ResponsesAdapter:
         if self.context is None:
             request_id = str(uuid.uuid4())
             self.context = StreamingContext(request_id=request_id)
+        ctx = self.context
 
         # 处理空行或空白行
         if not event_line or not event_line.strip():
@@ -742,7 +756,7 @@ class ResponsesAdapter:
 
         return None
 
-    def build_response_object(self, chat_response: dict, responses_payload: dict, request_id: str) -> tuple:
+    def build_response_object(self, chat_response: dict, responses_payload: dict, request_id: str) -> Tuple[dict, str]:
         """
         将上游 Chat API 的非流式响应转换为 Responses API 格式。
 
@@ -961,6 +975,7 @@ class ResponsesAdapter:
                 # 获取该 index 对应的独立 item_id
                 tool_call_item_id = self.context.tool_call_item_ids.get(index, item_id or f"msg_{uuid.uuid4().hex}")
 
+                input_value = ""
                 if is_custom_tool:
                     # 1. response.custom_tool_call_input.done
                     input_value = self.context.extract_custom_tool_input(arguments)

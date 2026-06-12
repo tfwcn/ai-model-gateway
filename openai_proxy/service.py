@@ -4,7 +4,7 @@ import logging
 import os
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -26,10 +26,10 @@ class OpenAIProxyService:
     def __init__(self, config_file: str = "models.yaml"):
         self.config_loader = ConfigLoader(config_file)
         # 注意：models 将在异步初始化方法中加载
-        self.models = None
-        self.failover_manager = None
-        self.responses_adapter = None
-        self.session_store = None
+        self.models: Dict[str, List[ModelConfig]] = {}
+        self.failover_manager: ModelFailoverManager = None  # type: ignore[assignment]
+        self.responses_adapter: ResponsesAdapter = None  # type: ignore[assignment]
+        self.session_store: DualModeSessionStore = None  # type: ignore[assignment]
 
         cache_ttl = int(os.getenv("MODELS_API_CACHE_TTL", "300"))
         self.model_list_cache = MemoryCache(default_ttl=cache_ttl)
@@ -212,6 +212,7 @@ class OpenAIProxyService:
 
                     try:
                         result = await self.failover_manager.chat_completion_stream(request_data)
+                        done_sent = False
                         if hasattr(result, '__aiter__'):
                             # 处理支持异步迭代的对象（包括StreamResponseWrapper和aiohttp.ClientResponse）
                             # 创建 SSE 事件解析器
@@ -282,7 +283,7 @@ class OpenAIProxyService:
 
                         yield error_str.encode() + b"\n"
 
-                return StreamingResponse(stream_generator(), media_type="text/event-stream")
+                return StreamingResponse(stream_generator(), media_type="text/event-stream")  # type: ignore[arg-type]
             else:
                 # 普通响应
 
@@ -327,6 +328,7 @@ class OpenAIProxyService:
 
                         async for chunk in upstream_stream:
                             chunk_count += 1
+                            chunk_str = ""
                             if chunk:
                                 try:
                                     chunk_str = chunk.decode('utf-8', errors='replace')
@@ -401,23 +403,33 @@ class OpenAIProxyService:
                 # 构造完整的对话历史并保存
                 history = await self.session_store.get_history(responses_payload.get("previous_response_id", "")) if responses_payload.get("previous_response_id") else []
 
-                # 提取助手响应内容（支持message和function_call类型）
-                assistant_message = {"role": "assistant"}
+                # 提取助手响应内容（支持message和function_call/custom_tool_call类型）
+                assistant_message: Dict[str, Any] = {"role": "assistant"}
                 if response_obj["output"] and len(response_obj["output"]) > 0:
-                    first_output = response_obj["output"][0]
-                    if first_output.get("type") == "message" and first_output.get("content"):
-                        # 文本消息
-                        assistant_message["content"] = first_output["content"][0].get("text", "")
-                    elif first_output.get("type") == "function_call":
-                        # 工具调用：存储为特殊格式
-                        assistant_message["tool_calls"] = [{
-                            "id": first_output.get("call_id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": first_output.get("name", ""),
-                                "arguments": first_output.get("arguments", "{}")
-                            }
-                        }]
+                    tool_calls = []
+                    for output_item in response_obj["output"]:
+                        if output_item.get("type") == "message" and output_item.get("content"):
+                            assistant_message["content"] = output_item["content"][0].get("text", "")
+                        elif output_item.get("type") == "function_call":
+                            tool_calls.append({
+                                "id": output_item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": output_item.get("name", ""),
+                                    "arguments": output_item.get("arguments", "{}")
+                                }
+                            })
+                        elif output_item.get("type") == "custom_tool_call":
+                            tool_calls.append({
+                                "id": output_item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": output_item.get("name", ""),
+                                    "arguments": output_item.get("input", "")
+                                }
+                            })
+                    if tool_calls:
+                        assistant_message["tool_calls"] = tool_calls
 
                 full_history = history + current_messages + [assistant_message]
                 # 保存会话时同时传递原始 output 数组
