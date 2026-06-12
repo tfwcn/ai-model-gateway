@@ -9,6 +9,21 @@ from ..utils.streaming_context import StreamingContext
 logger = logging.getLogger(__name__)
 
 
+def _ensure_additional_properties(schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return schema
+    if schema.get("type") == "object":
+        schema["additionalProperties"] = False
+        for key, val in schema.get("properties", {}).items():
+            schema["properties"][key] = _ensure_additional_properties(val)
+    if "items" in schema and isinstance(schema["items"], dict):
+        schema["items"] = _ensure_additional_properties(schema["items"])
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in schema and isinstance(schema[key], list):
+            schema[key] = [_ensure_additional_properties(s) for s in schema[key]]
+    return schema
+
+
 class ResponsesAdapter:
     """
     OpenAI Responses API 到 Chat Completions API 的协议转换器。
@@ -98,17 +113,24 @@ class ResponsesAdapter:
                 fmt = text_config["format"]
                 # 检查是否是 json_schema 格式
                 if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
-                    json_schema = fmt.get("json_schema", {})
-                    # 构建 Chat API 的 response_format
+                    # 支持两种格式:
+                    #   1) 嵌套: { "type": "json_schema", "json_schema": { "name": ..., "strict": ..., "schema": ... } }
+                    #   2) 扁平: { "type": "json_schema", "name": ..., "strict": ..., "schema": ... }
+                    nested = fmt.get("json_schema", {})
+                    if "name" in nested or "schema" in nested:
+                        src = nested
+                    else:
+                        src = fmt
+                    schema = _ensure_additional_properties(src.get("schema", {}))
                     chat_payload["response_format"] = {
                         "type": "json_schema",
                         "json_schema": {
-                            "name": json_schema.get("name", "Output"),
-                            "strict": json_schema.get("strict", True),
-                            "schema": json_schema.get("schema", {})
+                            "name": src.get("name", "Output"),
+                            "strict": src.get("strict", True),
+                            "schema": schema
                         }
                     }
-                    logger.info(f"Converted text.format to response_format with schema name: {json_schema.get('name', 'Output')}")
+                    logger.info(f"Converted text.format to response_format with schema name: {src.get('name', 'Output')}")
 
         return chat_payload, request_id
 
