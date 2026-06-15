@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 from openai_proxy.core.cache import MemoryCache
 from openai_proxy.models import ModelConfig, list_available_models
@@ -187,6 +187,19 @@ class OpenAIProxyService:
             logger.info("AI Model Gateway 已关闭")
 
         app = FastAPI(title="AI Model Gateway", version="1.0.0", lifespan=lifespan)
+
+        gateway_api_key = os.getenv("GATEWAY_API_KEY", "")
+
+        @app.middleware("http")
+        async def auth_middleware(request: Request, call_next):
+            if gateway_api_key and request.url.path != "/health":
+                auth_header = request.headers.get("Authorization", "")
+                if not auth_header.startswith("Bearer ") or auth_header[7:] != gateway_api_key:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"error": {"message": "Invalid or missing API key", "type": "auth_error", "code": "unauthorized"}}
+                    )
+            return await call_next(request)
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):

@@ -103,13 +103,23 @@ spec:
 
 ### API 认证
 
-未来版本将支持 API 密钥认证：
+通过 `GATEWAY_API_KEY` 环境变量启用 Bearer Token 认证：
 
-```yaml
-security:
-  api_key_auth:
-    enabled: true
-    header: "X-API-Key"
+```env
+GATEWAY_API_KEY=sk-your-secret-key
+```
+
+- 设置后，客户端请求需携带 `Authorization: Bearer <key>` 头
+- `/health` 端点不受认证限制
+- 留空则跳过认证（默认行为）
+
+**示例：**
+
+```bash
+curl http://localhost:8100/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "all", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 ---
@@ -266,6 +276,7 @@ groups:
 部署前请确认：
 
 - [ ] API 密钥通过环境变量或 Secrets 管理
+- [ ] `GATEWAY_API_KEY` 已设置并用于客户端认证
 - [ ] `.env` 文件已添加到 `.gitignore`
 - [ ] 生产环境启用了 HTTPS
 - [ ] 配置了速率限制

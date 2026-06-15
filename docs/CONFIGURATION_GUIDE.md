@@ -29,6 +29,9 @@ OPENROUTER_API_KEY=your-openrouter-api-key
 NVIDIA_API_KEY=your-nvidia-api-key
 OPENAI_API_KEY=your-openai-api-key
 AZURE_API_KEY=your-azure-api-key
+
+# Gateway 认证密钥（可选，留空则跳过认证）
+GATEWAY_API_KEY=sk-your-secret-key
 ```
 
 > ⚠️ **安全提示**：API 密钥绝不应该直接写在 `models.yaml` 文件中，必须通过环境变量管理。

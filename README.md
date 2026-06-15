@@ -64,7 +64,7 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 cp models.example.yaml models.yaml
-nano .env  # 填入你的 API 密钥
+nano .env  # 填入你的 API 密钥（可选设置 GATEWAY_API_KEY 开启认证）
 ```
 
 详细配置请参考：[📖 配置指南](docs/CONFIGURATION_GUIDE.md)
@@ -149,9 +149,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/models` | GET | 获取可用模型列表 |
-| `/v1/chat/completions` | POST | 聊天完成（OpenAI 兼容） |
-| `/health` | GET | 基本健康检查 |
+| `/models` | GET | 获取可用模型列表（需认证） |
+| `/v1/chat/completions` | POST | 聊天完成（需认证） |
+| `/health` | GET | 基本健康检查（免认证） |
 | `/health/detailed` | GET | 详细健康检查 |
 | `/metrics` | GET | Prometheus 监控指标 |
 
