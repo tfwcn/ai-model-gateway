@@ -170,8 +170,8 @@ class ModelFailoverManager:
             # 流式响应 - 设置精确的超时控制
             # connect: 连接建立超时
             # sock_connect: socket连接超时
-            # total: None 表示无总超时限制（一旦开始接收数据就不会超时）
-            # sock_read: None 表示流式数据读取无超时限制
+            # total: None 表示流式传输无总时间限制
+            # sock_read: 每次读取间隔超时，覆盖 TTFB + 流式间隙
             response = await session.post(
                 url,
                 json=request_body,
@@ -180,47 +180,39 @@ class ModelFailoverManager:
                     connect=model_config.timeout,      # 连接建立超时
                     sock_connect=model_config.timeout,  # socket连接超时
                     total=None,                        # 无总超时限制
-                    sock_read=None                     # 流式数据读取无超时
+                    sock_read=model_config.timeout     # TTFB + 流式间隙兜底
                 )
             )
             elapsed_time = time.time() - start_time
 
-            # 读取第一个数据块来检查是否是错误响应
+            # 读取第一个字节，检查是否是 JSON 错误响应
             try:
-                first_chunk = await asyncio.wait_for(
-                    response.content.read(1024),
-                    timeout=min(10, model_config.timeout)  # 设置较短的超时来读取首块数据
+                first_byte = await asyncio.wait_for(
+                    response.content.read(1),
+                    timeout=5
                 )
-                if first_chunk:
-                    chunk_str = first_chunk.decode('utf-8', errors='replace')
-                    # 检查是否是JSON错误格式（以{开头且包含"error"）
-                    if chunk_str.strip().startswith('{'):
-                        try:
-                            json_data = json.loads(chunk_str)
-                            # 检查是否包含错误信息
-                            if isinstance(json_data, dict):
-                                # 如果包含error字段，说明是错误响应
-                                if "error" in json_data or "errors" in json_data:
-                                    error_msg = f"流式响应返回错误: {chunk_str}"
-                                    logger.warning(error_msg)
-                                    # 关闭响应以释放资源
-                                    response.close()
-                                    return False, error_msg
 
-                                # 对于非错误的JSON响应，检查是否有有效的content字段
-                                # 注意：SSE格式通常不会进入这个分支
-                                if not self._has_valid_content(json_data):
-                                    error_msg = f"流式响应缺少有效的content字段: {chunk_str}"
-                                    logger.warning(error_msg)
-                                    # 关闭响应以释放资源
-                                    response.close()
-                                    return False, error_msg
-
-                        except (json.JSONDecodeError, ValueError):
-                            # 不是有效的JSON，可能是正常的流式数据（如SSE格式）
-                            # 对于SSE格式，我们不进行content验证，直接认为有效
-                            pass
-                    # 如果不是以{开头，很可能是SSE格式，直接认为有效
+                # 如果首字节是 {，说明可能是 JSON 错误响应（SSE 以 "data:" 开头）
+                if first_byte and first_byte.decode('utf-8', errors='replace').strip() == '{':
+                    rest = await asyncio.wait_for(
+                        response.content.read(4096),
+                        timeout=10
+                    )
+                    chunk = first_byte + rest
+                    chunk_str = chunk.decode('utf-8', errors='replace')
+                    try:
+                        json_data = json.loads(chunk_str)
+                        if isinstance(json_data, dict) and ("error" in json_data or "errors" in json_data):
+                            error_msg = f"流式响应返回错误: {chunk_str}"
+                            logger.warning(error_msg)
+                            response.close()
+                            return False, error_msg
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    # 不是错误 JSON，当作普通数据透传
+                    first_chunk_for_wrapper = chunk
+                else:
+                    first_chunk_for_wrapper = first_byte
 
                 # 创建一个包装对象包含原始响应和预读取的数据
                 class StreamResponseWrapper:
@@ -242,7 +234,7 @@ class ModelFailoverManager:
                             if chunk:
                                 yield chunk
 
-                wrapped_response = StreamResponseWrapper(response, first_chunk)
+                wrapped_response = StreamResponseWrapper(response, first_chunk_for_wrapper)
                 return True, wrapped_response
 
             except asyncio.TimeoutError:
