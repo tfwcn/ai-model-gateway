@@ -124,7 +124,7 @@ class ToolCapabilityTester:
                             }
                         }],
                         "tool_choice": "auto",
-                        "max_tokens": 50,  # 增加max_tokens以确保完整响应
+                        "max_completion_tokens": 50,  # 增加max_completion_tokens以确保完整响应
                         "temperature": 0,
                         "stream": False
                     }
@@ -224,7 +224,7 @@ class ToolCapabilityTester:
                             }
                         }],
                         "tool_choice": "auto",
-                        "max_tokens": 50,  # 增加max_tokens以确保完整响应
+                        "max_completion_tokens": 50,  # 增加max_completion_tokens以确保完整响应
                         "temperature": 0,
                         "stream": True
                     }

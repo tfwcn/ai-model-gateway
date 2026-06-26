@@ -80,10 +80,10 @@ class TestNVIDIAParseModelInfo:
         model = plugin._parse_model_info(model_info)
         assert model.context_window == 4096
 
-    def test_parse_model_with_max_tokens(self):
-        """测试解析带 max_tokens 的模型"""
+    def test_parse_model_with_max_completion_tokens(self):
+        """测试解析带 max_completion_tokens 的模型"""
         plugin = NVIDIAPlugin(api_key="test-key")
-        model_info = {"id": "model-1", "max_tokens": 8192}
+        model_info = {"id": "model-1", "max_completion_tokens": 8192}
         model = plugin._parse_model_info(model_info)
         assert model.context_window == 8192
 
@@ -255,26 +255,26 @@ class TestNVIDIAGetModels:
     async def test_get_models_with_new_config(self):
         """测试使用新配置获取模型列表"""
         plugin = NVIDIAPlugin(api_key="test-key")
-        
+
         plugin_config = {
             "args": {
                 "model_list_method": "GET",
                 "request_params": {"nim_type": "anim_type_preview"}
             }
         }
-        
+
         mock_response = {
             'data': [
                 {'id': 'model1', 'name': 'Model 1'},
                 {'id': 'model2', 'name': 'Model 2'}
             ]
         }
-        
+
         with patch.object(plugin, '_make_api_request', new_callable=AsyncMock) as mock_request:
             mock_request.return_value = mock_response
-            
+
             result = await plugin.get_models(plugin_config)
-            
+
             assert len(result) == 2
             assert result[0].model_id == 'model1'
             assert result[1].model_id == 'model2'
@@ -285,7 +285,7 @@ class TestNVIDIAGetModels:
         plugin = NVIDIAPlugin(api_key="test-key")
         plugin.models_cache = [NVIDIAModel(model_id="cached-model", model_name="Cached Model")]
         plugin.last_cache_time = time.time()
-        
+
         with patch.object(plugin, '_fetch_models_from_api', new_callable=AsyncMock) as mock_fetch:
             mock_fetch.side_effect = Exception("API error")
             models = await plugin.get_models()

@@ -12,66 +12,66 @@ logger = logging.getLogger(__name__)
 
 class Cache(ABC):
     """缓存抽象接口"""
-    
+
     @abstractmethod
     async def get(self, key: str) -> Optional[Any]:
         """
         获取缓存
-        
+
         Args:
             key: 缓存键
-            
+
         Returns:
             缓存值，如果不存在返回 None
         """
         pass
-    
+
     @abstractmethod
     async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """
         设置缓存
-        
+
         Args:
             key: 缓存键
             value: 缓存值
             ttl: 生存时间（秒）
-            
+
         Returns:
             是否设置成功
         """
         pass
-    
+
     @abstractmethod
     async def delete(self, key: str) -> bool:
         """
         删除缓存
-        
+
         Args:
             key: 缓存键
-            
+
         Returns:
             是否删除成功
         """
         pass
-    
+
     @abstractmethod
     async def clear(self) -> bool:
         """
         清除所有缓存
-        
+
         Returns:
             是否清除成功
         """
         pass
-    
+
     @abstractmethod
     async def exists(self, key: str) -> bool:
         """
         检查缓存是否存在
-        
+
         Args:
             key: 缓存键
-            
+
         Returns:
             缓存是否存在
         """
@@ -80,17 +80,17 @@ class Cache(ABC):
 
 class MemoryCache(Cache):
     """内存缓存实现"""
-    
+
     def __init__(self, default_ttl: int = 300):
         """
         初始化内存缓存
-        
+
         Args:
             default_ttl: 默认 TTL（秒）
         """
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._default_ttl = default_ttl
-    
+
     async def get(self, key: str) -> Optional[Any]:
         """获取缓存"""
         if key in self._cache:
@@ -102,7 +102,7 @@ class MemoryCache(Cache):
                 # 过期了，删除
                 del self._cache[key]
         return None
-    
+
     async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """设置缓存"""
         try:
@@ -115,19 +115,19 @@ class MemoryCache(Cache):
         except Exception as e:
             logger.error(f"内存缓存设置失败: {e}")
             return False
-    
+
     async def delete(self, key: str) -> bool:
         """删除缓存"""
         if key in self._cache:
             del self._cache[key]
             return True
         return False
-    
+
     async def clear(self) -> bool:
         """清除所有缓存"""
         self._cache.clear()
         return True
-    
+
     async def exists(self, key: str) -> bool:
         """检查缓存是否存在"""
         if key in self._cache:
@@ -141,7 +141,7 @@ class MemoryCache(Cache):
 
 class RedisCache(Cache):
     """Redis 缓存实现"""
-    
+
     def __init__(
         self,
         host: str = "localhost",
@@ -152,7 +152,7 @@ class RedisCache(Cache):
     ):
         """
         初始化 Redis 缓存
-        
+
         Args:
             host: Redis 主机
             port: Redis 端口
@@ -166,7 +166,7 @@ class RedisCache(Cache):
         self._password = password
         self._default_ttl = default_ttl
         self._redis = None
-    
+
     async def _get_redis(self):
         """获取 Redis 连接"""
         if self._redis is None:
@@ -183,7 +183,7 @@ class RedisCache(Cache):
                 logger.error("Redis 缓存需要安装 redis 包: pip install redis")
                 raise
         return self._redis
-    
+
     async def get(self, key: str) -> Optional[Any]:
         """获取缓存"""
         try:
@@ -195,7 +195,7 @@ class RedisCache(Cache):
         except Exception as e:
             logger.error(f"Redis 缓存获取失败: {e}")
             return None
-    
+
     async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """设置缓存"""
         try:
@@ -210,7 +210,7 @@ class RedisCache(Cache):
         except Exception as e:
             logger.error(f"Redis 缓存设置失败: {e}")
             return False
-    
+
     async def delete(self, key: str) -> bool:
         """删除缓存"""
         try:
@@ -220,7 +220,7 @@ class RedisCache(Cache):
         except Exception as e:
             logger.error(f"Redis 缓存删除失败: {e}")
             return False
-    
+
     async def clear(self) -> bool:
         """清除所有缓存"""
         try:
@@ -230,7 +230,7 @@ class RedisCache(Cache):
         except Exception as e:
             logger.error(f"Redis 缓存清除失败: {e}")
             return False
-    
+
     async def exists(self, key: str) -> bool:
         """检查缓存是否存在"""
         try:
@@ -244,10 +244,10 @@ class RedisCache(Cache):
 def compute_request_hash(request_data: Dict[str, Any]) -> str:
     """
     计算请求内容哈希值
-    
+
     Args:
         request_data: 请求数据
-        
+
     Returns:
         哈希值字符串
     """
@@ -257,10 +257,10 @@ def compute_request_hash(request_data: Dict[str, Any]) -> str:
         "messages": request_data.get("messages"),
         "temperature": request_data.get("temperature"),
         "top_p": request_data.get("top_p"),
-        "max_tokens": request_data.get("max_tokens"),
+        "max_completion_tokens": request_data.get("max_completion_tokens"),
         "stream": request_data.get("stream", False)
     }
-    
+
     # 序列化为 JSON 并计算哈希
     key_str = json.dumps(cache_key_data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(key_str.encode('utf-8')).hexdigest()
@@ -268,42 +268,42 @@ def compute_request_hash(request_data: Dict[str, Any]) -> str:
 
 class CacheManager:
     """缓存管理器 - 统一管理缓存操作"""
-    
+
     def __init__(self, cache: Cache, default_ttl: int = 300):
         """
         初始化缓存管理器
-        
+
         Args:
             cache: 缓存实例
             default_ttl: 默认 TTL（秒）
         """
         self._cache = cache
         self._default_ttl = default_ttl
-    
+
     async def get_response(self, request_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         根据请求数据获取缓存的响应
-        
+
         Args:
             request_data: 请求数据
-            
+
         Returns:
             缓存的响应数据
         """
         # 流式响应不缓存
         if request_data.get("stream", False):
             return None
-        
+
         cache_key = compute_request_hash(request_data)
         cached = await self._cache.get(cache_key)
-        
+
         if cached:
             logger.debug(f"缓存命中: {cache_key[:16]}...")
             return cached
-        
+
         logger.debug(f"缓存未命中: {cache_key[:16]}...")
         return None
-    
+
     async def set_response(
         self,
         request_data: Dict[str, Any],
@@ -312,35 +312,35 @@ class CacheManager:
     ) -> bool:
         """
         缓存响应数据
-        
+
         Args:
             request_data: 请求数据
             response_data: 响应数据
             ttl: TTL（秒）
-            
+
         Returns:
             是否缓存成功
         """
         # 流式响应不缓存
         if request_data.get("stream", False):
             return False
-        
+
         cache_key = compute_request_hash(request_data)
         ttl = ttl if ttl is not None else self._default_ttl
-        
+
         return await self._cache.set(cache_key, response_data, ttl)
-    
+
     async def clear_cache(self) -> bool:
         """清除所有缓存"""
         return await self._cache.clear()
-    
+
     async def delete_response(self, request_data: Dict[str, Any]) -> bool:
         """
         删除特定请求的缓存
-        
+
         Args:
             request_data: 请求数据
-            
+
         Returns:
             是否删除成功
         """
