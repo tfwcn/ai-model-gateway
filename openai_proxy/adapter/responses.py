@@ -87,7 +87,7 @@ class ResponsesAdapter:
 
         # 7. 映射其他可选参数 (字段名标准化)
         if "max_output_tokens" in responses_payload:
-            chat_payload["max_tokens"] = responses_payload["max_output_tokens"]
+            chat_payload["max_completion_tokens"] = responses_payload["max_output_tokens"]
 
         if "temperature" in responses_payload:
             chat_payload["temperature"] = responses_payload["temperature"]
@@ -287,6 +287,24 @@ class ResponsesAdapter:
         8. 顶层 function_call_output: {"type": "function_call_output", "call_id": "...", "output": "..."}
         """
         messages = []
+
+        # 预扫描：找出所有含图片输出的 function_call_output，记录其 call_id
+        # 这些对应的 function_call 需要从消息列表中移除，避免 assistant(tool_calls)
+        # 后直接接 user 消息，导致 Chat API 校验失败。
+        image_output_call_ids = set()
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call_output":
+                output = item.get("output", "")
+                if isinstance(output, list) and any(
+                    isinstance(p, dict) and p.get("type") == "input_image"
+                    for p in output
+                ):
+                    cid = item.get("call_id")
+                    if cid:
+                        image_output_call_ids.add(cid)
+
         for item in input_items:
             if not isinstance(item, dict):
                 continue
@@ -340,6 +358,8 @@ class ResponsesAdapter:
                     # 处理 function_call
                     elif output_type == "function_call":
                         call_id = output_item.get("call_id")
+                        if call_id and call_id in image_output_call_ids:
+                            continue
                         name = output_item.get("name", "")
                         arguments = output_item.get("arguments", "{}")
                         if call_id:
@@ -360,11 +380,24 @@ class ResponsesAdapter:
                         call_id = output_item.get("call_id")
                         output = output_item.get("output", "")
                         if call_id:
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "content": output
-                            })
+                            if call_id in image_output_call_ids:
+                                if isinstance(output, list):
+                                    converted = self._convert_content_array(output)
+                                    messages.append({
+                                        "role": "user",
+                                        "content": converted
+                                    })
+                                else:
+                                    messages.append({
+                                        "role": "user",
+                                        "content": [{"type": "text", "text": str(output)}]
+                                    })
+                            else:
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "content": output
+                                })
 
                 # 已经处理完 output 数组，跳过后续的逻辑
                 continue
@@ -430,6 +463,8 @@ class ResponsesAdapter:
             # 处理工具调用 (function_call) - 转换为 assistant 消息
             elif item_type == "function_call":
                 call_id = item.get("call_id")
+                if call_id and call_id in image_output_call_ids:
+                    continue
                 name = item.get("name", "")
                 arguments = item.get("arguments", "{}")
                 if call_id:
@@ -450,13 +485,23 @@ class ResponsesAdapter:
                 call_id = item.get("call_id")
                 output = item.get("output", "")
                 if call_id:
-                    if isinstance(output, list):
-                        output = self._extract_text_content(output)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": output
-                    })
+                    if isinstance(output, list) and any(
+                        isinstance(p, dict) and p.get("type") == "input_image"
+                        for p in output
+                    ):
+                        converted = self._convert_content_array(output)
+                        messages.append({
+                            "role": "user",
+                            "content": converted
+                        })
+                    else:
+                        if isinstance(output, list):
+                            output = self._extract_text_content(output)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": output
+                        })
 
             # 处理顶层的 custom_tool_call（独立元素格式）
             elif item_type == "custom_tool_call":
@@ -498,7 +543,7 @@ class ResponsesAdapter:
                 msg.get("role") == "assistant" and
                 "tool_calls" in msg and
                 merged[-1].get("role") == "assistant" and
-                "tool_calls" in merged[-1]):
+                    "tool_calls" in merged[-1]):
                 merged[-1]["tool_calls"].extend(msg["tool_calls"])
             else:
                 merged.append(msg)
@@ -546,8 +591,15 @@ class ResponsesAdapter:
         for part in content_array:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") in ("input_text", "output_text"):
+            t = part.get("type")
+            if t in ("input_text", "output_text"):
                 parts.append(part.get("text", ""))
+            elif t == "input_image":
+                image_url = part.get("image_url")
+                if isinstance(image_url, str):
+                    parts.append(image_url)
+                elif isinstance(image_url, dict):
+                    parts.append(image_url.get("url", ""))
         return "\n".join(parts)
 
     def convert_stream_event(self, event_line: str) -> Optional[str]:
