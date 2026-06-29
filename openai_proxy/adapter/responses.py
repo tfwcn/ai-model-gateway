@@ -534,7 +534,27 @@ class ResponsesAdapter:
                     })
                     logger.info(f"Converted top-level custom_tool_call_output to tool result")
 
-        return self._merge_consecutive_tool_calls(messages)
+        return self._deduplicate_image_messages(self._merge_consecutive_tool_calls(messages))
+
+    def _deduplicate_image_messages(self, messages: list) -> list:
+        seen_urls = set()
+        result = []
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                new_content = []
+                for part in msg["content"]:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        url = part.get("image_url", {}).get("url", "")
+                        if url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                    new_content.append(part)
+                if not new_content:
+                    continue
+                msg["content"] = new_content
+            result.append(msg)
+        result.reverse()
+        return result
 
     def _merge_consecutive_tool_calls(self, messages: list) -> list:
         merged = []
