@@ -1,7 +1,9 @@
-# "all" 的别名配置 - 使用这些别名同样会遍历所有平台的所有模型
+# 模型组别名配置 - 每个别名对应一组 model selector，系统取并集
+# selector 格式: "all"(全部), 平台名, 或 platform|model_name
 # all_aliases:
-#   - "全部"
-#   - "everything"
+#   fast-models:
+#     - "modelscope"
+#     - "openrouter"
 
 # ModelScope 免费模型配置示例
 # 使用网页爬虫从 modelscope.cn 获取热门免费模型列表
@@ -114,6 +116,7 @@ nvidia:
   weight: 1
   enabled: true
   retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
+
 
 # azure:
 #   baseUrl: "https://your-resource.openai.azure.com/openai/deployments"

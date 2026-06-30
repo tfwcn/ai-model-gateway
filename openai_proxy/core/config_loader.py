@@ -16,7 +16,7 @@ class ConfigLoader:
     def __init__(self, config_file: str = "models.yaml"):
         self.config_file = config_file
         self.plugin_manager = PluginManager()
-        self.all_aliases: List[str] = []
+        self.all_aliases: Dict[str, List[str]] = {}
 
     async def load_config(self) -> Dict[str, List[ModelConfig]]:
         """加载模型配置"""
@@ -44,9 +44,14 @@ class ConfigLoader:
                         config_data = json.load(f)
 
                 # 解析新格式的配置
-                self.all_aliases = config_data.pop('all_aliases', []) or []
-                if not isinstance(self.all_aliases, list):
-                    self.all_aliases = []
+                raw_aliases = config_data.pop('all_aliases', {}) or {}
+                if isinstance(raw_aliases, dict):
+                    self.all_aliases = {
+                        k: v if isinstance(v, list) else []
+                        for k, v in raw_aliases.items()
+                    }
+                else:
+                    self.all_aliases = {}
                 models = {}
                 for platform_name, platform_config in config_data.items():
                     if not isinstance(platform_config, dict):
@@ -145,7 +150,7 @@ class ConfigLoader:
                         models[platform_name] = []
                         for model_name in models_list:
                             model_config = ModelConfig(
-                                name=f"{platform_name}-{model_name.replace('/', '-')}",
+                                name=f"{platform_name}|{model_name.replace('/', '-')}",
                                 api_key=api_key,
                                 base_url=base_url,
                                 model=model_name,

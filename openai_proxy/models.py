@@ -60,7 +60,7 @@ def list_available_models(
     q: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    all_aliases: Optional[List[str]] = None,
+    all_aliases: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """按筛选条件聚合可用模型列表
 
@@ -68,23 +68,35 @@ def list_available_models(
     1. "all" - 所有平台所有模型
     2. "{platform}" - 指定平台的所有模型
     3. "{platform}|{model_name}" - 指定平台的指定模型
+    4. "{alias}" - 模型组别名（取并集）
     """
-    all_aliases = all_aliases or []
+    all_aliases = all_aliases or {}
     all_items: List[Dict[str, Any]] = []
 
-    # 构造所有可用的别名ID列表
-    all_ids = ["all"] + all_aliases
+    # "all" 选项
+    all_items.append({
+        "id": "all",
+        "name": "所有平台所有模型",
+        "provider": "all",
+        "capabilities": ["chat", "completion"],
+        "metadata": {
+            "type": "group",
+            "description": "遍历所有平台的所有模型，按权重排序"
+        }
+    })
 
-    # 为每个别名添加 "all" 选项
-    for alias_id in all_ids:
+    # 为每个别名添加选项
+    for alias_name, selectors in all_aliases.items():
+        selectors_desc = ", ".join(selectors)
         all_items.append({
-            "id": alias_id,
-            "name": "所有平台所有模型",
+            "id": alias_name,
+            "name": f"模型组: {alias_name}",
             "provider": "all",
             "capabilities": ["chat", "completion"],
             "metadata": {
                 "type": "group",
-                "description": "遍历所有平台的所有模型，按权重排序"
+                "selectors": selectors,
+                "description": f"模型组别名，包含: {selectors_desc}"
             }
         })
 
@@ -107,8 +119,6 @@ def list_available_models(
         # 添加每个具体模型的 "{platform}|{model_name}" 选项
         for model_config in model_configs:
             item = model_config_to_dict(platform, model_config)
-            # 修改 id 为 "{platform}|{model_name}" 格式
-            item["id"] = f"{platform}|{model_config.name}"
             item["metadata"]["type"] = "model"
             all_items.append(item)
 

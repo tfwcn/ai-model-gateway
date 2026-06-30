@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 class ModelFailoverManager:
     """模型故障转移管理器 - 负责模型选择、调用和故障转移"""
 
-    def __init__(self, models: Dict[str, List[ModelConfig]], all_aliases: Optional[List[str]] = None):
+    def __init__(self, models: Dict[str, List[ModelConfig]], all_aliases: Optional[Dict[str, List[str]]] = None):
         self.models = models
-        self.all_aliases = all_aliases or []
+        self.all_aliases = all_aliases or {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.model_state_manager = ModelStateManager()
 
@@ -40,7 +40,7 @@ class ModelFailoverManager:
             - 如果是 "{platform}"，返回 ("{platform}", None)
             - 如果是 "{platform}|{model_name}"，返回 ("{platform}", "{model_name}")
         """
-        if model_selector == "all" or model_selector in self.all_aliases:
+        if model_selector == "all":
             return ("all", None)
 
         parts = model_selector.split("|", 1)
@@ -611,6 +611,84 @@ class ModelFailoverManager:
 
         return {"success": False, "error": "未知错误", "data": None}
 
+    def _collect_alias_models(self, alias_name: str) -> Dict[str, List[ModelConfig]]:
+        """解析别名，收集所有匹配的模型并按平台分组
+
+        Args:
+            alias_name: 别名名称
+
+        Returns:
+            按平台分组的模型字典 {platform: [ModelConfig, ...]}
+        """
+        selectors = self.all_aliases.get(alias_name, [])
+        result: Dict[str, List[ModelConfig]] = {}
+        seen: set = set()
+
+        for selector in selectors:
+            if selector == "all":
+                for platform, platform_models in self.models.items():
+                    for mc in platform_models:
+                        key = mc.name
+                        if key not in seen:
+                            result.setdefault(platform, []).append(mc)
+                            seen.add(key)
+            elif "|" in selector:
+                platform, model_part = selector.split("|", 1)
+                platform = platform.strip()
+                model_part = model_part.strip()
+                if platform in self.models:
+                    for mc in self.models[platform]:
+                        if mc.name == model_part or mc.model == model_part:
+                            key = mc.name
+                            if key not in seen:
+                                result.setdefault(platform, []).append(mc)
+                                seen.add(key)
+            else:
+                platform = selector.strip()
+                if platform in self.models:
+                    for mc in self.models[platform]:
+                        key = mc.name
+                        if key not in seen:
+                            result.setdefault(platform, []).append(mc)
+                            seen.add(key)
+
+        return result
+
+    async def _try_platforms_by_weight(self, platforms: Dict[str, List[ModelConfig]], request_data: Dict[str, Any], is_stream: bool) -> Dict[str, Any]:
+        """按权重降序尝试各平台的模型
+
+        Args:
+            platforms: 按平台分组的模型字典
+            request_data: 请求数据
+            is_stream: 是否为流式
+
+        Returns:
+            调用结果
+        """
+        platform_weights = {}
+        for platform_name, platform_models in platforms.items():
+            if platform_models:
+                platform_weights[platform_name] = platform_models[0].weight
+            else:
+                platform_weights[platform_name] = 0
+
+        platforms_to_try = sorted(
+            platforms.keys(),
+            key=lambda x: (-platform_weights.get(x, 0), list(platforms.keys()).index(x))
+        )
+
+        last_error = None
+        for platform_name in platforms_to_try:
+            if is_stream:
+                result = await self._try_platform_models_stream(platform_name, platforms[platform_name], request_data)
+            else:
+                result = await self._try_platform_models_non_stream(platform_name, platforms[platform_name], request_data)
+            if result["success"]:
+                return result
+            last_error = result["error"]
+
+        return {"success": False, "error": last_error, "data": None}
+
     async def chat_completion_non_stream(self, request_data: Dict[str, Any]) -> Any:
         """
         执行非流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
@@ -620,6 +698,7 @@ class ModelFailoverManager:
         1. "all" - 所有平台所有模型
         2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
+        4. "{alias}" - 模型组别名（取并集）
         """
         # 处理可选参数的默认值
         model_selector = request_data.get("model", "all")
@@ -631,6 +710,17 @@ class ModelFailoverManager:
 
         # 解析模型选择器
         platform_or_all, model_name = self._parse_model_selector(model_selector)
+
+        # 检查是否是模型组别名
+        if model_selector in self.all_aliases:
+            platforms = self._collect_alias_models(model_selector)
+            if not platforms:
+                raise HTTPException(status_code=400, detail=f"别名 '{model_selector}' 未匹配到任何模型")
+
+            result = await self._try_platforms_by_weight(platforms, request_data, is_stream=False)
+            if result["success"]:
+                return result["data"]
+            raise HTTPException(status_code=500, detail=f"别名 '{model_selector}' 所有模型都不可用: {result['error']}")
 
         if platform_or_all == "all":
             # 模式1: all - 所有平台所有模型
@@ -718,6 +808,7 @@ class ModelFailoverManager:
         1. "all" - 所有平台所有模型
         2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
+        4. "{alias}" - 模型组别名（取并集）
         """
         # 处理可选参数的默认值
         model_selector = request_data.get("model", "all")
@@ -729,6 +820,17 @@ class ModelFailoverManager:
 
         # 解析模型选择器
         platform_or_all, model_name = self._parse_model_selector(model_selector)
+
+        # 检查是否是模型组别名
+        if model_selector in self.all_aliases:
+            platforms = self._collect_alias_models(model_selector)
+            if not platforms:
+                raise HTTPException(status_code=400, detail=f"别名 '{model_selector}' 未匹配到任何模型")
+
+            result = await self._try_platforms_by_weight(platforms, request_data, is_stream=True)
+            if result["success"]:
+                return result["data"]
+            raise HTTPException(status_code=500, detail=f"别名 '{model_selector}' 所有模型都不可用: {result['error']}")
 
         if platform_or_all == "all":
             # 模式1: all - 所有平台所有模型
