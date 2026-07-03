@@ -41,33 +41,35 @@
 - 📊 **Prometheus 监控**：实时监控请求量、延迟、错误率
 - 🚀 **零客户端改造**：完全兼容 OpenAI API
 
-## 🆕 最新特性
+## 🆕 核心特性
 
-| 特性 | 说明 |
-|------|------|
-| **Responses API** | 完整支持 `/v1/responses` 端点，Chat API ↔ Responses API 双向协议转换 |
-| **工具调用转换器** | 自动识别 NVIDIA JSON / Minimax XML 等非标准格式并转换为标准 tool_calls |
-| **流式工具调用缓冲** | 智能缓冲检测流式响应中的非标准工具调用，零延迟切换 |
-| **工具能力测试** | 新增模型时自动测试 tool call 能力，只保留真正支持的模型 |
-| **模型重试机制** | 单模型支持多次重试（可配置 `retry_count`），基于错误类型智能重试 |
-| **模型别名 & 黑名单** | `all_aliases` 支持多别名，`blacklist` 支持 `*` 通配符过滤 |
-| **GATEWAY_API_KEY 认证** | 可选 Bearer Token 认证保护所有 API 接口 |
-| **Redis 缓存 & 会话** | 响应缓存 + Responses API 会话历史，Redis 不可用时自动降级为文件 |
-| **SSE 事件标准化** | 统一 SSE 格式，消除多端点重复代码 |
-| **错误分类系统** | 7 种错误类型（超时/连接/认证/限流/服务器/格式/模型），精细控制重试和禁用策略 |
+| 特性                     | 说明                                                                         |
+| ------------------------ | ---------------------------------------------------------------------------- |
+| **Responses API**        | 完整支持 `/v1/responses` 端点，Chat API ↔ Responses API 双向协议转换         |
+| **工具调用转换器**       | 自动识别 NVIDIA JSON / Minimax XML 等非标准格式并转换为标准 tool_calls       |
+| **流式工具调用缓冲**     | 智能缓冲检测流式响应中的非标准工具调用，零延迟切换                           |
+| **工具能力测试**         | 新增模型时自动测试 tool call 能力，只保留真正支持的模型                      |
+| **模型重试机制**         | 单模型支持多次重试（可配置 `retry_count`），基于错误类型智能重试             |
+| **模型别名 & 黑名单**    | `all_aliases` 支持多别名，`blacklist` 支持 `*` 通配符过滤                    |
+| **GATEWAY_API_KEY 认证** | 可选 Bearer Token 认证保护所有 API 接口                                      |
+| **Redis 缓存 & 会话**    | 响应缓存 + Responses API 会话历史，Redis 不可用时自动降级为文件              |
+| **SSE 事件标准化**       | 统一 SSE 格式，消除多端点重复代码                                            |
+| **错误分类系统**         | 7 种错误类型（超时/连接/认证/限流/服务器/格式/模型），精细控制重试和禁用策略 |
+| **SKIP_PLUGIN_SCRAPER**  | 跳过插件爬虫直接使用缓存，适合离线环境或加速启动                             |
+| **Docker 一键部署**      | 内置 Redis、Playwright，开箱即用的容器化部署方案                             |
 
 ### 对比传统方案
 
-| 特性 | AI Model Gateway | 直接调用平台 API | 其他代理方案 |
-|------|------------------|------------------|--------------|
-| 自动故障转移 | ✅ 智能切换 | ❌ 需手动处理 | ⚠️ 部分支持 |
-| 多平台整合 | ✅ 5+ 平台 | ❌ 单平台 | ⚠️ 2-3 平台 |
-| 动态模型发现 | ✅ 插件调度 + 定时爬虫 | ❌ 手动维护 | ❌ 静态配置 |
-| OpenAI Responses API | ✅ 完整支持 | ❌ 仅 Chat | ❌ 不支持 |
-| 工具调用格式转换 | ✅ NVIDIA/Minimax 等 | ❌ 需手动处理 | ❌ 不支持 |
-| 监控告警 | ✅ Prometheus | ❌ 无 | ⚠️ 基础日志 |
-| 错误分类 | ✅ 7 种类型 | ❌ 统一处理 | ⚠️ 简单分类 |
-| 缓存支持 | ✅ Memory/Redis | ❌ 无 | ⚠️ 基础缓存 |
+| 特性                 | AI Model Gateway      | 直接调用平台 API | 其他代理方案 |
+| -------------------- | --------------------- | ---------------- | ------------ |
+| 自动故障转移         | ✅ 智能切换            | ❌ 需手动处理     | ⚠️ 部分支持   |
+| 多平台整合           | ✅ 5+ 平台             | ❌ 单平台         | ⚠️ 2-3 平台   |
+| 动态模型发现         | ✅ 插件调度 + 定时爬虫 | ❌ 手动维护       | ❌ 静态配置   |
+| OpenAI Responses API | ✅ 完整支持            | ❌ 仅 Chat        | ❌ 不支持     |
+| 工具调用格式转换     | ✅ NVIDIA/Minimax 等   | ❌ 需手动处理     | ❌ 不支持     |
+| 监控告警             | ✅ Prometheus          | ❌ 无             | ⚠️ 基础日志   |
+| 错误分类             | ✅ 7 种类型            | ❌ 统一处理       | ⚠️ 简单分类   |
+| 缓存支持             | ✅ Memory/Redis        | ❌ 无             | ⚠️ 基础缓存   |
 
 ---
 
@@ -76,8 +78,8 @@
 ### 1️⃣ 安装
 
 ```bash
-git clone <repo-url>
-cd openai-proxy
+git clone https://github.com/tfwcn/ai-model-gateway.git
+cd ai-model-gateway
 pip install -r requirements.txt
 # 安装 Playwright 浏览器（用于爬虫插件）
 playwright install --with-deps chromium
@@ -95,17 +97,25 @@ nano .env  # 填入你的 API 密钥（可选设置 GATEWAY_API_KEY 开启认证
 
 ### 3️⃣ 启动
 
+直接运行（默认端口 8000）：
+
 ```bash
 python run.py
 ```
 
-或使用启动脚本（自动管理 Redis 和虚拟环境）：
+或使用启动脚本（自动管理 Redis 和虚拟环境，默认端口 8100）：
 
 ```bash
-bash start.sh
+bash start.sh          # 默认端口 8100
+bash start.sh --port 8000  # 指定端口
 ```
 
-服务运行在 `http://localhost:8000`
+也可通过环境变量指定端口：
+
+```bash
+PORT=8000 python run.py
+PORT=8000 bash start.sh
+```
 
 ### 4️⃣ 测试
 
@@ -136,14 +146,14 @@ curl http://localhost:8000/v1/responses \
 
 ### 主要端点
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/v1/chat/completions` | POST | OpenAI Chat Completions（需认证） |
-| `/v1/responses` | POST | OpenAI Responses API（需认证） |
-| `/v1/models` | GET | 获取可用模型列表（支持筛选/分页，需认证） |
-| `/health` | GET | 基本健康检查（免认证） |
-| `/health/detailed` | GET | 详细健康检查 |
-| `/metrics` | GET | Prometheus 监控指标 |
+| 端点                   | 方法 | 描述                                      |
+| ---------------------- | ---- | ----------------------------------------- |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions（需认证）         |
+| `/v1/responses`        | POST | OpenAI Responses API（需认证）            |
+| `/v1/models`           | GET  | 获取可用模型列表（支持筛选/分页，需认证） |
+| `/health`              | GET  | 基本健康检查（免认证）                    |
+| `/health/detailed`     | GET  | 详细健康检查                              |
+| `/metrics`             | GET  | Prometheus 监控指标                       |
 
 ### 模型选择策略
 
@@ -281,9 +291,17 @@ OPENAI_API_KEY=your-openai-api-key
 # Gateway 认证（可选，为空则跳过）
 GATEWAY_API_KEY=your-gateway-api-key
 
-# Redis 配置（可选）
+# Redis 配置（可选，Responses API 会话管理）
 REDIS_URL=redis://localhost:6379
 RESPONSES_SESSION_TTL=86400
+
+# 跳过插件爬虫，直接使用缓存（可选）
+# SKIP_PLUGIN_SCRAPER=true
+
+# 日志配置（可选）
+# DEBUG=true                     # 启用 DEBUG 级别日志（默认 INFO）
+# ENABLE_CONSOLE_LOGS=false      # 禁用控制台输出（默认 true）
+# LOG_DIR=logs                   # 日志目录（默认 logs/）
 ```
 
 ### 平台配置示例
@@ -299,14 +317,15 @@ modelscope:
   retry_count: 3              # 单模型重试次数
   plugin:                     # 插件配置（可选）
     code: "plugin.modelscope"
-    cache_timeout: 3600
+    cache_timeout: 3600       # 模型列表缓存时间（秒）
     args:
-      scrape_url: "https://www.modelscope.cn/models?filter=inference_type&..."
+      scrape_url: "https://www.modelscope.cn/models?filter=inference_type&page=1&sort=default&tabKey=task"
       max_models: 10
       scraper_timeout: 60
+      headless: true          # 无头模式运行浏览器
       enable_scheduled_task: true
-      schedule_cron: "0 2 * * *"
-  blacklist:                  # 黑名单（支持通配符）
+      schedule_cron: "0 2 * * *"   # 每天凌晨2点执行
+  blacklist:                  # 黑名单（支持 * 通配符）
     - "iic/*"
   models: []                  # 静态模型列表（可选）
 ```
@@ -337,12 +356,14 @@ modelscope:
 - [🔧 完整配置指南](docs/CONFIGURATION_GUIDE.md)
 - [🐳 Docker 部署指南](docs/DEPLOYMENT.md)
 - [🚨 安全注意事项](docs/SECURITY.md)
+- [📋 项目功能与路线图](docs/ROADMAP.md)
 
 ### 高级功能
 
 - [📊 监控与运维](docs/MONITORING.md)
 - [⚡ 负载均衡策略](docs/LOAD_BALANCING.md)
 - [🛡️ 错误分类系统](docs/error-classification.md)
+- [🧪 错误分类测试](docs/error-classification-testing.md)
 - [🔧 工具调用格式转换器](docs/TOOL_CALL_CONVERTER.md)
 - [📡 Responses API 协议](docs/protocol_summary.md)
 
@@ -353,6 +374,10 @@ modelscope:
 - [📖 ModelScope 爬虫文档](docs/MODELSCOPE_SCRAPER_README.md)
 - [📖 OpenRouter 爬虫文档](docs/OPENROUTER_SCRAPER_README.md)
 
+### 迁移指南
+
+- [🔄 版本迁移指南](docs/MIGRATION_GUIDE.md) — 从旧版本升级的详细步骤
+
 ---
 
 ## 🤝 贡献指南
@@ -360,16 +385,19 @@ modelscope:
 ### 开发环境设置
 
 ```bash
-git clone <repo-url>
-cd openai-proxy
+git clone https://github.com/tfwcn/ai-model-gateway.git
+cd ai-model-gateway
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
 # 运行测试
-pytest tests/ -v
+pytest tests/ -v --tb=short
 
 # 代码格式化
 black openai_proxy/
+
+# 类型检查
+mypy openai_proxy/
 ```
 
 ### 贡献流程
@@ -401,6 +429,8 @@ black openai_proxy/
 - [Playwright](https://playwright.dev/)
 - [Prometheus](https://prometheus.io/)
 - [APScheduler](https://apscheduler.readthedocs.io/)
+- [pydantic](https://docs.pydantic.dev/)
+- [Redis](https://redis.io/)
 
 ---
 

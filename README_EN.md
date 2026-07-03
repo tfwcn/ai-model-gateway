@@ -42,33 +42,35 @@ Are you facing these issues?
 - 📊 **Prometheus Monitoring**: Real-time metrics for requests, latency, errors
 - 🚀 **Zero Client Changes**: Fully compatible with OpenAI API
 
-## 🆕 What's New
+## 🆕 Core Features
 
-| Feature | Description |
-|---------|-------------|
-| **Responses API** | Full `/v1/responses` support, bidirectional Chat ↔ Responses protocol conversion |
-| **Tool Call Converter** | Auto-detect NVIDIA JSON / Minimax XML and convert to standard `tool_calls` |
-| **Streaming Tool Call Buffer** | Intelligent buffer for streaming non-standard tool calls |
-| **Tool Capability Testing** | Auto-test tool call support on model discovery, keep only supported models |
-| **Model Retry Mechanism** | Configurable `retry_count`, intelligent retry based on error type |
-| **Model Alias & Blacklist** | `all_aliases` for multiple aliases, `blacklist` with glob pattern matching |
-| **GATEWAY_API_KEY Auth** | Optional Bearer Token authentication for all API endpoints |
-| **Redis Cache & Sessions** | Response caching + Responses API session history, auto-fallback to file storage |
-| **SSE Normalization** | Unified SSE event format, eliminating duplicate code across endpoints |
-| **Error Classification** | 7 error types (timeout/connection/auth/rate-limit/server/format/model) |
+| Feature                        | Description                                                                      |
+| ------------------------------ | -------------------------------------------------------------------------------- |
+| **Responses API**              | Full `/v1/responses` support, bidirectional Chat ↔ Responses protocol conversion |
+| **Tool Call Converter**        | Auto-detect NVIDIA JSON / Minimax XML and convert to standard `tool_calls`       |
+| **Streaming Tool Call Buffer** | Intelligent buffer for streaming non-standard tool calls                         |
+| **Tool Capability Testing**    | Auto-test tool call support on model discovery, keep only supported models       |
+| **Model Retry Mechanism**      | Configurable `retry_count`, intelligent retry based on error type                |
+| **Model Alias & Blacklist**    | `all_aliases` for multiple aliases, `blacklist` with glob pattern matching       |
+| **GATEWAY_API_KEY Auth**       | Optional Bearer Token authentication for all API endpoints                       |
+| **Redis Cache & Sessions**     | Response caching + Responses API session history, auto-fallback to file storage  |
+| **SSE Normalization**          | Unified SSE event format, eliminating duplicate code across endpoints            |
+| **Error Classification**       | 7 error types (timeout/connection/auth/rate-limit/server/format/model)           |
+| **SKIP_PLUGIN_SCRAPER**        | Skip plugin scraper and use cached models, ideal for offline environments        |
+| **Docker One-click Deploy**    | Built-in Redis, Playwright, ready-to-run containerized deployment                |
 
 ### 📊 Comparison with Traditional Solutions
 
-| Feature | This Project | Direct Platform API | Other Proxy Solutions |
-|---------|-------------|---------------------|----------------------|
-| Auto Failover | ✅ Smart switching | ❌ Manual handling | ⚠️ Partial support |
-| Multi-Platform | ✅ 5+ platforms | ❌ Single platform | ⚠️ 2-3 platforms |
-| Dynamic Models | ✅ Plugin scheduler + scraper | ❌ Manual maintenance | ❌ Static config |
-| OpenAI Responses API | ✅ Full support | ❌ Chat only | ❌ Not supported |
-| Tool Call Conversion | ✅ NVIDIA/Minimax/etc | ❌ Manual handling | ❌ Not supported |
-| Monitoring | ✅ Prometheus | ❌ None | ⚠️ Basic logging |
-| Error Classification | ✅ 7 types | ❌ Unified handling | ⚠️ Simple |
-| Cache | ✅ Memory/Redis | ❌ None | ⚠️ Basic |
+| Feature              | This Project                 | Direct Platform API  | Other Proxy Solutions |
+| -------------------- | ---------------------------- | -------------------- | --------------------- |
+| Auto Failover        | ✅ Smart switching            | ❌ Manual handling    | ⚠️ Partial support     |
+| Multi-Platform       | ✅ 5+ platforms               | ❌ Single platform    | ⚠️ 2-3 platforms       |
+| Dynamic Models       | ✅ Plugin scheduler + scraper | ❌ Manual maintenance | ❌ Static config       |
+| OpenAI Responses API | ✅ Full support               | ❌ Chat only          | ❌ Not supported       |
+| Tool Call Conversion | ✅ NVIDIA/Minimax/etc         | ❌ Manual handling    | ❌ Not supported       |
+| Monitoring           | ✅ Prometheus                 | ❌ None               | ⚠️ Basic logging       |
+| Error Classification | ✅ 7 types                    | ❌ Unified handling   | ⚠️ Simple              |
+| Cache                | ✅ Memory/Redis               | ❌ None               | ⚠️ Basic               |
 
 ---
 
@@ -77,8 +79,8 @@ Are you facing these issues?
 ### 1️⃣ Installation
 
 ```bash
-git clone <repo-url>
-cd openai-proxy
+git clone https://github.com/tfwcn/ai-model-gateway.git
+cd ai-model-gateway
 pip install -r requirements.txt
 playwright install --with-deps chromium
 ```
@@ -93,17 +95,25 @@ nano .env  # Fill in your API keys (optionally set GATEWAY_API_KEY)
 
 ### 3️⃣ Start
 
+Run directly (default port 8000):
+
 ```bash
 python run.py
 ```
 
-Or use the startup script (auto-manages Redis and virtual env):
+Or use the startup script (auto-manages Redis and virtual env, default port 8100):
 
 ```bash
-bash start.sh
+bash start.sh               # default port 8100
+bash start.sh --port 8000   # specify port
 ```
 
-Service runs on `http://localhost:8000`.
+You can also set the port via environment variable:
+
+```bash
+PORT=8000 python run.py
+PORT=8000 bash start.sh
+```
 
 ### 4️⃣ Test
 
@@ -134,14 +144,14 @@ curl http://localhost:8000/v1/responses \
 
 ### Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/chat/completions` | POST | OpenAI Chat Completions (auth required) |
-| `/v1/responses` | POST | OpenAI Responses API (auth required) |
-| `/v1/models` | GET | List models with filtering/pagination (auth required) |
-| `/health` | GET | Basic health check (no auth) |
-| `/health/detailed` | GET | Detailed health check |
-| `/metrics` | GET | Prometheus metrics |
+| Endpoint               | Method | Description                                           |
+| ---------------------- | ------ | ----------------------------------------------------- |
+| `/v1/chat/completions` | POST   | OpenAI Chat Completions (auth required)               |
+| `/v1/responses`        | POST   | OpenAI Responses API (auth required)                  |
+| `/v1/models`           | GET    | List models with filtering/pagination (auth required) |
+| `/health`              | GET    | Basic health check (no auth)                          |
+| `/health/detailed`     | GET    | Detailed health check                                 |
+| `/metrics`             | GET    | Prometheus metrics                                    |
 
 ### Model Selection
 
@@ -224,6 +234,14 @@ NVIDIA_API_KEY=your-nvidia-api-key
 OPENAI_API_KEY=your-openai-api-key
 GATEWAY_API_KEY=your-gateway-api-key   # Optional auth
 REDIS_URL=redis://localhost:6379       # Optional Redis
+
+# Skip plugin scraper, use cached models directly (optional)
+# SKIP_PLUGIN_SCRAPER=true
+
+# Logging configuration (optional)
+# DEBUG=true                           # Enable DEBUG level logs (default INFO)
+# ENABLE_CONSOLE_LOGS=false            # Disable console output (default true)
+# LOG_DIR=logs                         # Log directory (default logs/)
 ```
 
 ### Platform Config Example
@@ -238,15 +256,18 @@ modelscope:
   retry_count: 3
   plugin:
     code: "plugin.modelscope"
-    cache_timeout: 3600
+    cache_timeout: 3600       # Model list cache TTL (seconds)
     args:
-      scrape_url: "https://www.modelscope.cn/models?filter=inference_type&..."
+      scrape_url: "https://www.modelscope.cn/models?filter=inference_type&page=1&sort=default&tabKey=task"
       max_models: 10
+      scraper_timeout: 60
+      headless: true          # Run browser in headless mode
       enable_tool_capability_test: true
       enable_scheduled_task: true
-      schedule_cron: "0 2 * * *"
-  blacklist:
+      schedule_cron: "0 2 * * *"   # Run daily at 2 AM
+  blacklist:                  # Blacklist (supports * glob pattern)
     - "iic/*"
+  models: []                  # Static model list (optional)
 ```
 
 See [📖 Configuration Guide](docs/CONFIGURATION_GUIDE.md) for details.
@@ -258,24 +279,31 @@ See [📖 Configuration Guide](docs/CONFIGURATION_GUIDE.md) for details.
 - [🔧 Configuration Guide](docs/CONFIGURATION_GUIDE.md)
 - [🐳 Docker Deployment](docs/DEPLOYMENT.md)
 - [🚨 Security](docs/SECURITY.md)
+- [📋 Roadmap](docs/ROADMAP.md)
 - [📊 Monitoring](docs/MONITORING.md)
 - [⚡ Load Balancing](docs/LOAD_BALANCING.md)
 - [🛡️ Error Classification](docs/error-classification.md)
+- [🧪 Error Classification Testing](docs/error-classification-testing.md)
 - [🔧 Tool Call Converter](docs/TOOL_CALL_CONVERTER.md)
 - [📡 Responses API Protocol](docs/protocol_summary.md)
 - [🔌 Plugin FAQ](docs/PLUGIN_FAQ.md)
+
+### Migration Guide
+
+- [🔄 Version Migration Guide](docs/MIGRATION_GUIDE.md) — Step-by-step upgrade instructions
 
 ---
 
 ## 🤝 Contributing
 
 ```bash
-git clone <repo-url>
-cd openai-proxy
+git clone https://github.com/tfwcn/ai-model-gateway.git
+cd ai-model-gateway
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
-pytest tests/ -v
+pytest tests/ -v --tb=short
 black openai_proxy/
+mypy openai_proxy/
 ```
 
 1. Fork the repo
@@ -299,6 +327,8 @@ MIT License — see [LICENSE](LICENSE)
 - [Playwright](https://playwright.dev/)
 - [Prometheus](https://prometheus.io/)
 - [APScheduler](https://apscheduler.readthedocs.io/)
+- [pydantic](https://docs.pydantic.dev/)
+- [Redis](https://redis.io/)
 
 ---
 
