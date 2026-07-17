@@ -31,6 +31,7 @@ class ErrorCategory(Enum):
     INVALID_RESPONSE_FORMAT = "invalid_response_format"  # 响应格式无效
     MISSING_CONTENT = "missing_content"  # 缺少内容字段
     INVALID_MODEL = "invalid_model"  # 模型不存在或无效
+    TOOL_CALL_ID_ERROR = "tool_call_id_error"  # 工具调用ID缺失响应
     
     # 其他错误
     UNKNOWN_ERROR = "unknown_error"  # 未知错误
@@ -44,6 +45,7 @@ class ClassifiedError:
     is_retryable: bool  # 是否可重试
     should_disable_model: bool  # 是否应该禁用模型
     retry_delay_seconds: float = 0.0  # 重试延迟（秒）
+    should_stop_failover: bool = False  # 是否停止故障转移（不切换模型）
     metadata: Dict[str, Any] = None  # 额外元数据
     
     def __post_init__(self):
@@ -141,16 +143,25 @@ class ErrorClassifier:
         ErrorCategory.INVALID_RESPONSE_FORMAT: {
             "is_retryable": False,
             "should_disable_model": True,  # 响应格式错误，可能是模型问题
+            "should_stop_failover": False,
             "retry_delay_seconds": 0.0,
         },
         ErrorCategory.MISSING_CONTENT: {
             "is_retryable": False,
             "should_disable_model": True,  # 缺少内容，可能是模型问题
+            "should_stop_failover": False,
             "retry_delay_seconds": 0.0,
         },
         ErrorCategory.INVALID_MODEL: {
             "is_retryable": False,
             "should_disable_model": True,
+            "should_stop_failover": False,
+            "retry_delay_seconds": 0.0,
+        },
+        ErrorCategory.TOOL_CALL_ID_ERROR: {
+            "is_retryable": False,
+            "should_disable_model": False,  # 模型本身没问题，是消息构造问题
+            "should_stop_failover": True,   # 不切换模型
             "retry_delay_seconds": 0.0,
         },
         
@@ -161,6 +172,15 @@ class ErrorClassifier:
             "retry_delay_seconds": 1.0,
         },
     }
+    
+    @classmethod
+    def _is_tool_call_id_error(cls, error_text: str) -> bool:
+        """检测是否为工具调用ID缺失响应错误"""
+        if not error_text:
+            return False
+        error_lower = error_text.lower()
+        keywords = ["tool_call_ids", "tool_call_id", "tool_calls"]
+        return any(kw in error_lower for kw in keywords)
     
     @classmethod
     def classify_http_error(cls, status_code: int, error_text: str, model_name: str) -> ClassifiedError:
@@ -175,6 +195,10 @@ class ErrorClassifier:
         Returns:
             ClassifiedError: 分类后的错误
         """
+        # 检测工具调用ID缺失错误（不管具体HTTP状态码，优先匹配）
+        if cls._is_tool_call_id_error(error_text):
+            return cls.classify_tool_call_error(model_name, error_text)
+        
         category = cls.HTTP_STATUS_MAP.get(status_code, ErrorCategory.UNKNOWN_ERROR)
         strategy = cls.ERROR_STRATEGIES.get(category, cls.ERROR_STRATEGIES[ErrorCategory.UNKNOWN_ERROR])
         
@@ -282,10 +306,39 @@ class ErrorClassifier:
             message=f"模型 {model_name} 返回无效响应: {reason}",
             is_retryable=strategy["is_retryable"],
             should_disable_model=strategy["should_disable_model"],
+            should_stop_failover=strategy.get("should_stop_failover", False),
             retry_delay_seconds=strategy["retry_delay_seconds"],
             metadata={
                 "model_name": model_name,
                 "reason": reason,
+            }
+        )
+    
+    @classmethod
+    def classify_tool_call_error(cls, model_name: str, error_text: str) -> ClassifiedError:
+        """
+        分类工具调用ID缺失响应错误
+        
+        Args:
+            model_name: 模型名称
+            error_text: 错误文本
+            
+        Returns:
+            ClassifiedError: 分类后的错误
+        """
+        strategy = cls.ERROR_STRATEGIES[ErrorCategory.TOOL_CALL_ID_ERROR]
+        message = f"模型 {model_name} 工具调用ID缺失响应: {error_text[:200]}"
+        
+        return ClassifiedError(
+            category=ErrorCategory.TOOL_CALL_ID_ERROR,
+            message=message,
+            is_retryable=strategy["is_retryable"],
+            should_disable_model=strategy["should_disable_model"],
+            should_stop_failover=strategy["should_stop_failover"],
+            retry_delay_seconds=strategy["retry_delay_seconds"],
+            metadata={
+                "model_name": model_name,
+                "error_text": error_text[:500],
             }
         )
     

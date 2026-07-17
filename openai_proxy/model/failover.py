@@ -206,7 +206,15 @@ class ModelFailoverManager:
                             error_msg = f"流式响应返回错误: {chunk_str}"
                             logger.warning(error_msg)
                             response.close()
-                            return False, error_msg
+                            # 提取错误消息进行分类，走HTTP错误分类路径（包含tool_call检测）
+                            error_text = chunk_str
+                            if isinstance(json_data.get("error"), dict):
+                                error_text = json_data["error"].get("message", chunk_str)
+                            classified_error = ErrorClassifier.classify_http_error(
+                                400, error_text, model_config.name
+                            )
+                            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+                            return False, classified_error
                     except (json.JSONDecodeError, ValueError):
                         pass
                     # 不是错误 JSON，当作普通数据透传
@@ -522,6 +530,10 @@ class ModelFailoverManager:
                     error_summary = ErrorClassifier.get_error_summary(classified_error)
                     logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
 
+                    # 如果错误标记为停止故障转移，立即返回
+                    if classified_error.should_stop_failover:
+                        return {"success": False, "error": classified_error.message, "data": None}
+
                     # 如果错误分类建议禁用模型，则禁用
                     if classified_error.should_disable_model:
                         if model_config.quota_period is not None:
@@ -581,6 +593,10 @@ class ModelFailoverManager:
                     classified_error = result
                     error_summary = ErrorClassifier.get_error_summary(classified_error)
                     logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
+
+                    # 如果错误标记为停止故障转移，立即返回
+                    if classified_error.should_stop_failover:
+                        return {"success": False, "error": classified_error.message, "data": None}
 
                     # 如果错误分类建议禁用模型，则禁用
                     if classified_error.should_disable_model:
