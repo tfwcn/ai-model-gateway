@@ -358,8 +358,6 @@ class ResponsesAdapter:
                     # 处理 function_call
                     elif output_type == "function_call":
                         call_id = output_item.get("call_id")
-                        if call_id and call_id in image_output_call_ids:
-                            continue
                         name = output_item.get("name", "")
                         arguments = output_item.get("arguments", "{}")
                         if call_id:
@@ -382,15 +380,22 @@ class ResponsesAdapter:
                         if call_id:
                             if call_id in image_output_call_ids:
                                 if isinstance(output, list):
-                                    converted = self._convert_content_array(output)
+                                    text_output = self._replace_image_with_text(output)
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": call_id,
+                                        "content": text_output
+                                    })
+                                    image_output = self._convert_content_array(output)
                                     messages.append({
                                         "role": "user",
-                                        "content": converted
+                                        "content": image_output
                                     })
                                 else:
                                     messages.append({
-                                        "role": "user",
-                                        "content": [{"type": "text", "text": str(output)}]
+                                        "role": "tool",
+                                        "tool_call_id": call_id,
+                                        "content": str(output)
                                     })
                             else:
                                 messages.append({
@@ -463,8 +468,6 @@ class ResponsesAdapter:
             # 处理工具调用 (function_call) - 转换为 assistant 消息
             elif item_type == "function_call":
                 call_id = item.get("call_id")
-                if call_id and call_id in image_output_call_ids:
-                    continue
                 name = item.get("name", "")
                 arguments = item.get("arguments", "{}")
                 if call_id:
@@ -489,10 +492,16 @@ class ResponsesAdapter:
                         isinstance(p, dict) and p.get("type") == "input_image"
                         for p in output
                     ):
-                        converted = self._convert_content_array(output)
+                        text_output = self._replace_image_with_text(output)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": text_output
+                        })
+                        image_output = self._convert_content_array(output)
                         messages.append({
                             "role": "user",
-                            "content": converted
+                            "content": image_output
                         })
                     else:
                         if isinstance(output, list):
@@ -568,6 +577,18 @@ class ResponsesAdapter:
             else:
                 merged.append(msg)
         return merged
+
+    def _replace_image_with_text(self, content_array: list) -> list:
+        result = []
+        for part in content_array:
+            if isinstance(part, dict) and part.get("type") == "input_image":
+                result.append({
+                    "type": "text",
+                    "text": "已通过工具查看此图片，详见下方用户原始消息中的原图"
+                })
+            else:
+                result.append(part)
+        return result
 
     def _convert_content_array(self, content_array: list) -> list:
         """
