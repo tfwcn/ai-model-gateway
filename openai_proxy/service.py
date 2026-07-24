@@ -235,10 +235,9 @@ class OpenAIProxyService:
                             async for chunk in result:
                                 if chunk:
                                     try:
-                                        chunk_str = chunk.decode('utf-8', errors='replace')
-
-                                        # 使用 SSEEventParser 处理 chunk
-                                        events = parser.feed(chunk_str)
+                                        # SSEEventParser 内部使用 bytes 缓冲，
+                                        # 按完整事件分割后统一解码，防止 UTF-8 跨 chunk 截断
+                                        events = parser.feed(chunk)
 
                                         # 处理所有完整的事件
                                         for event in events:
@@ -341,14 +340,11 @@ class OpenAIProxyService:
 
                         async for chunk in upstream_stream:
                             chunk_count += 1
-                            chunk_str = ""
                             if chunk:
                                 try:
-                                    chunk_str = chunk.decode('utf-8', errors='replace')
-                                    logger.debug(f"[{chunk_count}] Raw chunk received: {chunk_str[:200]}...")  # 只记录前200字符
-
-                                    # 使用 SSEEventParser 处理 chunk
-                                    events = parser.feed(chunk_str)
+                                    # SSEEventParser 内部使用 bytes 缓冲，
+                                    # 按完整事件分割后统一解码，防止 UTF-8 跨 chunk 截断
+                                    events = parser.feed(chunk)
 
                                     # 处理所有完整的事件
                                     for event in events:
@@ -364,16 +360,15 @@ class OpenAIProxyService:
                                                 # 提取 data: 行并进行协议转换 (Chat API → Responses API)
                                                 converted_line = self.responses_adapter.convert_stream_event(stripped)
                                                 if converted_line:
-                                                    # 对于关键事件（completed, output_item.done等），输出完整日志
-                                                    if 'response.completed' in converted_line or 'output_item.done' in converted_line or 'function_call' in converted_line:
-                                                        logger.debug(f"[{chunk_count}] Converted line (FULL): {converted_line}")
-                                                    else:
-                                                        logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
+                                                    logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
                                                     yield converted_line.encode('utf-8')
 
                                 except Exception as e:
                                     logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
-                                    logger.error(f"Problematic chunk: {chunk_str if 'chunk_str' in locals() else 'N/A'}")
+                                    try:
+                                        logger.error(f"Problematic chunk preview: {chunk[:200]}")
+                                    except Exception:
+                                        pass
 
                         # 上游流结束,检查是否已发出完成事件
                         # 对于某些上游(如 ModelScope)不发 [DONE] 的情况,需要手动补发
