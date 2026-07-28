@@ -372,7 +372,7 @@ class OpenAIProxyService:
 
                         # 上游流结束,检查是否已发出完成事件
                         # 对于某些上游(如 ModelScope)不发 [DONE] 的情况,需要手动补发
-                        if self.responses_adapter.context and not self.responses_adapter.context.has_received_done:
+                        if self.responses_adapter.has_request_context() and not self.responses_adapter.context.has_received_done:
                             logger.info("Upstream did not send [DONE], emitting completion events")
                             completion_events = self.responses_adapter._build_completion_events()
                             if completion_events:
@@ -381,7 +381,7 @@ class OpenAIProxyService:
                     except Exception as e:
                         logger.error(f"Upstream stream error: {e}", exc_info=True)
                         # 异常时清理上下文状态
-                        if self.responses_adapter.context:
+                        if self.responses_adapter.has_request_context():
                             self.responses_adapter.context.cleanup()
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")

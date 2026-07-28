@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import uuid
@@ -28,12 +29,35 @@ class ResponsesAdapter:
     """
     OpenAI Responses API 到 Chat Completions API 的协议转换器。
     负责将 /v1/responses 的请求格式转换为 /v1/chat/completions 兼容的格式。
+
+    使用 contextvars 实现 per-request 隔离，避免并发请求间 context 污染。
     """
+
+    # 每个 asyncio Task 独立存储 context，避免并发请求间污染
+    _request_context: contextvars.ContextVar[StreamingContext] = contextvars.ContextVar('responses_context')
 
     def __init__(self, session_store: Optional[SessionStore] = None):
         self.session_store = session_store
-        # 流式响应上下文（统一管理所有流式状态）
-        self.context: StreamingContext = StreamingContext(request_id="")
+        # 重置当前 task 的 context，确保不会被之前相同 task 的残留数据污染
+        self._request_context.set(StreamingContext(request_id=""))
+
+    @property
+    def context(self) -> StreamingContext:
+        """获取当前请求的 StreamingContext（per-task 隔离）。"""
+        ctx = self._request_context.get(None)
+        if ctx is None:
+            ctx = StreamingContext(request_id="")
+            self._request_context.set(ctx)
+        return ctx
+
+    @context.setter
+    def context(self, value: StreamingContext) -> None:
+        self._request_context.set(value)
+
+    def has_request_context(self) -> bool:
+        """当前 task 是否为真正的请求（而非默认 context）。"""
+        ctx = self._request_context.get(None)
+        return ctx is not None and bool(ctx.request_id)
 
     async def convert_request(self, responses_payload: dict) -> Tuple[dict, str]:
         """
@@ -42,7 +66,7 @@ class ResponsesAdapter:
         # 生成请求ID
         request_id = str(uuid.uuid4())
 
-        # 创建流式上下文
+        # 创建流式上下文（per-task 隔离，不影响其他并发请求）
         self.context = StreamingContext(request_id=request_id)
 
         # 保存模型名称（从请求中提取）
@@ -649,10 +673,10 @@ class ResponsesAdapter:
         按照 OpenAI Responses API 标准协议发送完整的事件序列。
         """
         # 确保 context 已初始化（如果没有通过 convert_request 初始化）
-        if self.context is None:
+        if self._request_context.get(None) is None:
             request_id = str(uuid.uuid4())
-            self.context = StreamingContext(request_id=request_id)
-        ctx = self.context
+            self._request_context.set(StreamingContext(request_id=request_id))
+        ctx = self._request_context.get()
 
         # 处理空行或空白行
         if not event_line or not event_line.strip():
@@ -749,10 +773,23 @@ class ResponsesAdapter:
                     if not isinstance(tc, dict):
                         continue
 
-                    index = tc.get("index", 0)
-
-                    # 提取完整信息（id, name）
                     has_complete_info = "id" in tc or ("function" in tc and isinstance(tc["function"], dict) and "name" in tc["function"])
+
+                    index = tc.get("index")
+                    if index is None:
+                        if has_complete_info:
+                            call_id = tc.get("id", "")
+                            found_idx = None
+                            for idx, state in self.context.tool_call_states.items():
+                                if state.get("call_id") == call_id:
+                                    found_idx = idx
+                                    break
+                            if found_idx is not None:
+                                index = found_idx
+                            else:
+                                index = len(self.context.tool_call_states)
+                        else:
+                            index = 0
 
                     if has_complete_info:
                         call_id = tc.get("id", "")
@@ -772,6 +809,10 @@ class ResponsesAdapter:
                     call_id = cached_state.get("call_id", "")
                     name = cached_state.get("name", "")
                     arguments = tc.get("function", {}).get("arguments", "") if isinstance(tc.get("function"), dict) else ""
+
+                    # 不完整信息且该 index 尚未初始化：跳过（等待后续带 id/name 的 chunk）
+                    if not has_complete_info and index not in self.context.tool_call_states:
+                        continue
 
                     # 累积参数（delta 是增量，需要拼接到之前的参数上）
                     if index not in self.context.tool_call_states:
