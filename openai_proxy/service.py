@@ -16,6 +16,7 @@ from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
 from openai_proxy.utils.sse_parser import SSEEventParser
+from openai_proxy.utils.logger import sanitize_payload
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +313,7 @@ class OpenAIProxyService:
                 responses_payload = await request.json()
                 logger.debug("=" * 80)
                 logger.debug("📥 [RECEIVED] Responses API Request:")
-                logger.debug(json.dumps(responses_payload, indent=2, ensure_ascii=False))
+                logger.debug(json.dumps(sanitize_payload(responses_payload), indent=2, ensure_ascii=False))
                 logger.debug("=" * 80)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
@@ -322,7 +323,7 @@ class OpenAIProxyService:
 
             logger.debug("=" * 80)
             logger.debug("🔄 [CONVERTED] Chat Completions Request:")
-            logger.debug(json.dumps(chat_payload, indent=2, ensure_ascii=False))
+            logger.debug(json.dumps(sanitize_payload(chat_payload), indent=2, ensure_ascii=False))
             logger.debug("=" * 80)
 
             is_stream = chat_payload.get("stream", False)
@@ -391,7 +392,7 @@ class OpenAIProxyService:
 
                 logger.debug("=" * 80)
                 logger.debug("📤 [UPSTREAM RESPONSE] Chat Completions Response:")
-                logger.debug(json.dumps(chat_response, indent=2, ensure_ascii=False))
+                logger.debug(json.dumps(sanitize_payload(chat_response), indent=2, ensure_ascii=False))
                 logger.debug("=" * 80)
 
                 # 1. 包装响应对象
@@ -399,7 +400,7 @@ class OpenAIProxyService:
 
                 logger.debug("=" * 80)
                 logger.debug("📦 [FINAL] Responses API Response:")
-                logger.debug(json.dumps(response_obj, indent=2, ensure_ascii=False))
+                logger.debug(json.dumps(sanitize_payload(response_obj), indent=2, ensure_ascii=False))
                 logger.debug("=" * 80)
 
                 # 2. 更新会话状态 (将当前请求和回复存入 Redis)

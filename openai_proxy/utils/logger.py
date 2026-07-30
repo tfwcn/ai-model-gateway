@@ -1,9 +1,29 @@
 """日志工具模块 - 提供安全的日志记录功能"""
 
 import logging
+import os
+import re
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
+
+_BASE64_DATA_URL_RE = re.compile(r'data:[^;]+;base64,[A-Za-z0-9+/=]+')
+_LONG_STR_THRESHOLD = int(os.getenv('LOG_MAX_STR_LEN', '500'))
+
+
+def sanitize_payload(data: Any, max_str_len: int = _LONG_STR_THRESHOLD) -> Any:
+    """递归清理 payload 中的 base64 数据和超长字符串，防止日志膨胀。"""
+    if isinstance(data, dict):
+        return {k: sanitize_payload(v, max_str_len) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_payload(item, max_str_len) for item in data]
+    elif isinstance(data, str):
+        if _BASE64_DATA_URL_RE.search(data):
+            data = _BASE64_DATA_URL_RE.sub('[BASE64_DATA_REMOVED]', data)
+        if len(data) > max_str_len:
+            data = f'{data[:max_str_len]}... [truncated, len={len(data)}]'
+        return data
+    return data
 
 
 def sanitize_request_data(request_data: Dict[str, Any], max_messages_len: int = 100) -> Dict[str, Any]:

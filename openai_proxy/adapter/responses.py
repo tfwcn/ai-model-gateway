@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from ..utils.session import SessionStore
 from ..utils.tool_call_converter import ToolCallConverter
 from ..utils.streaming_context import StreamingContext
+from ..utils.logger import sanitize_payload
 
 logger = logging.getLogger(__name__)
 
@@ -946,8 +947,8 @@ class ResponsesAdapter:
                         # 这是 custom tool，使用 extract_custom_tool_input 提取 input 字段
                         input_value = self.context.extract_custom_tool_input(arguments)
                         logger.debug(f"🔄 [REVERSE CONVERT] Function call '{name}' -> Custom tool call")
-                        logger.debug(f"   Arguments: {arguments}")
-                        logger.debug(f"   Extracted input: {input_value}")
+                        logger.debug(f"   Arguments: {sanitize_payload(arguments)}")
+                        logger.debug(f"   Extracted input: {sanitize_payload(input_value)}")
 
                         # 转换为 custom_tool_call 格式，使用提取的 input 值
                         output_items.append({
