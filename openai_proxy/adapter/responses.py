@@ -60,6 +60,48 @@ class ResponsesAdapter:
         ctx = self._request_context.get(None)
         return ctx is not None and bool(ctx.request_id)
 
+    @staticmethod
+    def _convert_usage(usage: dict) -> dict:
+        """
+        将上游 Chat API 的 usage 字段转换为完整的 Responses API usage 格式。
+
+        上游可能返回两种字段命名:
+        - prompt_tokens / completion_tokens / total_tokens (OpenAI/Azure 原生)
+        - input_tokens / output_tokens / total_tokens (已有 Responses 格式)
+
+        Responses API 的 ResponseUsage 需要 input_tokens_details / output_tokens_details
+        嵌套对象，缺失会导致 SDK 解析 response.completed 失败，因此始终补齐。
+        """
+        usage = usage or {}
+
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        total_tokens = usage.get("total_tokens") or (input_tokens + output_tokens)
+
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+
+        input_details = usage.get("input_tokens_details") or {}
+        if not input_details:
+            input_details = {
+                "cache_write_tokens": prompt_details.get("cache_write_tokens", 0),
+                "cached_tokens": prompt_details.get("cached_tokens", 0),
+            }
+
+        output_details = usage.get("output_tokens_details") or {}
+        if not output_details:
+            output_details = {
+                "reasoning_tokens": completion_details.get("reasoning_tokens", 0),
+            }
+
+        return {
+            "input_tokens": input_tokens,
+            "input_tokens_details": input_details,
+            "output_tokens": output_tokens,
+            "output_tokens_details": output_details,
+            "total_tokens": total_tokens,
+        }
+
     async def convert_request(self, responses_payload: dict) -> Tuple[dict, str]:
         """
         将 Responses API 请求体转换为 Chat API 请求体。
@@ -109,6 +151,12 @@ class ResponsesAdapter:
             "messages": messages,
             "stream": stream,
         }
+
+        # 6.1 流式请求默认请求上游返回 usage (Azure 等平台需显式启用)
+        if stream:
+            chat_payload["stream_options"] = {
+                "include_usage": True
+            }
 
         # 7. 映射其他可选参数 (字段名标准化)
         if "max_output_tokens" in responses_payload:
@@ -722,14 +770,7 @@ class ResponsesAdapter:
                 # 检查是否有 usage 信息（在最后一个chunk中）
                 if "usage" in data:
                     usage_data = data["usage"]
-                    self.context.usage = {
-                        "input_tokens": usage_data.get("prompt_tokens") or usage_data.get("input_tokens") or 0,
-                        "output_tokens": usage_data.get("completion_tokens") or usage_data.get("output_tokens") or 0,
-                    }
-                    self.context.usage["total_tokens"] = (
-                        self.context.usage["input_tokens"] +
-                        self.context.usage["output_tokens"]
-                    )
+                    self.context.usage = self._convert_usage(usage_data)
                 return None
 
             choice = choices[0]
@@ -1000,11 +1041,7 @@ class ResponsesAdapter:
             "tool_choice": responses_payload.get("tool_choice", "auto"),
             "tools": responses_payload.get("tools", []),
             "top_p": responses_payload.get("top_p", 1.0),
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
-                "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens") or 0,
-                "total_tokens": usage.get("total_tokens") or 0
-            },
+            "usage": self._convert_usage(usage),
             "user": None
         }
 
@@ -1218,11 +1255,7 @@ class ResponsesAdapter:
         """构建最终完成事件（response.completed + [DONE]）"""
         events = []
         response_id = self.context.response_id
-        usage = self.context.usage or {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0
-        }
+        usage = self.context.usage or self._convert_usage({})
 
         # response.completed
         seq = self.context.next_sequence()
