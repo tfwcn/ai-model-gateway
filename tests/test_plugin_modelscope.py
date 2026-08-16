@@ -106,14 +106,21 @@ class TestModelScopeGetModels:
     @pytest.mark.asyncio
     async def test_get_models_no_scrape_url(self):
         """测试没有爬虫URL时获取模型"""
-        plugin = ModelScopePlugin(api_key="test-key")
+        plugin = ModelScopePlugin(
+            api_key="test-key",
+            plugin_config={'args': {'enable_tool_capability_test': False, 'cache_file': 'data/test_modelscope_empty.json'}}
+        )
         models = await plugin.get_models()
         assert models == []
 
     @pytest.mark.asyncio
     async def test_get_models_with_cache(self):
         """测试使用缓存获取模型"""
-        plugin = ModelScopePlugin(api_key="test-key", scrape_url="https://www.modelscope.cn/models")
+        plugin = ModelScopePlugin(
+            api_key="test-key",
+            scrape_url="https://www.modelscope.cn/models",
+            plugin_config={'args': {'enable_tool_capability_test': False, 'cache_file': 'data/test_modelscope_empty.json'}}
+        )
         plugin.models_cache = [ModelScopeModel(model_id="cached-model", model_name="Cached Model")]
         plugin.last_cache_time = time.time()
         plugin.initial_scrape_completed = True  # 标记首次爬虫已完成
@@ -126,7 +133,8 @@ class TestModelScopeGetModels:
         """测试从爬虫成功获取模型（通过内存缓存）"""
         plugin = ModelScopePlugin(
             api_key="test-key",
-            scrape_url="https://www.modelscope.cn/models"
+            scrape_url="https://www.modelscope.cn/models",
+            plugin_config={'args': {'enable_tool_capability_test': False, 'cache_file': 'data/test_modelscope_empty.json'}}
         )
         # 模拟爬虫已完成并更新了内存缓存
         plugin.initial_scrape_completed = True
@@ -147,7 +155,8 @@ class TestModelScopeGetModels:
         """测试爬虫失败但有缓存"""
         plugin = ModelScopePlugin(
             api_key="test-key",
-            scrape_url="https://www.modelscope.cn/models"
+            scrape_url="https://www.modelscope.cn/models",
+            plugin_config={'args': {'enable_tool_capability_test': False, 'cache_file': 'data/test_modelscope_empty.json'}}
         )
         plugin.models_cache = [ModelScopeModel(model_id="cached-model", model_name="Cached Model")]
         plugin.last_cache_time = time.time()
@@ -165,7 +174,8 @@ class TestModelScopeGetModels:
         """测试爬虫失败且无缓存"""
         plugin = ModelScopePlugin(
             api_key="test-key",
-            scrape_url="https://www.modelscope.cn/models"
+            scrape_url="https://www.modelscope.cn/models",
+            plugin_config={'args': {'enable_tool_capability_test': False, 'cache_file': 'data/test_modelscope_empty.json'}}
         )
 
         with patch.object(plugin, '_get_models_from_scraper', new_callable=AsyncMock) as mock_scraper:

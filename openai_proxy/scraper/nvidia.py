@@ -6,6 +6,7 @@ NVIDIA免费模型专用爬虫
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 from playwright.async_api import Page
 
@@ -76,7 +77,10 @@ class NVIDIAModelScraper(WebScraper):
         try:
             # 等待页面加载完成
             await page.wait_for_load_state('domcontentloaded', timeout=self.timeout)
-            await asyncio.sleep(3)  # 等待动态内容渲染
+
+            # 等待 AWS WAF 挑战完成和模型链接渲染（最多等待 scraper_timeout 秒）
+            # 页面会先返回 AWS WAF 挑战页，通过后才渲染真实内容
+            await self._wait_for_models_rendered(page)
 
             # 从页面链接中提取所有模型ID
             models_data = await page.evaluate("""
@@ -140,6 +144,52 @@ class NVIDIAModelScraper(WebScraper):
         # 由于架构限制，这里简化处理，实际使用时可能需要调整
         logger.debug("API拦截策略：需要在页面加载前设置路由")
         return None
+
+    async def _wait_for_models_rendered(self, page: Page) -> None:
+        """
+        等待页面渲染出模型链接
+
+        build.nvidia.com 受 AWS WAF 保护，首次访问会返回挑战页，
+        通过验证后才会导航到真实页面。这里轮询等待模型链接出现，
+        避免在 WAF 挑战页上执行 DOM 提取。
+
+        Args:
+            page: Playwright页面对象
+        """
+        # 轮询等待：模型链接的特征是 /publisher/model-name 格式的 href
+        start = time.time()
+        while (time.time() - start) < self.timeout / 1000:
+            try:
+                has_models = await page.evaluate("""
+                    () => {
+                        const links = document.querySelectorAll('a[href]');
+                        for (const a of links) {
+                            const href = a.getAttribute('href') || '';
+                            // 匹配 /publisher/model-name 模式（排除非模型路径）
+                            const m = href.match(/^\\/([^\\/]+)\\/([^\\/\\?]+)/);
+                            if (!m) continue;
+                            const exclude = ['explore', 'blueprints', 'models', 'api',
+                                             'community', '_next', 'chat', 'image',
+                                             'video', 'audio', 'embeddings', 'docs'];
+                            if (!exclude.includes(m[1])) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if has_models:
+                    logger.info("✓ 模型列表已渲染完成")
+                    return
+            except Exception as e:
+                # 页面可能在导航中，等待稳定
+                logger.debug(f"等待模型渲染中: {e}")
+
+            await asyncio.sleep(2)
+
+        # 等待超时后，再多等待几秒以加载剩余动态内容
+        logger.warning("等待模型渲染超时，尝试继续提取")
+        await asyncio.sleep(5)
 
     async def _extract_embedded_json(self, page: Page) -> Optional[List[Dict]]:
         """从页面嵌入的JSON脚本中提取数据"""

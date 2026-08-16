@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from openai_proxy.utils.error_classifier import ErrorClassifier, ErrorType
 from openai_proxy.core.base_plugin import BasePlugin
 from openai_proxy.scraper.modelscope import ModelScopeModelScraper
+from openai_proxy.scraper.modelscope_api import ModelScopeAPIClient
 from openai_proxy.model.cache import ModelCacheManager
 from openai_proxy.scraper.scheduled import ScheduledScraper
 from openai_proxy.model.capability.cache import CapabilityCacheManager
@@ -47,6 +48,7 @@ class ModelScopePlugin(BasePlugin):
         max_models: int = 50,
         scraper_timeout: int = 60,
         headless: bool = True,
+        use_api: bool = True,
         plugin_config: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
@@ -61,6 +63,7 @@ class ModelScopePlugin(BasePlugin):
             max_models: 最大模型数量，默认50
             scraper_timeout: 爬虫超时时间（秒），默认60秒
             headless: 是否使用无头模式运行浏览器，默认True
+            use_api: 是否优先使用官方 API 获取模型，默认True
             plugin_config: 完整的插件配置字典（可选）
             **kwargs: 其他插件特定参数
         """
@@ -82,6 +85,9 @@ class ModelScopePlugin(BasePlugin):
         self.max_models = max_models if max_models != 50 else self.get_plugin_arg('max_models', 50)
         self.scraper_timeout = scraper_timeout if scraper_timeout != 60 else self.get_plugin_arg('scraper_timeout', 60)
         self.headless = self.get_plugin_arg('headless', headless)
+
+        # 是否优先使用官方 API 获取模型（网页爬虫作为降级方案）
+        self.use_api = self.get_plugin_arg('use_api', use_api)
 
         # 定时任务配置 - 使用统一的 get_plugin_arg 方法
         self.cache_file = self.get_plugin_arg('cache_file', 'data/modelscope_free_models.json')
@@ -117,12 +123,31 @@ class ModelScopePlugin(BasePlugin):
         self.scraper: Optional[ModelScopeModelScraper] = None
         self.scheduler: Optional[ScheduledScraper] = None
 
+        # 初始化官方 API 客户端（用于获取模型列表）
+        self.api_client: Optional[ModelScopeAPIClient] = None
+        if self.use_api:
+            self._init_api_client()
+
         # 标记是否已完成首次爬虫任务
         self.initial_scrape_completed: bool = False
 
         self._init_scraper()
         if self.enable_scheduled_task:
             self._init_scheduler()
+
+    def _init_api_client(self) -> None:
+        """初始化官方 API 客户端"""
+        try:
+            self.api_client = ModelScopeAPIClient(
+                api_key=self.api_key,
+                base_url="https://api-inference.modelscope.cn/v1",
+                max_models=self.max_models,
+                timeout=self.scraper_timeout,
+            )
+            logger.info(f"✓ ModelScope 官方 API 客户端已初始化 (max_models={self.max_models})")
+        except Exception as e:
+            logger.error(f"初始化 API 客户端失败: {e}")
+            self.api_client = None
 
     def _init_scraper(self) -> None:
         """初始化ModelScope模型爬虫"""
@@ -162,19 +187,26 @@ class ModelScopePlugin(BasePlugin):
             logger.error(f"初始化调度器失败: {e}")
 
     async def _run_scraper_and_cache(self) -> None:
-        """执行爬虫并缓存结果"""
-        if not self.scraper:
-            logger.warning("爬虫未初始化")
-            # 即使爬虫未初始化，也标记为已完成（避免无限等待）
-            if not self.initial_scrape_completed:
-                self.initial_scrape_completed = True
-                logger.warning("爬虫未初始化，标记为已完成（降级模式）")
-            return
+        """执行模型获取并缓存结果（优先官方 API，降级网页爬虫）"""
+        models_data = None
 
-        try:
-            logger.info("开始执行爬虫任务...")
+        # 策略1：优先使用官方 API
+        if self.api_client:
+            logger.info("尝试通过官方 API 获取模型列表...")
+            models_data = await self.api_client.fetch_free_models()
+
+        # 策略2：API 失败或未启用时，降级到网页爬虫
+        if not models_data:
+            if not self.scraper:
+                logger.warning("爬虫未初始化且 API 未获取到数据")
+                if not self.initial_scrape_completed:
+                    self.initial_scrape_completed = True
+                    logger.warning("模型获取不可用，标记为已完成（降级模式）")
+                return
+            logger.info("官方 API 未获取到数据，降级到网页爬虫...")
             models_data = await self.scraper.scrape()
 
+        try:
             if models_data:
                 # 转换为 ModelScopeModel 对象
                 models = [
@@ -191,7 +223,7 @@ class ModelScopePlugin(BasePlugin):
                     "fetch_time": time.time(),
                     "total_count": len(models),
                     "returned_count": len(models),
-                    "source": "web_scraper"
+                    "source": "api" if self.api_client else "web_scraper"
                 }
 
                 success = self.cache_manager.save(
@@ -201,13 +233,13 @@ class ModelScopePlugin(BasePlugin):
                 )
 
                 if success:
-                    logger.info(f"✓ 爬虫任务完成，缓存 {len(models)} 个模型")
+                    logger.info(f"✓ 获取任务完成，缓存 {len(models)} 个模型")
                     # 更新内存缓存
                     self.update_cache(models)
                 else:
                     logger.error("✗ 保存缓存失败")
             else:
-                logger.warning("爬虫返回空结果")
+                logger.warning("未获取到模型数据")
 
             # 无论成功与否，都标记为已完成（避免无限等待）
             if not self.initial_scrape_completed:

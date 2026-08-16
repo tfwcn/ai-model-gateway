@@ -57,7 +57,8 @@ class TestGetModelsNewConfig:
         """测试使用爬虫获取模型列表（通过内存缓存）"""
         plugin = OpenRouterPlugin(
             api_key="test-key",
-            scrape_url="https://openrouter.ai/models?max_price=0"
+            scrape_url="https://openrouter.ai/models?max_price=0",
+            plugin_config={'args': {'enable_tool_capability_test': False}}
         )
 
         # 模拟爬虫已完成并更新了内存缓存
@@ -87,7 +88,8 @@ class TestGetModelsNewConfig:
         """测试缓存命中时不发起请求"""
         plugin = OpenRouterPlugin(
             api_key="test-key",
-            scrape_url="https://openrouter.ai/models?max_price=0"
+            scrape_url="https://openrouter.ai/models?max_price=0",
+            plugin_config={'args': {'enable_tool_capability_test': False}}
         )
 
         # 标记首次爬虫已完成
@@ -111,7 +113,10 @@ class TestGetModelsNewConfig:
     @pytest.mark.asyncio
     async def test_get_models_no_scrape_url_returns_empty(self):
         """测试未配置爬虫URL时返回空列表"""
-        plugin = OpenRouterPlugin(api_key="test-key")
+        plugin = OpenRouterPlugin(
+            api_key="test-key",
+            plugin_config={'args': {'enable_tool_capability_test': False, 'cache_file': 'data/test_openrouter_empty.json'}}
+        )
 
         plugin_config = {"args": {}}
 

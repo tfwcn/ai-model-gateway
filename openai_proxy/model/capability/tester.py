@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import json
 import logging
 from typing import Dict, List, Optional, Tuple
 import aiohttp
@@ -94,6 +95,43 @@ class ToolCapabilityTester:
         logger.warning(f"⚠ 模型{platform_str} {model_id} 测试结果不确定，视为不支持")
         return False
 
+    def _handle_auth_error(self, model_id: str, error_text: str) -> Optional[bool]:
+        """
+        处理 401 鉴权错误
+
+        区分两种情况：
+        - 全局密钥无效（返回 None，由调用方中断测试）
+        - 模型级授权问题（模型需单独开通，视为该模型不支持）
+
+        Args:
+            model_id: 模型ID
+            error_text: 401 错误响应体
+
+        Returns:
+            False 表示模型不支持；None 表示全局密钥问题
+        """
+        # 解析错误体，识别模型级授权错误（如 ModelScope 异步推理模型未授权）
+        is_model_auth_error = False
+        try:
+            error_data = json.loads(error_text)
+            error_obj = error_data.get("error", {})
+            if isinstance(error_obj, dict):
+                error_code = str(error_obj.get("code", ""))
+                error_msg = str(error_obj.get("message", ""))
+                # 模型级授权错误特征：code 为数字 401，或消息含"授权/令牌/未开通/not authorize"等关键词
+                if "授权" in error_msg or "令牌" in error_msg or "not_authorize" in error_msg.lower() or "not authorize" in error_msg.lower():
+                    is_model_auth_error = True
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if is_model_auth_error:
+            logger.warning(f"模型 {model_id} 未获得授权 (401)，视为不支持（可能需单独开通该模型）")
+            return False
+
+        # 其余情况视为全局密钥无效
+        logger.error(f"API 密钥无效 (401)")
+        raise Exception("API 密钥无效，请检查配置")
+
     async def _test_non_streaming(self, model_id: str) -> Optional[bool]:
         """
         测试非流式工具调用能力
@@ -148,8 +186,9 @@ class ToolCapabilityTester:
                                 return None
 
                         elif response.status == 401:
-                            logger.error(f"API 密钥无效 (401)")
-                            raise Exception("API 密钥无效，请检查配置")
+                            # 读取错误响应体，区分「全局密钥无效」与「模型级授权问题」
+                            error_text = await response.text()
+                            return self._handle_auth_error(model_id, error_text)
 
                         elif response.status == 404:
                             logger.warning(f"模型不存在 (404): {model_id}")
@@ -164,7 +203,8 @@ class ToolCapabilityTester:
                         data = await response.json()
                         choices = data.get("choices", [])
                         if not choices:
-                            logger.warning(f"响应中没有choices字段")
+                            # choices 为空通常表示模型为异步推理（未实际调用），视为不支持
+                            logger.warning(f"响应中没有choices字段: {model_id}")
                             return False
 
                         message = choices[0].get("message", {})
@@ -247,8 +287,9 @@ class ToolCapabilityTester:
                                 return None
 
                         elif response.status == 401:
-                            logger.error(f"API 密钥无效 (401)")
-                            raise Exception("API 密钥无效，请检查配置")
+                            # 读取错误响应体，区分「全局密钥无效」与「模型级授权问题」
+                            error_text = await response.text()
+                            return self._handle_auth_error(model_id, error_text)
 
                         elif response.status == 404:
                             logger.warning(f"模型不存在 (404): {model_id}")
@@ -272,7 +313,6 @@ class ToolCapabilityTester:
                                     break
 
                                 try:
-                                    import json
                                     chunk = json.loads(data_str)
                                     choices = chunk.get("choices", [])
                                     if choices:
@@ -362,8 +402,14 @@ class ToolCapabilityTester:
 
         # 处理结果
         for task_result in task_results:
-            if isinstance(task_result, Exception):
+            # 单个任务抛出的异常（如全局密钥无效）
+            if isinstance(task_result, BaseException):
                 logger.error(f"测试任务异常: {task_result}")
+                continue
+
+            # 正常结果为一个 (model_id, result) 元组
+            if not isinstance(task_result, tuple) or len(task_result) != 2:
+                logger.error(f"测试任务返回异常结果: {task_result!r}")
                 continue
 
             model_id, result = task_result

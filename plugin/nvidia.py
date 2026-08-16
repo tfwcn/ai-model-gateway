@@ -42,6 +42,7 @@ class NVIDIAPlugin(BasePlugin):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         cache_ttl: int = 3600,
+        use_api: bool = True,
         plugin_config: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
@@ -52,6 +53,7 @@ class NVIDIAPlugin(BasePlugin):
             api_key: API 密钥，如果为 None 则从环境变量获取
             base_url: API 基础URL，如果为 None 则使用默认值
             cache_ttl: 缓存有效期（秒），默认3600秒（1小时）
+            use_api: 是否优先使用官方 API 获取模型，默认True
             plugin_config: 插件配置字典，包含 args 等配置项
             **kwargs: 其他插件特定参数（保留用于向后兼容）
         """
@@ -70,6 +72,12 @@ class NVIDIAPlugin(BasePlugin):
 
         if not self.api_key:
             logger.warning("NVIDIA API 密钥未配置，插件将无法工作")
+
+        # 是否优先使用官方 API 获取模型（网页爬虫作为降级方案）
+        # 注意：NVIDIA 的 /v1/models 接口不区分免费与付费模型，
+        # 免费模型只能通过 build.nvidia.com 的 "Free Endpoint" 过滤器识别。
+        # 因此 NVIDIA 必须使用网页爬虫获取免费模型，API 客户端不适用于此。
+        self.use_api = False
 
         # 爬虫配置参数 - 使用统一的 get_plugin_arg 方法
         self.free_model_count = self.get_plugin_arg('free_model_count', 10)
@@ -177,7 +185,7 @@ class NVIDIAPlugin(BasePlugin):
             logger.error(f"初始化调度器失败: {e}")
 
     async def _run_scraper_and_cache(self) -> None:
-        """执行爬虫并缓存结果"""
+        """执行模型获取并缓存结果"""
         if not self.scraper:
             logger.warning("爬虫未初始化")
             return

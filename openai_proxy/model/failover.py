@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -14,6 +15,7 @@ from openai_proxy.model.state import ModelStateManager
 from openai_proxy.model.error_classifier import ErrorClassifier, ClassifiedError
 from openai_proxy.utils.tool_call_converter import ToolCallConverter
 from openai_proxy.utils.streaming_tool_call_buffer import StreamingToolCallBuffer
+from openai_proxy.utils.sse_parser import SSEEventParser
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ class ModelFailoverManager:
         self.all_aliases = all_aliases or {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.model_state_manager = ModelStateManager()
+        # 流式内容探测超时（秒）：超过该时间仍无内容则视为正常慢速响应
+        self.stream_probe_timeout = float(os.getenv("STREAM_PROBE_TIMEOUT", "5"))
 
     def _parse_model_selector(self, model_selector: str) -> Tuple[str, Optional[str]]:
         """
@@ -132,12 +136,111 @@ class ModelFailoverManager:
                     if "tool_calls" in delta and delta["tool_calls"]:
                         return True
 
+                    # 检查 reasoning_content（推理模型的思维链内容）
+                    if "reasoning_content" in delta:
+                        reasoning_content = delta["reasoning_content"]
+                        if reasoning_content is not None:
+                            if isinstance(reasoning_content, str):
+                                return len(reasoning_content.strip()) > 0
+                            else:
+                                return True
+
             # 如果既没有 message 也没有 delta，或者没有 content 字段
             return False
 
         except Exception as e:
             pass
             return False
+
+    async def _probe_stream_content(
+        self,
+        response: aiohttp.ClientResponse,
+        model_config: ModelConfig,
+        first_chunk: Optional[bytes],
+    ) -> tuple[bool, List[bytes]]:
+        """
+        探测流式响应是否包含实际内容。
+
+        读取流的前几块数据，检查是否包含内容（delta.content / tool_calls / reasoning_content）。
+        用于识别空响应：有些模型返回 200 但流中没有实际内容，此时应触发故障转移。
+
+        Args:
+            response: aiohttp 响应对象
+            model_config: 模型配置
+            first_chunk: 已预读的首块数据（可能为 None）
+
+        Returns:
+            tuple[bool, List[bytes]]: (是否包含内容, 已缓冲的数据块列表)
+        """
+        # 已缓冲的数据块（后续需要原样转发给客户端）
+        buffered: List[bytes] = []
+        if first_chunk:
+            buffered.append(first_chunk)
+
+        # SSE 事件解析器（不标准化，仅用于内容探测）
+        parser = SSEEventParser(normalize=False)
+
+        def check_events(events: List[str]) -> bool:
+            """检查事件列表中是否包含实际内容"""
+            for event in events:
+                if not event:
+                    continue
+                # 如果是 [DONE] 标记，跳过
+                if event.strip() == "[DONE]":
+                    continue
+                # 检查 data 行中的 JSON 是否包含内容
+                for line in event.split('\n'):
+                    stripped = line.strip()
+                    if not stripped.startswith('data:'):
+                        continue
+                    data = stripped[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        payload = json.loads(data)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if self._has_valid_content(payload):
+                        return True
+            return False
+
+        # 先检查首块数据
+        if first_chunk:
+            if check_events(parser.feed(first_chunk)):
+                return True, buffered
+
+        # 探测截止时间：使用模型超时与探测超时中较小值，避免无限等待
+        probe_deadline = time.time() + min(self.stream_probe_timeout, model_config.timeout)
+        try:
+            while True:
+                remaining = probe_deadline - time.time()
+                if remaining <= 0:
+                    # 探测超时仍未出现内容：视为正常慢速响应，不阻断转发
+                    logger.info(
+                        f"模型 {model_config.name} 流式内容探测超时，按正常响应处理"
+                    )
+                    return True, buffered
+                # 读取下一块数据（带超时控制）
+                chunk = await asyncio.wait_for(
+                    response.content.read(8192),
+                    timeout=remaining
+                )
+                if not chunk:
+                    # 流已结束但没有任何内容 → 空响应
+                    logger.warning(
+                        f"模型 {model_config.name} 流式响应结束但无实际内容"
+                    )
+                    return False, buffered
+                buffered.append(chunk)
+                if check_events(parser.feed(chunk)):
+                    return True, buffered
+        except asyncio.TimeoutError:
+            # 读取超时：按正常慢速响应处理，不阻断转发
+            logger.info(
+                f"模型 {model_config.name} 流式内容探测读取超时，按正常响应处理"
+            )
+            return True, buffered
+
 
     async def call_model_stream(self, model_config: ModelConfig, request_data: Dict[str, Any]) -> tuple[bool, Any]:
         """
@@ -193,6 +296,7 @@ class ModelFailoverManager:
                 )
 
                 # 如果首字节是 {，说明可能是 JSON 错误响应（SSE 以 "data:" 开头）
+                first_chunk_for_wrapper = first_byte
                 if first_byte and first_byte.decode('utf-8', errors='replace').strip() == '{':
                     rest = await asyncio.wait_for(
                         response.content.read(4096),
@@ -219,30 +323,44 @@ class ModelFailoverManager:
                         pass
                     # 不是错误 JSON，当作普通数据透传
                     first_chunk_for_wrapper = chunk
-                else:
-                    first_chunk_for_wrapper = first_byte
+
+                # 【新增】探测流式响应是否包含实际内容，避免空响应不触发故障转移
+                has_content, buffered_chunks = await self._probe_stream_content(
+                    response, model_config, first_chunk_for_wrapper
+                )
+                if not has_content:
+                    error_msg = f"模型 {model_config.name} 流式响应为空（无有效 content 字段）"
+                    logger.warning(error_msg)
+                    response.close()
+                    # 空响应分类为缺少内容，触发故障转移到下一个模型
+                    classified_error = ErrorClassifier.classify_invalid_response(
+                        model_config.name, error_msg
+                    )
+                    logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+                    return False, classified_error
 
                 # 创建一个包装对象包含原始响应和预读取的数据
                 class StreamResponseWrapper:
-                    def __init__(self, original_response, preloaded_data):
+                    def __init__(self, original_response, preloaded_chunks):
                         self.original_response = original_response
-                        self.preloaded_data = preloaded_data
-                        self.first_chunk_sent = False
+                        self.preloaded_chunks = preloaded_chunks
+                        self.preloaded_index = 0
                         # 【新增】初始化工具调用缓冲器（如果启用）
                         self.tool_call_buffer = StreamingToolCallBuffer() if model_config.enable_tool_call_conversion else None
 
                     async def __aiter__(self):
                         """使用iter_any()读取数据块，由上层按行处理"""
-                        if self.preloaded_data and not self.first_chunk_sent:
-                            self.first_chunk_sent = True
-                            yield self.preloaded_data
+                        # 先回放探测阶段已缓冲的数据块
+                        for chunk in self.preloaded_chunks:
+                            if chunk:
+                                yield chunk
 
                         # 使用iter_any()读取原始数据块
                         async for chunk in self.original_response.content.iter_any():
                             if chunk:
                                 yield chunk
 
-                wrapped_response = StreamResponseWrapper(response, first_chunk_for_wrapper)
+                wrapped_response = StreamResponseWrapper(response, buffered_chunks)
                 return True, wrapped_response
 
             except asyncio.TimeoutError:
