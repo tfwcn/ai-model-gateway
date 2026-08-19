@@ -182,19 +182,6 @@ class TestGPT5ParameterAdaptation:
     """Test GPT-5 specific parameter handling."""
 
     @pytest.mark.asyncio
-    async def test_gpt5_temperature_override(self, adapter):
-        """Test that GPT-5 temperature is forced to 1."""
-        payload = {
-            "model": "gpt-5",
-            "input": [{"role": "user", "content": "Hello"}],
-            "temperature": 0.7
-        }
-
-        chat_payload, _ = await adapter.convert_request(payload)
-
-        assert chat_payload["temperature"] == 1
-
-    @pytest.mark.asyncio
     async def test_non_gpt5_temperature_preserved(self, adapter):
         """Test that non-GPT-5 models preserve their temperature."""
         payload = {

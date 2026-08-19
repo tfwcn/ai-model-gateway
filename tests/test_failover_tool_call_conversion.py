@@ -104,10 +104,13 @@ class TestNonStreamToolCallConversion:
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=None)
 
-        # Mock session.post
+        # Mock session.post - 需让 post 返回异步上下文管理器而非协程
         with patch.object(failover_manager, 'get_session') as mock_get_session:
             mock_session = AsyncMock()
-            mock_session.post = AsyncMock(return_value=mock_response)
+            async_mock_response = AsyncMock()
+            async_mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+            async_mock_response.__aexit__ = AsyncMock(return_value=None)
+            mock_session.post = MagicMock(return_value=async_mock_response)
             mock_get_session.return_value = mock_session
 
             # 调用方法
@@ -160,10 +163,13 @@ class TestNonStreamToolCallConversion:
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=None)
 
-        # Mock session.post
+        # Mock session.post - 需让 post 返回异步上下文管理器而非协程
         with patch.object(failover_manager, 'get_session') as mock_get_session:
             mock_session = AsyncMock()
-            mock_session.post = AsyncMock(return_value=mock_response)
+            async_mock_response = AsyncMock()
+            async_mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+            async_mock_response.__aexit__ = AsyncMock(return_value=None)
+            mock_session.post = MagicMock(return_value=async_mock_response)
             mock_get_session.return_value = mock_session
 
             # 调用方法
@@ -204,10 +210,13 @@ class TestNonStreamToolCallConversion:
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=None)
 
-        # Mock session.post
+        # Mock session.post - 需让 post 返回异步上下文管理器而非协程
         with patch.object(failover_manager, 'get_session') as mock_get_session:
             mock_session = AsyncMock()
-            mock_session.post = AsyncMock(return_value=mock_response)
+            async_mock_response = AsyncMock()
+            async_mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+            async_mock_response.__aexit__ = AsyncMock(return_value=None)
+            mock_session.post = MagicMock(return_value=async_mock_response)
             mock_get_session.return_value = mock_session
 
             # 调用方法

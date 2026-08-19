@@ -315,7 +315,7 @@ class ModelFailoverManager:
                             if isinstance(json_data.get("error"), dict):
                                 error_text = json_data["error"].get("message", chunk_str)
                             classified_error = ErrorClassifier.classify_http_error(
-                                400, error_text, model_config.name
+                                response.status, error_text, model_config.name
                             )
                             logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
                             return False, classified_error

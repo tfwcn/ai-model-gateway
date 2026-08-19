@@ -2,7 +2,7 @@
 
 import os
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from openai_proxy.core.base_plugin import BasePlugin
 
@@ -116,9 +116,15 @@ async def test_make_api_request_success():
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.json.return_value = {"data": "test"}
-        
-        mock_session.return_value.__aenter__.return_value.get.return_value.__aenter__.return_value = mock_response
-        
+
+        # 模拟 ClientSession 及 get 返回的异步上下文管理器
+        session_instance = MagicMock()
+        mock_session.return_value.__aenter__.return_value = session_instance
+        async_response = MagicMock()
+        async_response.__aenter__.return_value = mock_response
+        mock_session_instance_get = session_instance.get
+        mock_session_instance_get.return_value = async_response
+
         result = await plugin._make_api_request("https://api.test.com/test")
         assert result == {"data": "test"}
 
@@ -132,9 +138,15 @@ async def test_make_api_request_failure():
         mock_response = AsyncMock()
         mock_response.status = 401
         mock_response.text.return_value = "Unauthorized"
-        
-        mock_session.return_value.__aenter__.return_value.get.return_value.__aenter__.return_value = mock_response
-        
+
+        # 模拟 ClientSession 及 get 返回的异步上下文管理器
+        session_instance = MagicMock()
+        mock_session.return_value.__aenter__.return_value = session_instance
+        async_response = MagicMock()
+        async_response.__aenter__.return_value = mock_response
+        mock_session_instance_get = session_instance.get
+        mock_session_instance_get.return_value = async_response
+
         with pytest.raises(Exception) as exc_info:
             await plugin._make_api_request("https://api.test.com/test")
         
