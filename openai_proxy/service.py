@@ -21,6 +21,64 @@ from openai_proxy.utils.logger import sanitize_payload
 logger = logging.getLogger(__name__)
 
 
+async def _forward_normalized_sse(upstream_stream):
+    """
+    标准化 SSE 流转发（公共逻辑）
+
+    使用 SSEEventParser 按完整事件分割并标准化，自动补发 [DONE]。
+    消除 /v1/chat/completions 与 /v1/responses 间的重复代码。
+    """
+    parser = SSEEventParser(normalize=True)
+    done_sent = False
+    async for chunk in upstream_stream:
+        if not chunk:
+            continue
+        try:
+            events = parser.feed(chunk)
+            for event in events:
+                if not event.strip():
+                    continue
+                yield (event + "\n\n").encode("utf-8")
+                if "[DONE]" in event:
+                    done_sent = True
+        except Exception as e:
+            logger.error(f"SSE normalization error: {e}", exc_info=True)
+            yield chunk  # 降级：透传原始 chunk
+    if not done_sent:
+        logger.info("Upstream did not send [DONE], appending termination marker")
+        yield b"data: [DONE]\n\n"
+
+
+async def _convert_responses_sse(upstream_stream, adapter):
+    """
+    Responses API 专用：标准化 + Chat→Responses 协议转换
+    """
+    parser = SSEEventParser(normalize=True)
+    chunk_count = 0
+    async for chunk in upstream_stream:
+        chunk_count += 1
+        if not chunk:
+            continue
+        try:
+            events = parser.feed(chunk)
+            for event in events:
+                if not event.strip():
+                    continue
+                for line in event.split("\n"):
+                    stripped = line.strip()
+                    if stripped.lower().startswith("data:"):
+                        converted = adapter.convert_stream_event(stripped)
+                        if converted:
+                            logger.debug(f"[{chunk_count}] Converted: {converted[:150]}...")
+                            yield converted.encode("utf-8")
+        except Exception as e:
+            logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
+            try:
+                logger.error(f"Problematic chunk preview: {chunk[:200]}")
+            except Exception:
+                pass
+
+
 class OpenAIProxyService:
     """AI Model Gateway 主服务类 - 负责FastAPI应用和路由"""
 
@@ -210,6 +268,11 @@ class OpenAIProxyService:
 
             try:
                 request_data = await request.json()
+                # 打印请求体到日志，方便调试
+                logger.debug("=" * 80)
+                logger.debug("请求体内容:")
+                logger.debug(json.dumps(sanitize_payload(request_data), indent=2, ensure_ascii=False))
+                logger.debug("=" * 80)
 
             except Exception as e:
 
@@ -223,37 +286,12 @@ class OpenAIProxyService:
             if request_data.get("stream", False):
                 # 流式响应处理
                 async def stream_generator():
-
                     try:
                         result = await self.failover_manager.chat_completion_stream(request_data)
-                        done_sent = False
                         if hasattr(result, '__aiter__'):
-                            # 处理支持异步迭代的对象（包括StreamResponseWrapper和aiohttp.ClientResponse）
-                            # 创建 SSE 事件解析器
-                            parser = SSEEventParser(normalize=True)
                             logger.info("SSE normalization enabled for /v1/chat/completions")
-                            done_sent = False
-                            async for chunk in result:
-                                if chunk:
-                                    try:
-                                        # SSEEventParser 内部使用 bytes 缓冲，
-                                        # 按完整事件分割后统一解码，防止 UTF-8 跨 chunk 截断
-                                        events = parser.feed(chunk)
-
-                                        # 处理所有完整的事件
-                                        for event in events:
-                                            if not event.strip():
-                                                continue
-
-                                            # SSEEventParser 已经标准化了事件，直接 yield
-                                            yield (event + '\n\n').encode('utf-8')
-                                            if "[DONE]" in event:
-                                                done_sent = True
-
-                                    except Exception as e:
-                                        logger.error(f"SSE normalization error: {e}", exc_info=True)
-                                        # 如果标准化失败，直接透传原始 chunk
-                                        yield chunk
+                            async for data in _forward_normalized_sse(result):
+                                yield data
                         else:
                             # 如果返回的是普通响应但请求是流式的，转换为流式格式
                             try:
@@ -262,7 +300,6 @@ class OpenAIProxyService:
                                 elif isinstance(result, str):
                                     payload = result.encode('utf-8')
                                 else:
-                                    # 兼容 aiohttp.ClientResponse 等对象
                                     if hasattr(result, 'text'):
                                         payload = (await result.text()).encode('utf-8')
                                     elif hasattr(result, 'read'):
@@ -273,17 +310,10 @@ class OpenAIProxyService:
                             except Exception as e:
                                 logger.error(f"Stream fallback serialization error: {e}", exc_info=True)
                                 payload = str(result).encode('utf-8')
-
                             yield payload + b"\n"
-
-                        # 上游流结束,确保发送 [DONE] 终止标记
-                        # 对于某些上游(如 ModelScope)不发 [DONE] 的情况,需要手动补发
-                        if not done_sent:
-                            logger.info("Upstream did not send [DONE], appending termination marker")
+                            # 补发 [DONE]（非 SSE 流场景）
                             yield b"data: [DONE]\n\n"
-
                     except Exception as e:
-
                         error_response = {
                             "error": {
                                 "message": str(e),
@@ -292,9 +322,7 @@ class OpenAIProxyService:
                                 "code": "proxy_error"
                             }
                         }
-                        error_str = json.dumps(error_response)
-
-                        yield error_str.encode() + b"\n"
+                        yield json.dumps(error_response).encode() + b"\n"
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")  # type: ignore[arg-type]
             else:
@@ -331,57 +359,17 @@ class OpenAIProxyService:
             if is_stream:
                 async def stream_generator():
                     try:
-                        # 2. 调用上游 Chat API
                         upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
-
-                        # 3. 转换流式事件并转发
-                        chunk_count = 0
-                        # 创建 SSE 事件解析器
-                        parser = SSEEventParser(normalize=True)
-
-                        async for chunk in upstream_stream:
-                            chunk_count += 1
-                            if chunk:
-                                try:
-                                    # SSEEventParser 内部使用 bytes 缓冲，
-                                    # 按完整事件分割后统一解码，防止 UTF-8 跨 chunk 截断
-                                    events = parser.feed(chunk)
-
-                                    # 处理所有完整的事件
-                                    for event in events:
-                                        if not event.strip():
-                                            continue
-
-                                        # SSEEventParser 已经标准化了事件格式
-                                        # 从事件中提取 data: 行进行协议转换
-                                        lines = event.split('\n')
-                                        for line in lines:
-                                            stripped = line.strip()
-                                            if stripped.lower().startswith('data:'):
-                                                # 提取 data: 行并进行协议转换 (Chat API → Responses API)
-                                                converted_line = self.responses_adapter.convert_stream_event(stripped)
-                                                if converted_line:
-                                                    logger.debug(f"[{chunk_count}] Converted line: {converted_line[:150]}...")
-                                                    yield converted_line.encode('utf-8')
-
-                                except Exception as e:
-                                    logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
-                                    try:
-                                        logger.error(f"Problematic chunk preview: {chunk[:200]}")
-                                    except Exception:
-                                        pass
-
-                        # 上游流结束,检查是否已发出完成事件
-                        # 对于某些上游(如 ModelScope)不发 [DONE] 的情况,需要手动补发
+                        async for data in _convert_responses_sse(upstream_stream, self.responses_adapter):
+                            yield data
+                        # 上游流结束,检查是否已发出完成事件（ModelScope 等不发 [DONE] 的上游）
                         if self.responses_adapter.has_request_context() and not self.responses_adapter.context.has_received_done:
                             logger.info("Upstream did not send [DONE], emitting completion events")
                             completion_events = self.responses_adapter._build_completion_events()
                             if completion_events:
                                 yield completion_events.encode('utf-8')
-
                     except Exception as e:
                         logger.error(f"Upstream stream error: {e}", exc_info=True)
-                        # 异常时清理上下文状态
                         if self.responses_adapter.has_request_context():
                             self.responses_adapter.context.cleanup()
 

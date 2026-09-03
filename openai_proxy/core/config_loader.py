@@ -116,6 +116,7 @@ class ConfigLoader:
                     enabled = platform_config.get('enabled', True)
                     quota_period = platform_config.get('quota_period')  # 支持 quota_period 配置
                     retry_count = platform_config.get('retry_count', 3)  # 单个模型重试次数
+                    stream_probe_timeout = platform_config.get('stream_probe_timeout')  # 流式探测超时（可选）
 
                     # 如果有插件配置且返回了模型，或者静态配置有模型，才添加该平台
                     # 注意：如果只有插件配置但返回空列表，仍然添加平台（让定时任务去填充）
@@ -158,7 +159,8 @@ class ConfigLoader:
                                 weight=weight,
                                 enabled=enabled,
                                 quota_period=quota_period,
-                                retry_count=retry_count
+                                retry_count=retry_count,
+                                stream_probe_timeout=stream_probe_timeout,
                             )
                             models[platform_name].append(model_config)
                     else:
@@ -171,7 +173,8 @@ class ConfigLoader:
                             'weight': weight,
                             'enabled': enabled,
                             'quota_period': quota_period,
-                            'retry_count': retry_count
+                            'retry_count': retry_count,
+                            'stream_probe_timeout': stream_probe_timeout,
                         }
 
                 # 只在加载模型时打印详细日志

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 
@@ -28,8 +29,14 @@ class ModelFailoverManager:
         self.all_aliases = all_aliases or {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.model_state_manager = ModelStateManager()
-        # 流式内容探测超时（秒）：超过该时间仍无内容则视为正常慢速响应
-        self.stream_probe_timeout = float(os.getenv("STREAM_PROBE_TIMEOUT", "5"))
+        # 流式内容探测超时（秒）：超过该时间仍无内容则触发故障转移
+        self.stream_probe_timeout = float(os.getenv("STREAM_PROBE_TIMEOUT", "10"))
+
+    def _get_probe_timeout(self, model_config: ModelConfig) -> float:
+        """获取探测超时：优先使用模型单独配置，否则使用全局配置"""
+        if model_config.stream_probe_timeout is not None:
+            return float(model_config.stream_probe_timeout)
+        return self.stream_probe_timeout
 
     def _parse_model_selector(self, model_selector: str) -> Tuple[str, Optional[str]]:
         """
@@ -58,189 +65,174 @@ class ModelFailoverManager:
     async def get_session(self) -> aiohttp.ClientSession:
         """获取HTTP会话"""
         if self.session is None or self.session.closed:
-            # 移除total超时，避免影响流式响应
+            # 使用连接池限制，避免过多并发连接；total=None 由调用方按需设置
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
             self.session = aiohttp.ClientSession(
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"},
+                connector=connector,
             )
-        else:
-            pass
         return self.session
 
-    def _has_valid_content(self, response_data: Any) -> bool:
+    def _has_valid_content(self, response_data: Any, allow_empty: bool = False) -> bool:
         """
-        检查响应数据是否包含有效的 content 字段
+        检查响应数据是否包含有效的 content 字段。
 
         Args:
             response_data: API 响应的 JSON 数据
+            allow_empty: 是否允许空字符串（流式探测阶段为 True，非流式为 False）
 
-        Returns:
-            bool: 如果包含有效的 content 字段返回 True，否则返回 False
+        判断规则：
+        - tool_calls 存在且非空 → 有效（优先级最高）
+        - content 非 None 且非空（根据 allow_empty 决定是否允许 ""）
+        - reasoning_content 同上
         """
         try:
             if not isinstance(response_data, dict):
                 return False
 
-            # 检查 choices 数组是否存在且非空
             choices = response_data.get("choices")
             if not choices or not isinstance(choices, list) or len(choices) == 0:
                 return False
 
-            # 检查第一个 choice 是否包含 message 或 delta
             first_choice = choices[0]
             if not isinstance(first_choice, dict):
                 return False
+
+            def _is_valid_value(value) -> bool:
+                """判断值是否有效"""
+                if value is None:
+                    return False
+                if isinstance(value, str):
+                    # 非流式要求非空字符串（去空白后），流式允许空字符串
+                    return True if allow_empty else len(value.strip()) > 0
+                return True
 
             # 对于普通响应，检查 message.content 或 message.tool_calls
             if "message" in first_choice:
                 message = first_choice["message"]
                 if isinstance(message, dict):
-                    # 检查 tool_calls（工具调用也是有效响应，优先级最高）
                     if "tool_calls" in message and message["tool_calls"]:
                         return True
+                    if "content" in message and _is_valid_value(message["content"]):
+                        return True
+                    if "reasoning_content" in message and _is_valid_value(message["reasoning_content"]):
+                        return True
 
-                    # 检查 content
-                    if "content" in message:
-                        content = message["content"]
-                        # content 必须是非None值，如果是字符串则不能是空字符串
-                        if content is not None:
-                            if isinstance(content, str):
-                                if len(content.strip()) > 0:
-                                    return True
-                            else:
-                                return True  # 非字符串类型（如数字、布尔值等）认为有效
-
-                    # 检查 reasoning_content（某些模型如 minimax 使用此字段）
-                    if "reasoning_content" in message:
-                        reasoning_content = message["reasoning_content"]
-                        if reasoning_content is not None:
-                            if isinstance(reasoning_content, str):
-                                return len(reasoning_content.strip()) > 0
-                            else:
-                                return True
-
-            # 对于流式响应的 chunk，检查 delta.content 或 delta.tool_calls
+            # 对于流式 chunk，检查 delta.content 或 delta.tool_calls
             if "delta" in first_choice:
                 delta = first_choice["delta"]
                 if isinstance(delta, dict):
-                    # 检查 content
-                    if "content" in delta:
-                        content = delta["content"]
-                        # content 必须是非None值，如果是字符串则不能是空字符串
-                        if content is not None:
-                            if isinstance(content, str):
-                                return len(content.strip()) > 0
-                            else:
-                                return True  # 非字符串类型认为有效
-
-                    # 检查 tool_calls（工具调用也是有效响应）
+                    if "content" in delta and _is_valid_value(delta["content"]):
+                        return True
                     if "tool_calls" in delta and delta["tool_calls"]:
                         return True
+                    if "reasoning_content" in delta and _is_valid_value(delta["reasoning_content"]):
+                        return True
 
-                    # 检查 reasoning_content（推理模型的思维链内容）
-                    if "reasoning_content" in delta:
-                        reasoning_content = delta["reasoning_content"]
-                        if reasoning_content is not None:
-                            if isinstance(reasoning_content, str):
-                                return len(reasoning_content.strip()) > 0
-                            else:
-                                return True
-
-            # 如果既没有 message 也没有 delta，或者没有 content 字段
             return False
 
-        except Exception as e:
-            pass
+        except Exception:
             return False
+
+    def _is_only_keepalive(self, chunk: bytes) -> bool:
+        """判断 chunk 是否仅为 SSE keep-alive 注释（无有效数据）"""
+        if not chunk:
+            return True
+        text = chunk.decode("utf-8", errors="ignore").strip()
+        if not text:
+            return True
+        # 仅包含注释行或空 data 行
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if not lines:
+            return True
+        for line in lines:
+            if line.startswith(":"):
+                continue  # SSE 注释
+            if line == "data: [DONE]":
+                continue
+            if line.startswith("data:"):
+                # data: 后为空或仅空白
+                if line[5:].strip() == "":
+                    continue
+                return False
+            # 其他有效行
+            return False
+        return True
 
     async def _probe_stream_content(
         self,
         response: aiohttp.ClientResponse,
         model_config: ModelConfig,
         first_chunk: Optional[bytes],
+        request_id: str = "",
     ) -> tuple[bool, List[bytes]]:
         """
         探测流式响应是否包含实际内容。
 
-        读取流的前几块数据，检查是否包含内容（delta.content / tool_calls / reasoning_content）。
-        用于识别空响应：有些模型返回 200 但流中没有实际内容，此时应触发故障转移。
-
-        Args:
-            response: aiohttp 响应对象
-            model_config: 模型配置
-            first_chunk: 已预读的首块数据（可能为 None）
-
-        Returns:
-            tuple[bool, List[bytes]]: (是否包含内容, 已缓冲的数据块列表)
+        宽松策略：仅过滤纯 keep-alive 注释，只要收到任何有效 data 行即视为有内容。
+        只有在整个探测窗口内完全无有效数据时才判定为空。
         """
-        # 已缓冲的数据块（后续需要原样转发给客户端）
         buffered: List[bytes] = []
+        rid = f"[{request_id}] " if request_id else ""
+
+        # 首块有效数据直接视为有内容
+        if first_chunk and not self._is_only_keepalive(first_chunk):
+            buffered.append(first_chunk)
+            return True, buffered
         if first_chunk:
+            # 首块仅为 keep-alive，仍需继续探测
             buffered.append(first_chunk)
 
-        # SSE 事件解析器（不标准化，仅用于内容探测）
-        parser = SSEEventParser(normalize=False)
-
-        def check_events(events: List[str]) -> bool:
-            """检查事件列表中是否包含实际内容"""
-            for event in events:
-                if not event:
-                    continue
-                # 如果是 [DONE] 标记，跳过
-                if event.strip() == "[DONE]":
-                    continue
-                # 检查 data 行中的 JSON 是否包含内容
-                for line in event.split('\n'):
-                    stripped = line.strip()
-                    if not stripped.startswith('data:'):
-                        continue
-                    data = stripped[5:].strip()
-                    if not data:
-                        continue
-                    try:
-                        payload = json.loads(data)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if self._has_valid_content(payload):
-                        return True
-            return False
-
-        # 先检查首块数据
-        if first_chunk:
-            if check_events(parser.feed(first_chunk)):
-                return True, buffered
-
-        # 探测截止时间：使用模型超时与探测超时中较小值，避免无限等待
-        probe_deadline = time.time() + min(self.stream_probe_timeout, model_config.timeout)
+        probe_timeout = self._get_probe_timeout(model_config)
+        probe_deadline = time.time() + min(probe_timeout, model_config.timeout)
         try:
             while True:
                 remaining = probe_deadline - time.time()
                 if remaining <= 0:
-                    # 探测超时仍未出现内容：视为正常慢速响应，不阻断转发
+                    # 探测超时：检查是否全为 keep-alive
+                    has_valid = any(not self._is_only_keepalive(c) for c in buffered)
+                    if not has_valid:
+                        logger.info(
+                            f"{rid}模型 {model_config.name} 流式探测超时，未收到有效数据，触发故障转移"
+                        )
+                        return False, buffered
+                    total = sum(len(c) for c in buffered)
                     logger.info(
-                        f"模型 {model_config.name} 流式内容探测超时，按正常响应处理"
+                        f"{rid}模型 {model_config.name} 流式探测超时，但已收到 {total} 字节有效数据，继续转发"
                     )
                     return True, buffered
-                # 读取下一块数据（带超时控制）
+
                 chunk = await asyncio.wait_for(
                     response.content.read(8192),
                     timeout=remaining
                 )
                 if not chunk:
-                    # 流已结束但没有任何内容 → 空响应
-                    logger.warning(
-                        f"模型 {model_config.name} 流式响应结束但无实际内容"
+                    has_valid = any(not self._is_only_keepalive(c) for c in buffered)
+                    if not has_valid:
+                        logger.warning(
+                            f"{rid}模型 {model_config.name} 流式响应结束但未收到有效数据"
+                        )
+                        return False, buffered
+                    total = sum(len(c) for c in buffered)
+                    logger.info(
+                        f"{rid}模型 {model_config.name} 流式响应结束，已收到 {total} 字节有效数据"
                     )
-                    return False, buffered
-                buffered.append(chunk)
-                if check_events(parser.feed(chunk)):
                     return True, buffered
+                buffered.append(chunk)
+                if not self._is_only_keepalive(chunk):
+                    return True, buffered
+                # 仅为 keep-alive，继续探测
         except asyncio.TimeoutError:
-            # 读取超时：按正常慢速响应处理，不阻断转发
+            has_valid = any(not self._is_only_keepalive(c) for c in buffered)
+            if not has_valid:
+                logger.info(
+                    f"{rid}模型 {model_config.name} 流式内容探测读取超时，未收到有效数据，触发故障转移"
+                )
+                return False, buffered
             logger.info(
-                f"模型 {model_config.name} 流式内容探测读取超时，按正常响应处理"
+                f"{rid}模型 {model_config.name} 流式内容探测读取超时，但已收到有效数据，继续转发"
             )
             return True, buffered
-
 
     async def call_model_stream(self, model_config: ModelConfig, request_data: Dict[str, Any]) -> tuple[bool, Any]:
         """
@@ -266,9 +258,11 @@ class ModelFailoverManager:
         if "messages" in safe_request_data and len(str(safe_request_data["messages"])) > 200:
             safe_request_data["messages"] = f"[{len(safe_request_data['messages'])} messages, truncated]"
 
+        # 请求唯一ID，用于日志关联
+        request_id = uuid.uuid4().hex[:8]
         try:
             start_time = time.time()
-            logger.info(f"调用模型: {model_config.name} ({model_config.model}) - 流式")
+            logger.info(f"[{request_id}] 调用模型: {model_config.name} ({model_config.model}) - 流式")
 
             # 流式响应 - 设置精确的超时控制
             # connect: 连接建立超时
@@ -288,74 +282,82 @@ class ModelFailoverManager:
             )
             elapsed_time = time.time() - start_time
 
-            # 读取第一个字节，检查是否是 JSON 错误响应
+            # 读取首块数据（8192字节），同时检测 JSON 错误响应
             try:
-                first_byte = await asyncio.wait_for(
-                    response.content.read(1),
+                content_type = response.headers.get("Content-Type", "")
+                first_chunk = await asyncio.wait_for(
+                    response.content.read(8192),
                     timeout=5
                 )
 
-                # 如果首字节是 {，说明可能是 JSON 错误响应（SSE 以 "data:" 开头）
-                first_chunk_for_wrapper = first_byte
-                if first_byte and first_byte.decode('utf-8', errors='replace').strip() == '{':
-                    rest = await asyncio.wait_for(
-                        response.content.read(4096),
-                        timeout=10
-                    )
-                    chunk = first_byte + rest
-                    chunk_str = chunk.decode('utf-8', errors='replace')
-                    try:
-                        json_data = json.loads(chunk_str)
+                if not first_chunk:
+                    # 首块为空 → 进入探测流程
+                    first_chunk_for_wrapper = None
+                else:
+                    stripped = first_chunk.lstrip(b"\xef\xbb\xbf \t\r\n")
+                    is_json = stripped.startswith(b"{") or "json" in content_type.lower()
+                    if is_json:
+                        # 尝试补读以获得完整 JSON（避免截断）
+                        chunk_str = first_chunk.decode("utf-8", errors="replace")
+                        json_data = None
+                        try:
+                            json_data = json.loads(chunk_str)
+                        except json.JSONDecodeError:
+                            # 可能被截断，尝试再读一块
+                            try:
+                                extra = await asyncio.wait_for(
+                                    response.content.read(8192),
+                                    timeout=3
+                                )
+                                if extra:
+                                    chunk_str += extra.decode("utf-8", errors="replace")
+                                    first_chunk = first_chunk + extra
+                                    try:
+                                        json_data = json.loads(chunk_str)
+                                    except json.JSONDecodeError:
+                                        pass
+                            except asyncio.TimeoutError:
+                                pass
                         if isinstance(json_data, dict) and ("error" in json_data or "errors" in json_data):
-                            error_msg = f"流式响应返回错误: {chunk_str}"
+                            error_msg = f"[{request_id}] 流式响应返回错误: {chunk_str[:500]}"
                             logger.warning(error_msg)
                             response.close()
-                            # 提取错误消息进行分类，走HTTP错误分类路径（包含tool_call检测）
                             error_text = chunk_str
                             if isinstance(json_data.get("error"), dict):
                                 error_text = json_data["error"].get("message", chunk_str)
                             classified_error = ErrorClassifier.classify_http_error(
                                 response.status, error_text, model_config.name
                             )
-                            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+                            logger.info(f"[{request_id}] 错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
                             return False, classified_error
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    # 不是错误 JSON，当作普通数据透传
-                    first_chunk_for_wrapper = chunk
+                    first_chunk_for_wrapper = first_chunk
 
-                # 【新增】探测流式响应是否包含实际内容，避免空响应不触发故障转移
+                # 探测流式响应是否收到有效数据（宽松策略）
                 has_content, buffered_chunks = await self._probe_stream_content(
-                    response, model_config, first_chunk_for_wrapper
+                    response, model_config, first_chunk_for_wrapper, request_id=request_id
                 )
                 if not has_content:
-                    error_msg = f"模型 {model_config.name} 流式响应为空（无有效 content 字段）"
-                    logger.warning(error_msg)
+                    error_msg = f"模型 {model_config.name} 流式响应为空（未收到有效数据）"
+                    logger.warning(f"[{request_id}] {error_msg}")
                     response.close()
-                    # 空响应分类为缺少内容，触发故障转移到下一个模型
                     classified_error = ErrorClassifier.classify_invalid_response(
                         model_config.name, error_msg
                     )
-                    logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+                    logger.info(f"[{request_id}] 错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
                     return False, classified_error
 
-                # 创建一个包装对象包含原始响应和预读取的数据
+                # 包装响应对象：回放已缓冲数据 + 后续流
                 class StreamResponseWrapper:
                     def __init__(self, original_response, preloaded_chunks):
                         self.original_response = original_response
                         self.preloaded_chunks = preloaded_chunks
-                        self.preloaded_index = 0
-                        # 【新增】初始化工具调用缓冲器（如果启用）
                         self.tool_call_buffer = StreamingToolCallBuffer() if model_config.enable_tool_call_conversion else None
 
                     async def __aiter__(self):
                         """使用iter_any()读取数据块，由上层按行处理"""
-                        # 先回放探测阶段已缓冲的数据块
                         for chunk in self.preloaded_chunks:
                             if chunk:
                                 yield chunk
-
-                        # 使用iter_any()读取原始数据块
                         async for chunk in self.original_response.content.iter_any():
                             if chunk:
                                 yield chunk
@@ -364,15 +366,18 @@ class ModelFailoverManager:
                 return True, wrapped_response
 
             except asyncio.TimeoutError:
-                # 首块数据读取超时，可能连接不稳定
                 error_msg = f"模型 {model_config.name} 首块数据读取超时"
-                logger.warning(error_msg)
+                logger.warning(f"[{request_id}] {error_msg}")
                 response.close()
-                return False, error_msg
+                classified_error = ErrorClassifier.classify_timeout_error(
+                    model_config.name, 5, 5
+                )
+                return False, classified_error
             except Exception as e:
-
-                # 如果检查失败，假设是正常的流式响应
-                return True, response
+                logger.error(f"[{request_id}] 流式首块探测异常: {e}", exc_info=True)
+                response.close()
+                classified_error = ErrorClassifier.classify_unknown_error(e, model_config.name, time.time() - start_time)
+                return False, classified_error
 
         except asyncio.TimeoutError:
             elapsed_time = time.time() - start_time

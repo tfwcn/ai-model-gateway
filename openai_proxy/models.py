@@ -15,6 +15,7 @@ class ModelConfig:
     quota_period: Optional[str] = None  # 额度刷新周期
     enable_tool_call_conversion: bool = True  # 是否启用工具调用格式转换
     retry_count: int = 3  # 单个模型调用失败时的重试次数
+    stream_probe_timeout: Optional[float] = None  # 流式探测超时（秒），None 则使用全局配置
 
 
 def _infer_capabilities(model_id: str) -> List[str]:
