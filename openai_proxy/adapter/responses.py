@@ -60,6 +60,14 @@ class ResponsesAdapter:
         ctx = self._request_context.get(None)
         return ctx is not None and bool(ctx.request_id)
 
+    def activate_context(self, context: StreamingContext) -> contextvars.Token:
+        """在当前协程中绑定指定请求的流式上下文。"""
+        return self._request_context.set(context)
+
+    def reset_context(self, token: contextvars.Token) -> None:
+        """恢复绑定前的流式上下文。"""
+        self._request_context.reset(token)
+
     @staticmethod
     def _convert_usage(usage: dict) -> dict:
         """

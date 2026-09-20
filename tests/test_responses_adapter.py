@@ -3,6 +3,7 @@ Tests for Responses API adapter, focusing on custom tools conversion.
 """
 import pytest
 import json
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 from openai_proxy.adapter.responses import ResponsesAdapter
 
@@ -13,6 +14,43 @@ def adapter():
     mock_store = AsyncMock()
     mock_store.get_history = AsyncMock(return_value=[])
     return ResponsesAdapter(session_store=mock_store)
+
+
+class TestRequestContextIsolation:
+    """Test that concurrent streaming tasks keep their request state isolated."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_stream_context_isolation(self):
+        adapter = ResponsesAdapter()
+
+        async def convert(text: str) -> str:
+            await adapter.convert_request({
+                "model": "gpt-4",
+                "input": [{"role": "user", "content": text}],
+                "stream": True,
+            })
+            request_context = adapter.context
+            await asyncio.sleep(0)
+            token = adapter.activate_context(request_context)
+            try:
+                result = adapter.convert_stream_event(
+                    "data: " + json.dumps({
+                        "id": "chatcmpl-test",
+                        "choices": [{
+                            "delta": {"content": text},
+                            "finish_reason": None,
+                        }],
+                    })
+                )
+                assert request_context.accumulated_text == text
+                return result
+            finally:
+                adapter.reset_context(token)
+
+        results = await asyncio.gather(convert("client-A"), convert("client-B"))
+
+        assert '"delta": "client-A"' in results[0]
+        assert '"delta": "client-B"' in results[1]
 
 
 class TestCustomToolConversion:

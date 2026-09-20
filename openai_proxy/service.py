@@ -49,34 +49,40 @@ async def _forward_normalized_sse(upstream_stream):
         yield b"data: [DONE]\n\n"
 
 
-async def _convert_responses_sse(upstream_stream, adapter):
+async def _convert_responses_sse(upstream_stream, adapter, stream_context):
     """
-    Responses API 专用：标准化 + Chat→Responses 协议转换
+    Responses API 专用：标准化 + Chat→Responses 协议转换。
+
+    显式绑定请求上下文，避免 StreamingResponse 在新协程执行时继承到其他请求的 ContextVar。
     """
+    context_token = adapter.activate_context(stream_context)
     parser = SSEEventParser(normalize=True)
     chunk_count = 0
-    async for chunk in upstream_stream:
-        chunk_count += 1
-        if not chunk:
-            continue
-        try:
-            events = parser.feed(chunk)
-            for event in events:
-                if not event.strip():
-                    continue
-                for line in event.split("\n"):
-                    stripped = line.strip()
-                    if stripped.lower().startswith("data:"):
-                        converted = adapter.convert_stream_event(stripped)
-                        if converted:
-                            logger.debug(f"[{chunk_count}] Converted: {converted[:150]}...")
-                            yield converted.encode("utf-8")
-        except Exception as e:
-            logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
+    try:
+        async for chunk in upstream_stream:
+            chunk_count += 1
+            if not chunk:
+                continue
             try:
-                logger.error(f"Problematic chunk preview: {chunk[:200]}")
-            except Exception:
-                pass
+                events = parser.feed(chunk)
+                for event in events:
+                    if not event.strip():
+                        continue
+                    for line in event.split("\n"):
+                        stripped = line.strip()
+                        if stripped.lower().startswith("data:"):
+                            converted = adapter.convert_stream_event(stripped)
+                            if converted:
+                                logger.debug(f"[{chunk_count}] Converted: {converted[:150]}...")
+                                yield converted.encode("utf-8")
+            except Exception as e:
+                logger.error(f"Stream conversion error at chunk {chunk_count}: {e}", exc_info=True)
+                try:
+                    logger.error(f"Problematic chunk preview: {chunk[:200]}")
+                except Exception:
+                    pass
+    finally:
+        adapter.reset_context(context_token)
 
 
 class OpenAIProxyService:
@@ -356,22 +362,29 @@ class OpenAIProxyService:
 
             is_stream = chat_payload.get("stream", False)
 
+            # StreamingResponse 会在独立协程中迭代生成器，必须显式保留本请求的上下文。
+            stream_context = self.responses_adapter.context
+
             if is_stream:
                 async def stream_generator():
+                    context_token = self.responses_adapter.activate_context(stream_context)
                     try:
                         upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
-                        async for data in _convert_responses_sse(upstream_stream, self.responses_adapter):
+                        async for data in _convert_responses_sse(
+                            upstream_stream, self.responses_adapter, stream_context
+                        ):
                             yield data
                         # 上游流结束,检查是否已发出完成事件（ModelScope 等不发 [DONE] 的上游）
-                        if self.responses_adapter.has_request_context() and not self.responses_adapter.context.has_received_done:
+                        if not self.responses_adapter.context.has_received_done:
                             logger.info("Upstream did not send [DONE], emitting completion events")
                             completion_events = self.responses_adapter._build_completion_events()
                             if completion_events:
                                 yield completion_events.encode('utf-8')
                     except Exception as e:
                         logger.error(f"Upstream stream error: {e}", exc_info=True)
-                        if self.responses_adapter.has_request_context():
-                            self.responses_adapter.context.cleanup()
+                        self.responses_adapter.context.cleanup()
+                    finally:
+                        self.responses_adapter.reset_context(context_token)
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:
