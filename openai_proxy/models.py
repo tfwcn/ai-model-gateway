@@ -14,7 +14,7 @@ class ModelConfig:
     enabled: bool = True
     quota_period: Optional[str] = None  # 额度刷新周期
     enable_tool_call_conversion: bool = True  # 是否启用工具调用格式转换
-    retry_count: int = 3  # 单个模型调用失败时的重试次数
+    retry_count: int = 5  # 单个模型调用失败时的重试次数，默认5次
 
 
 def _infer_capabilities(model_id: str) -> List[str]:

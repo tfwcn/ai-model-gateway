@@ -115,7 +115,7 @@ class ConfigLoader:
                     weight = platform_config.get('weight', 1)
                     enabled = platform_config.get('enabled', True)
                     quota_period = platform_config.get('quota_period')  # 支持 quota_period 配置
-                    retry_count = platform_config.get('retry_count', 3)  # 单个模型重试次数
+                    retry_count = platform_config.get('retry_count', 5)  # 单个模型重试次数，默认5次
 
                     # 如果有插件配置且返回了模型，或者静态配置有模型，才添加该平台
                     # 注意：如果只有插件配置但返回空列表，仍然添加平台（让定时任务去填充）

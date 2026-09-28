@@ -32,6 +32,7 @@ class ErrorCategory(Enum):
     MISSING_CONTENT = "missing_content"  # 缺少内容字段
     INVALID_MODEL = "invalid_model"  # 模型不存在或无效
     TOOL_CALL_ID_ERROR = "tool_call_id_error"  # 工具调用ID缺失响应
+    FREE_TIER_BLOCKED = "free_tier_blocked"  # 免费层被拦截（需真 Key 或官方客户端）
     
     # 其他错误
     UNKNOWN_ERROR = "unknown_error"  # 未知错误
@@ -164,6 +165,13 @@ class ErrorClassifier:
             "should_stop_failover": True,   # 不切换模型
             "retry_delay_seconds": 0.0,
         },
+        # 免费层被拦截 - 重试无意义，直接故障转移到下一个模型/平台
+        ErrorCategory.FREE_TIER_BLOCKED: {
+            "is_retryable": False,
+            "should_disable_model": False,  # 不是模型问题，不禁用（配了 quota_period 也不持久禁用）
+            "should_stop_failover": False,  # 继续切换模型
+            "retry_delay_seconds": 0.0,
+        },
         
         # 未知错误 - 保守处理
         ErrorCategory.UNKNOWN_ERROR: {
@@ -198,6 +206,10 @@ class ErrorClassifier:
         # 检测工具调用ID缺失错误（不管具体HTTP状态码，优先匹配）
         if cls._is_tool_call_id_error(error_text):
             return cls.classify_tool_call_error(model_name, error_text)
+
+        # 检测免费层拦截（OpenCode 新版网关：匿名伪装头已失效，返回 403 FreeTierError）
+        if cls._is_free_tier_blocked(error_text):
+            return cls.classify_free_tier_blocked(model_name, error_text, status_code)
         
         category = cls.HTTP_STATUS_MAP.get(status_code, ErrorCategory.UNKNOWN_ERROR)
         strategy = cls.ERROR_STRATEGIES.get(category, cls.ERROR_STRATEGIES[ErrorCategory.UNKNOWN_ERROR])
@@ -341,6 +353,39 @@ class ErrorClassifier:
                 "error_text": error_text[:500],
             }
         )
+
+    @classmethod
+    def _is_free_tier_blocked(cls, error_text: str) -> bool:
+        """检测是否为免费层拦截（匿名伪装头失效，只能用真 Key 或官方客户端）"""
+        if not error_text:
+            return False
+        error_lower = error_text.lower()
+        keywords = ["freetiererror", "can only be used from within opencode"]
+        return any(kw in error_lower for kw in keywords)
+
+    @classmethod
+    def classify_free_tier_blocked(cls, model_name: str, error_text: str,
+                                   status_code: int = 403) -> ClassifiedError:
+        """分类免费层拦截错误"""
+        strategy = cls.ERROR_STRATEGIES[ErrorCategory.FREE_TIER_BLOCKED]
+        message = (
+            f"模型 {model_name} 免费层被拦截（匿名访问已失效）: {error_text[:200]} "
+            f"请配置真实 Key（OPENCODE_API_KEY，见 opencode.ai/auth）或切换其他平台"
+        )
+
+        return ClassifiedError(
+            category=ErrorCategory.FREE_TIER_BLOCKED,
+            message=message,
+            is_retryable=strategy["is_retryable"],
+            should_disable_model=strategy["should_disable_model"],
+            should_stop_failover=strategy.get("should_stop_failover", False),
+            retry_delay_seconds=strategy["retry_delay_seconds"],
+            metadata={
+                "model_name": model_name,
+                "status_code": status_code,
+                "error_text": error_text[:500],
+            }
+        )
     
     @classmethod
     def classify_unknown_error(cls, exception: Exception, model_name: str, elapsed_time: float) -> ClassifiedError:
@@ -398,6 +443,8 @@ class ErrorClassifier:
             ErrorCategory.INVALID_RESPONSE_FORMAT: "响应格式无效",
             ErrorCategory.MISSING_CONTENT: "缺少内容字段",
             ErrorCategory.INVALID_MODEL: "模型无效",
+            ErrorCategory.TOOL_CALL_ID_ERROR: "工具调用ID缺失",
+            ErrorCategory.FREE_TIER_BLOCKED: "免费层被拦截",
             ErrorCategory.UNKNOWN_ERROR: "未知错误",
         }
         
