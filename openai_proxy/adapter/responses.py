@@ -366,7 +366,17 @@ class ResponsesAdapter:
         6. 顶层 custom_tool_call_output: {"type": "custom_tool_call_output", "call_id": "...", "output": "..."}
         7. 顶层 function_call: {"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}
         8. 顶层 function_call_output: {"type": "function_call_output", "call_id": "...", "output": "..."}
+        9. 纯字符串: "..." （等价于一条 user 文本消息）
         """
+        # 兼容简写：input 直接为字符串，包成标准 user 文本消息
+        if isinstance(input_items, str):
+            input_items = [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_items}]
+            }]
+        elif not input_items:
+            return []
+
         messages = []
 
         # 预扫描：找出所有含图片输出的 function_call_output，记录其 call_id
@@ -787,17 +797,31 @@ class ResponsesAdapter:
 
             content = delta.get("content")
             tool_calls = delta.get("tool_calls")
+            reasoning_content = delta.get("reasoning_content")
 
             events = []
 
-            # 如果是第一个内容块（文本或工具调用），发送初始事件序列
-            if not self.context.has_sent_initial_events and (content is not None or tool_calls is not None):
-                # 判断是纯文本还是包含工具调用
-                has_tool_calls = tool_calls is not None and isinstance(tool_calls, list) and len(tool_calls) > 0
-                initial_events = self._build_initial_events(for_tool_call=has_tool_calls)
-                logger.info(f"Building initial events for {'tool_call' if has_tool_calls else 'text'}, count: {len(initial_events)}")
-                events.extend(initial_events)
-                self.context.has_sent_initial_events = True
+            # 打开事件兜底：调用方（service 层）通常已提前下发；此处兜底直接使用本类的场景
+            if not self.context.has_sent_open_events:
+                self.context.has_sent_open_events = True
+                events.extend(self._build_open_events())
+
+            # 文本消息项事件：仅纯文本回复需要，工具调用走各自的 output_item.added
+            if content is not None and not self.context.has_sent_message_item_events:
+                events.extend(self._build_message_item_events())
+                self.context.has_sent_message_item_events = True
+
+            # 思考增量：思考模型专用，独立事件名，避免思考阶段整段静默
+            if reasoning_content:
+                self.context.accumulated_reasoning += reasoning_content
+                seq = self.context.next_sequence()
+                reasoning_event = {
+                    "type": "response.reasoning.delta",
+                    "item_id": self.context.item_id,
+                    "delta": reasoning_content,
+                    "sequence_number": seq
+                }
+                events.append(f"event: response.reasoning.delta\ndata: {json.dumps(reasoning_event)}\n\n")
 
             # 处理文本内容
             if content is not None:
@@ -1059,15 +1083,26 @@ class ResponsesAdapter:
 
         return response_obj, new_id
 
-    def _build_initial_events(self, for_tool_call: bool = False) -> List[str]:
-        """构建初始事件序列（response.queued, created, in_progress, output_item.added, content_part.added）
-
-        Args:
-            for_tool_call: 如果是为工具调用构建初始事件，则使用 function_call 类型
+    def build_stream_open_events(self) -> Optional[str]:
         """
+        流开始时即下发"打开事件"（queued/created/in_progress）。
+
+        与内容无关，可尽早发送，避免客户端在首 token 前完全静默。
+        幂等：重复调用只返回一次事件串。
+        """
+        if self.context.has_sent_open_events:
+            return None
+        self.context.has_sent_open_events = True
+        events = self._build_open_events()
+        return "".join(events) if events else None
+
+    def _build_open_events(self) -> List[str]:
+        """构建与内容类型无关的打开事件序列（response.queued, created, in_progress）。"""
         events = []
+        # 提前生成 response_id，使打开事件在收到上游首个 chunk 前也能完整下发
+        if not self.context.response_id:
+            self.context.response_id = f"resp_{uuid.uuid4().hex}"
         response_id = self.context.response_id
-        item_id = self.context.item_id
 
         # 1. response.queued (第一个事件)
         seq = self.context.next_sequence()
@@ -1101,38 +1136,43 @@ class ResponsesAdapter:
         }
         events.append(f"event: response.in_progress\ndata: {json.dumps(in_progress_event)}\n\n")
 
-        # 4. response.output_item.added - only for non-tool-call (text) responses
-        # For tool calls, per-index output_item.added is emitted in convert_stream_event
-        if not for_tool_call:
-            seq = self.context.next_sequence()
-            # 文本消息类型的 output_item
-            item_added_event = {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "id": item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "status": "in_progress"
-                },
-                "sequence_number": seq
-            }
-            events.append(f"event: response.output_item.added\ndata: {json.dumps(item_added_event)}\n\n")
+        return events
 
-            # 5. response.content_part.added
-            seq = self.context.next_sequence()
-            part_added_event = {
-                "type": "response.content_part.added",
-                "item_id": item_id,
-                "content_index": 0,
-                "part": {
-                    "type": "output_text",
-                    "text": ""
-                },
-                "sequence_number": seq
-            }
-            events.append(f"event: response.content_part.added\ndata: {json.dumps(part_added_event)}\n\n")
+    def _build_message_item_events(self) -> List[str]:
+        """构建文本消息的 output_item.added 与 content_part.added（仅纯文本回复使用）。"""
+        events = []
+        # 提前生成 item_id，确保 message 项与后续 text/reasoning 增量引用同一 id
+        if not self.context.item_id:
+            self.context.item_id = f"msg_{uuid.uuid4().hex}"
+        item_id = self.context.item_id
+
+        seq = self.context.next_sequence()
+        item_added_event = {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "status": "in_progress"
+            },
+            "sequence_number": seq
+        }
+        events.append(f"event: response.output_item.added\ndata: {json.dumps(item_added_event)}\n\n")
+
+        seq = self.context.next_sequence()
+        part_added_event = {
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": ""
+            },
+            "sequence_number": seq
+        }
+        events.append(f"event: response.content_part.added\ndata: {json.dumps(part_added_event)}\n\n")
 
         return events
 

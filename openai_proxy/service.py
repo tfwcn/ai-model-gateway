@@ -16,6 +16,7 @@ from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
 from openai_proxy.utils.sse_parser import SSEEventParser
+from openai_proxy.utils.keepalive import KeepAliveStream
 from openai_proxy.utils.logger import sanitize_payload
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,11 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
     parser = SSEEventParser(normalize=True)
     chunk_count = 0
     try:
+        # 流刚开始即下发打开事件（queued/created/in_progress），消除首 token 前的静默
+        opening = adapter.build_stream_open_events()
+        if opening:
+            yield opening.encode("utf-8")
+
         async for chunk in upstream_stream:
             chunk_count += 1
             if not chunk:
@@ -296,7 +302,8 @@ class OpenAIProxyService:
                         result = await self.failover_manager.chat_completion_stream(request_data)
                         if hasattr(result, '__aiter__'):
                             logger.info("SSE normalization enabled for /v1/chat/completions")
-                            async for data in _forward_normalized_sse(result):
+                            # 包裹心跳：上游首 token 前静默期下发 SSE 注释，避免客户端等待空白
+                            async for data in KeepAliveStream(_forward_normalized_sse(result)):
                                 yield data
                         else:
                             # 如果返回的是普通响应但请求是流式的，转换为流式格式
@@ -370,8 +377,9 @@ class OpenAIProxyService:
                     context_token = self.responses_adapter.activate_context(stream_context)
                     try:
                         upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
-                        async for data in _convert_responses_sse(
-                            upstream_stream, self.responses_adapter, stream_context
+                        # 包裹心跳：思考阶段/首 token 前静默期下发 SSE 注释
+                        async for data in KeepAliveStream(
+                            _convert_responses_sse(upstream_stream, self.responses_adapter, stream_context)
                         ):
                             yield data
                         # 上游流结束,检查是否已发出完成事件（ModelScope 等不发 [DONE] 的上游）

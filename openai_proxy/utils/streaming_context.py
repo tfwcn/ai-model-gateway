@@ -46,8 +46,9 @@ class StreamingContext:
           sequence_number            → self.sequence_number: int
           response_id                → self.response_id: Optional[str]
           item_id                    → self.item_id: Optional[str]
-          has_sent_initial_events    → self.has_sent_initial_events: bool
+          has_sent_initial_events    → self.has_sent_open_events / has_sent_message_item_events: bool
           accumulated_text           → self.accumulated_text: str
+          accumulated_reasoning      → self.accumulated_reasoning: str
           usage                      → self.usage: Optional[Dict]
           request_id                 → self.request_id: str (构造函数传入)
           has_tool_calls             → self.has_tool_calls: bool
@@ -76,8 +77,11 @@ class StreamingContext:
         self.sequence_number: int = 0
         self.response_id: Optional[str] = None
         self.item_id: Optional[str] = None
-        self.has_sent_initial_events: bool = False
+        # 拆分为两类，便于在流刚开始时先下发"打开事件"，再在首个正文/工具时下发消息项事件
+        self.has_sent_open_events: bool = False          # response.queued/created/in_progress 是否已发
+        self.has_sent_message_item_events: bool = False  # message output_item + content_part 是否已发
         self.accumulated_text: str = ""
+        self.accumulated_reasoning: str = ""  # 思考模型推理文本累积
         self.usage: Optional[Dict[str, int]] = None
         self.has_tool_calls: bool = False
         self.has_received_done: bool = False  # 上游是否发送了 [DONE]
@@ -117,8 +121,10 @@ class StreamingContext:
         self.sequence_number = 0
         self.response_id = None
         self.item_id = None
-        self.has_sent_initial_events = False
+        self.has_sent_open_events = False
+        self.has_sent_message_item_events = False
         self.accumulated_text = ""
+        self.accumulated_reasoning = ""
         self.usage = None
         self.has_tool_calls = False
         self.model_name = "unknown"
@@ -196,8 +202,10 @@ class StreamingContext:
             "sequence_number": self.sequence_number,
             "response_id": self.response_id,
             "item_id": self.item_id,
-            "has_sent_initial_events": self.has_sent_initial_events,
+            "has_sent_open_events": self.has_sent_open_events,
+            "has_sent_message_item_events": self.has_sent_message_item_events,
             "accumulated_text_length": len(self.accumulated_text),
+            "accumulated_reasoning_length": len(self.accumulated_reasoning),
             "has_tool_calls": self.has_tool_calls,
             "model_name": self.model_name,
             "tool_call_count": len(self.tool_call_states),

@@ -302,6 +302,13 @@ RESPONSES_SESSION_TTL=86400
 # DEBUG=true                     # 启用 DEBUG 级别日志（默认 INFO）
 # ENABLE_CONSOLE_LOGS=false      # 禁用控制台输出（默认 true）
 # LOG_DIR=logs                   # 日志目录（默认 logs/）
+
+# 流式响应心跳（可选）：上游首个 token 前的静默期，每隔该秒数下发一条 SSE 注释
+# 设为 0 可关闭心跳
+# SSE_KEEPALIVE_INTERVAL=1.0
+
+# 流探超时（可选）：探测上游是否返回有效内容的最长等待秒数
+# STREAM_PROBE_TIMEOUT=8
 ```
 
 ### 平台配置示例

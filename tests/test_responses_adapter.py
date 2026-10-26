@@ -264,3 +264,78 @@ class TestStructuredOutputConversion:
         assert chat_payload["response_format"]["type"] == "json_schema"
         assert chat_payload["response_format"]["json_schema"]["name"] == "MyOutput"
         assert chat_payload["response_format"]["json_schema"]["strict"] is True
+
+
+def _delta_chunk(**delta):
+    """构造一条只含 delta 的上游 chat 流事件行。"""
+    return "data: " + json.dumps({
+        "id": "chatcmpl-test",
+        "choices": [{"delta": delta, "finish_reason": None}],
+    })
+
+
+class TestStreamingEventConversion:
+    """流式事件转换：打开事件尽早下发、思考增量透传、字符串 input 兼容。"""
+
+    @pytest.mark.asyncio
+    async def test_string_input_converted_to_user_message(self, adapter):
+        """input 直接为字符串时应转换为一条 user 文本消息。"""
+        chat_payload, _ = await adapter.convert_request(
+            {"model": "gpt-4", "input": "你好", "stream": True}
+        )
+        assert chat_payload["messages"] == [
+            {"role": "user", "content": [{"type": "text", "text": "你好"}]}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_input_yields_no_messages(self, adapter):
+        chat_payload, _ = await adapter.convert_request(
+            {"model": "gpt-4", "input": None, "stream": True}
+        )
+        assert chat_payload["messages"] == []
+
+    @pytest.mark.asyncio
+    async def test_open_events_emitted_early_and_once(self, adapter):
+        """首个 chunk（仅 role）即下发打开事件，且仅发一次。"""
+        await adapter.convert_request(
+            {"model": "gpt-4", "input": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+        out = adapter.convert_stream_event(_delta_chunk(role="assistant"))
+        assert "event: response.queued" in out
+        assert "event: response.created" in out
+        assert "event: response.in_progress" in out
+        # 再次收到 role chunk 不应重复下发打开事件
+        assert adapter.convert_stream_event(_delta_chunk(role="assistant")) is None
+
+    @pytest.mark.asyncio
+    async def test_reasoning_delta_streams(self, adapter):
+        """reasoning_content 应转为独立的 response.reasoning.delta，不被丢弃。"""
+        await adapter.convert_request(
+            {"model": "gpt-4", "input": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+        out = adapter.convert_stream_event(_delta_chunk(reasoning_content="思考中"))
+        assert "event: response.reasoning.delta" in out
+        assert '"delta": "\\u601d\\u8003\\u4e2d"' in out or '"delta": "思考中"' in out
+        assert adapter.context.accumulated_reasoning == "思考中"
+
+    @pytest.mark.asyncio
+    async def test_message_item_events_on_first_content(self, adapter):
+        """首个正文 chunk 应先补发 message item 事件，再发 text.delta。"""
+        await adapter.convert_request(
+            {"model": "gpt-4", "input": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+        out = adapter.convert_stream_event(_delta_chunk(content="hi"))
+        added = out.index("event: response.output_item.added")
+        delta = out.index("event: response.text.delta")
+        assert "event: response.content_part.added" in out
+        assert added < delta
+
+    @pytest.mark.asyncio
+    async def test_build_stream_open_events_idempotent(self, adapter):
+        """build_stream_open_events 幂等，供 service 层在流开始时提前下发。"""
+        await adapter.convert_request(
+            {"model": "gpt-4", "input": "hi", "stream": True}
+        )
+        first = adapter.build_stream_open_events()
+        assert "event: response.created" in first
+        assert adapter.build_stream_open_events() is None
