@@ -18,6 +18,7 @@ from openai_proxy.utils.session import DualModeSessionStore
 from openai_proxy.utils.sse_parser import SSEEventParser
 from openai_proxy.utils.keepalive import KeepAliveStream
 from openai_proxy.utils.logger import sanitize_payload
+from openai_proxy.utils.stream_metrics import StreamPerformanceMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -28,26 +29,34 @@ async def _forward_normalized_sse(upstream_stream):
 
     使用 SSEEventParser 按完整事件分割并标准化，自动补发 [DONE]。
     消除 /v1/chat/completions 与 /v1/responses 间的重复代码。
+
+    同时埋点：统计首块耗时、总耗时与输出 token，输出 tokens/s。
     """
     parser = SSEEventParser(normalize=True)
+    monitor = StreamPerformanceMonitor.from_stream(upstream_stream)
     done_sent = False
-    async for chunk in upstream_stream:
-        if not chunk:
-            continue
-        try:
-            events = parser.feed(chunk)
-            for event in events:
-                if not event.strip():
-                    continue
-                yield (event + "\n\n").encode("utf-8")
-                if "[DONE]" in event:
-                    done_sent = True
-        except Exception as e:
-            logger.error(f"SSE normalization error: {e}", exc_info=True)
-            yield chunk  # 降级：透传原始 chunk
-    if not done_sent:
-        logger.info("Upstream did not send [DONE], appending termination marker")
-        yield b"data: [DONE]\n\n"
+    try:
+        async for chunk in upstream_stream:
+            if not chunk:
+                continue
+            try:
+                events = parser.feed(chunk)
+                for event in events:
+                    if not event.strip():
+                        continue
+                    monitor.observe(event)
+                    yield (event + "\n\n").encode("utf-8")
+                    if "[DONE]" in event:
+                        done_sent = True
+            except Exception as e:
+                logger.error(f"SSE normalization error: {e}", exc_info=True)
+                yield chunk  # 降级：透传原始 chunk
+        if not done_sent:
+            logger.info("Upstream did not send [DONE], appending termination marker")
+            yield b"data: [DONE]\n\n"
+    finally:
+        # 客户端提前断开时也会走到这里，落一条不完整的统计便于排查
+        monitor.finish()
 
 
 async def _convert_responses_sse(upstream_stream, adapter, stream_context):
@@ -58,6 +67,7 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
     """
     context_token = adapter.activate_context(stream_context)
     parser = SSEEventParser(normalize=True)
+    monitor = StreamPerformanceMonitor.from_stream(upstream_stream)
     chunk_count = 0
     try:
         # 流刚开始即下发打开事件（queued/created/in_progress），消除首 token 前的静默
@@ -74,6 +84,7 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
                 for event in events:
                     if not event.strip():
                         continue
+                    monitor.observe(event)
                     for line in event.split("\n"):
                         stripped = line.strip()
                         if stripped.lower().startswith("data:"):
@@ -88,6 +99,7 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
                 except Exception:
                     pass
     finally:
+        monitor.finish()
         adapter.reset_context(context_token)
 
 

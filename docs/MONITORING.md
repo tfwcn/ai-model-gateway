@@ -145,6 +145,33 @@ LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 2026-05-04 10:30:02 [INFO] AI Model Gateway 启动完成
 ```
 
+### 输出速度埋点
+
+每次模型调用（流式与非流式）结束后追加一条 `输出速度统计` 日志，字段为 `key=value`，便于检索与聚合：
+
+```
+2026-05-04 10:30:31 [INFO] openai_proxy.utils.stream_metrics: 输出速度统计: 模型=openrouter|qwen3-235b 请求=e2e00001 上游id=chatcmpl-9f2c 首块=2.31s 总耗时=12.40s 输入tokens=120 输出tokens=350 输出字符数=820 端到端速度=28.23tokens/s
+```
+
+| 字段 | 说明 |
+|------|------|
+| `请求` | 网关本次模型尝试生成的 8 位 id（失败重试会更换），非流式为 `-` |
+| `上游id` | 上游响应/chunk 里的 `id`（如 `chatcmpl-xxx`）；上游未返回时为 `-`。它和 `/v1/responses` 回给客户端的 `resp_xxx` 不是同一个 |
+| `首块` | 上游首块数据耗时（TTFB），非流式为 `-` |
+| `总耗时` | 发起调用到流结束的耗时 |
+| `输出tokens` | 上游 usage 中的输出 token 数（含推理 token）；上游未返回 usage 时为 0 |
+| `输出字符数` | 增量文本字符数（含 `reasoning_content`、工具调用参数），usage 缺失时用于估算 |
+| `端到端速度` | 输出 tokens ÷ 总耗时，客户端感知的平均输出速度 |
+
+按小时聚合平均速度（日志时间为 UTC）：
+
+```bash
+grep "输出速度统计" logs/proxy.log \
+  | sed -nE 's/^([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}):[0-9:]+ .*端到端速度=([0-9.]+)tokens\/s.*/\1T\2 \3/p' \
+  | awk '{s[$1]+=$2; n[$1]++} END {for (k in s) printf "%s  平均 %.2f tokens/s（%d 次）\n", k, s[k]/n[k], n[k]}' \
+  | sort
+```
+
 ### 日志轮转
 
 生产环境建议使用日志轮转工具：

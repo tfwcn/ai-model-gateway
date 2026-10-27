@@ -17,6 +17,7 @@ from openai_proxy.model.error_classifier import ErrorClassifier, ClassifiedError
 from openai_proxy.utils.tool_call_converter import ToolCallConverter
 from openai_proxy.utils.streaming_tool_call_buffer import StreamingToolCallBuffer
 from openai_proxy.utils.sse_parser import SSEEventParser
+from openai_proxy.utils.stream_metrics import report_non_stream_usage
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +364,10 @@ class ModelFailoverManager:
                                 yield chunk
 
                 wrapped_response = StreamResponseWrapper(response, buffered_chunks)
+                # 埋点元信息：上层据此统计首块耗时、总耗时与输出速度
+                wrapped_response.model_name = model_config.name
+                wrapped_response.request_id = request_id
+                wrapped_response.started_at = start_time
                 return True, wrapped_response
 
             except asyncio.TimeoutError:
@@ -500,6 +505,8 @@ class ModelFailoverManager:
                         else:
                             logger.debug(f"Tool call conversion disabled for model {model_config.name}")
 
+                        # 埋点：记录本次非流式调用的 token 输出速度
+                        report_non_stream_usage(model_config.name, start_time, result)
                         return True, result
                     else:
                         error_msg = f"模型 {model_config.name} 返回的响应缺少有效的 content 字段"
