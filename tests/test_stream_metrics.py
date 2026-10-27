@@ -7,6 +7,7 @@ import pytest
 
 from openai_proxy.utils.stream_metrics import (
     StreamPerformanceMonitor,
+    extract_cached_tokens,
     extract_usage,
     report_non_stream_usage,
 )
@@ -22,6 +23,17 @@ def test_extract_usage_兼容两种协议命名():
 
 
 @pytest.mark.unit
+def test_extract_cached_tokens_兼容各家字段命名():
+    """OpenAI/Azure 的 details 嵌套、DeepSeek 的扁平字段都要能取到"""
+    assert extract_cached_tokens({"prompt_tokens_details": {"cached_tokens": 128}}) == 128
+    assert extract_cached_tokens({"input_tokens_details": {"cached_tokens": 64}}) == 64
+    assert extract_cached_tokens({"prompt_cache_hit_tokens": 32}) == 32
+    assert extract_cached_tokens({"cache_read_input_tokens": 16}) == 16
+    # 没有缓存字段时是 0（上游未上报 = 无命中）
+    assert extract_cached_tokens({"prompt_tokens": 10}) == 0
+
+
+@pytest.mark.unit
 def test_流式事件累积token与字符数():
     """流式场景：逐事件喂入，末块 usage 生效，增量文本累加"""
     monitor = StreamPerformanceMonitor(model_name="m1", request_id="abc", started_at=time.time() - 4)
@@ -29,14 +41,19 @@ def test_流式事件累积token与字符数():
         {"id": "chatcmpl-abc", "choices": [{"delta": {"content": "你"}}]},
         {"id": "chatcmpl-abc", "choices": [{"delta": {"content": "好"}}]},
         {"id": "chatcmpl-abc", "choices": [{"delta": {"tool_calls": [{"function": {"arguments": "{}"}}]}}]},
-        {"id": "chatcmpl-abc", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17}},
+        {"id": "chatcmpl-abc", "choices": [], "usage": {
+            "prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17,
+            "prompt_tokens_details": {"cached_tokens": 6},
+        }},
     ]
     for payload in payloads:
         monitor.observe(f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]")
     stats = monitor.finish()
 
     assert stats["upstream_id"] == "chatcmpl-abc"
+    assert stats["has_usage"] is True
     assert stats["input_tokens"] == 10
+    assert stats["cached_tokens"] == 6
     assert stats["output_tokens"] == 7
     # "你" + "好" + "{}" = 4 个字符
     assert stats["output_chars"] == 4
@@ -76,14 +93,17 @@ def test_畸形事件不抛异常():
 
 @pytest.mark.unit
 def test_无usage时速度为空():
-    """上游不给 usage 时不编造速度，只留耗时与字符数"""
+    """上游不给 usage 时不编造速度，token 值标记为未知（日志显示 -）"""
     monitor = StreamPerformanceMonitor(model_name="m2", started_at=time.time() - 2)
     monitor.observe('data: {"choices":[{"delta":{"content":"hello"}}]}')
     stats = monitor.finish()
 
+    assert stats["has_usage"] is False
     assert stats["output_tokens"] == 0
     assert stats["throughput"] is None
     assert stats["output_chars"] == 5
+    # 未知的 token 字段在日志里用 - 占位，而不是 0
+    assert "输出tokens=-" in StreamPerformanceMonitor._format(stats)
 
 
 @pytest.mark.unit
@@ -92,12 +112,19 @@ def test_非流式一键埋点():
     response = {
         "id": "chatcmpl-test",
         "choices": [{"message": {"content": "ok"}}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        "usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "total_tokens": 3,
+            "prompt_tokens_details": {"cached_tokens": 1},
+        },
     }
     stats = report_non_stream_usage("m3", time.time() - 1, response)
 
     assert stats["upstream_id"] == "chatcmpl-test"
     assert stats["ttft"] is None
+    assert stats["input_tokens"] == 1
+    assert stats["cached_tokens"] == 1
     assert stats["output_tokens"] == 2
     assert stats["output_chars"] == 2
     assert stats["throughput"] is not None

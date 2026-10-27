@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 _OUTPUT_TOKEN_KEYS = ("completion_tokens", "output_tokens")
 _INPUT_TOKEN_KEYS = ("prompt_tokens", "input_tokens")
 
+# 输入缓存命中字段：OpenAI/Azure 放在 *_tokens_details.cached_tokens，DeepSeek 是扁平字段
+_CACHE_HIT_DETAIL_KEYS = ("prompt_tokens_details", "input_tokens_details")
+_CACHE_HIT_KEYS = ("prompt_cache_hit_tokens", "cache_read_input_tokens")
+
 # 增量文本字段：usage 缺失时用输出字符数兜底，便于事后估算
 _TEXT_KEYS = ("content", "reasoning_content", "text")
 _TOOL_ARGUMENT_KEYS = ("arguments",)
@@ -45,6 +49,15 @@ def _pick_int(usage: Dict[str, Any], keys: Sequence[str]) -> int:
         if isinstance(value, (int, float)):
             return int(value)
     return 0
+
+
+def extract_cached_tokens(usage: Dict[str, Any]) -> int:
+    """取输入缓存命中的 token 数，兼容各家字段命名，取不到返回 0"""
+    for key in _CACHE_HIT_DETAIL_KEYS:
+        details = usage.get(key)
+        if isinstance(details, dict) and isinstance(details.get("cached_tokens"), (int, float)):
+            return int(details["cached_tokens"])
+    return _pick_int(usage, _CACHE_HIT_KEYS)
 
 
 def _text_length(node: Any, keys: Sequence[str]) -> int:
@@ -77,7 +90,9 @@ class StreamPerformanceMonitor:
         self.started_at = started_at if started_at is not None else time.time()
         self.first_chunk_at: Optional[float] = None
         self.upstream_id = ""
+        self.has_usage = False
         self.input_tokens = 0
+        self.cached_tokens = 0
         self.output_tokens = 0
         self.output_chars = 0
 
@@ -128,9 +143,11 @@ class StreamPerformanceMonitor:
                 "model": self.model_name,
                 "request_id": self.request_id,
                 "upstream_id": self.upstream_id,
+                "has_usage": self.has_usage,
                 "ttft": ttft,
                 "total": total,
                 "input_tokens": self.input_tokens,
+                "cached_tokens": self.cached_tokens,
                 "output_tokens": self.output_tokens,
                 "output_chars": self.output_chars,
                 # 端到端速度：含首块等待，即客户端感知的平均 token 输出速度
@@ -152,8 +169,10 @@ class StreamPerformanceMonitor:
         usage = extract_usage(payload)
         if usage is None:
             return
+        self.has_usage = True
         # 流式场景 usage 只在末块出现，取到有效值后即保留
         self.input_tokens = _pick_int(usage, _INPUT_TOKEN_KEYS) or self.input_tokens
+        self.cached_tokens = extract_cached_tokens(usage) or self.cached_tokens
         self.output_tokens = _pick_int(usage, _OUTPUT_TOKEN_KEYS) or self.output_tokens
 
     @staticmethod
@@ -188,7 +207,9 @@ class StreamPerformanceMonitor:
             f"输出速度统计: 模型={stats['model']} 请求={stats['request_id'] or '-'} "
             f"上游id={stats['upstream_id'] or '-'} "
             f"首块={_format_seconds(stats['ttft'])} 总耗时={stats['total']:.2f}s "
-            f"输入tokens={stats['input_tokens']} 输出tokens={stats['output_tokens']} "
+            f"输入tokens={_format_tokens(stats['input_tokens'], stats['has_usage'])} "
+            f"输入缓存命中={_format_tokens(stats['cached_tokens'], stats['has_usage'])} "
+            f"输出tokens={_format_tokens(stats['output_tokens'], stats['has_usage'])} "
             f"输出字符数={stats['output_chars']} "
             f"端到端速度={_format_speed(stats['throughput'])}"
         )
@@ -197,6 +218,11 @@ class StreamPerformanceMonitor:
 def _format_seconds(value: Optional[float]) -> str:
     """格式化秒数字段，无有效值时返回占位符"""
     return f"{value:.2f}s" if value is not None else "-"
+
+
+def _format_tokens(value: int, known: bool) -> str:
+    """格式化 token 字段：上游没返回 usage 时属于未知，不能用 0 冒充"""
+    return str(value) if known else "-"
 
 
 def _format_speed(value: Optional[float]) -> str:
