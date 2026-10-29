@@ -16,7 +16,7 @@ from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
 from openai_proxy.utils.sse_parser import SSEEventParser
-from openai_proxy.utils.keepalive import KeepAliveStream
+from openai_proxy.utils.keepalive import KeepAliveStream, UpstreamStartHeartbeat
 from openai_proxy.utils.logger import sanitize_payload
 from openai_proxy.utils.stream_metrics import StreamPerformanceMonitor
 
@@ -311,7 +311,14 @@ class OpenAIProxyService:
                 # 流式响应处理
                 async def stream_generator():
                     try:
-                        result = await self.failover_manager.chat_completion_stream(request_data)
+                        # 等待上游返回流对象的静默期（连接建立/上游排队/首块等待）同样下发心跳，
+                        # 否则客户端在这段时间收不到任何字节，无法区分「仍在处理」与「已卡死」
+                        waiter = UpstreamStartHeartbeat(
+                            self.failover_manager.chat_completion_stream(request_data)
+                        )
+                        async for data in waiter:
+                            yield data
+                        result = waiter.result
                         if hasattr(result, '__aiter__'):
                             logger.info("SSE normalization enabled for /v1/chat/completions")
                             # 包裹心跳：上游首 token 前静默期下发 SSE 注释，避免客户端等待空白
@@ -388,7 +395,13 @@ class OpenAIProxyService:
                 async def stream_generator():
                     context_token = self.responses_adapter.activate_context(stream_context)
                     try:
-                        upstream_stream = await self.failover_manager.chat_completion_stream(chat_payload)
+                        # 同 /v1/chat/completions：等待上游流对象的静默期也要下发心跳
+                        waiter = UpstreamStartHeartbeat(
+                            self.failover_manager.chat_completion_stream(chat_payload)
+                        )
+                        async for data in waiter:
+                            yield data
+                        upstream_stream = waiter.result
                         # 包裹心跳：思考阶段/首 token 前静默期下发 SSE 注释
                         async for data in KeepAliveStream(
                             _convert_responses_sse(upstream_stream, self.responses_adapter, stream_context)

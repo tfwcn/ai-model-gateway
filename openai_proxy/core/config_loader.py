@@ -5,6 +5,7 @@ import yaml
 import logging
 from typing import Dict, List, Any
 from openai_proxy.models import ModelConfig
+from openai_proxy.core.model_entry import ModelEntry
 from openai_proxy.core.plugin_manager import PluginManager
 
 logger = logging.getLogger(__name__)
@@ -73,43 +74,45 @@ class ConfigLoader:
                     plugin_config = platform_config.get('plugin')
                     plugin_models_list = []
                     static_models_list = []
+                    model_entries: List[ModelEntry] = []
 
                     if load_models and plugin_config:
                         logger.info(f"平台 {platform_name} 检测到插件配置: {plugin_config.get('code')}")
                         # 使用插件动态获取模型列表
                         plugin_models_list = await self.plugin_manager.load_plugin_models(plugin_config)
                         logger.info(f"平台 {platform_name} 插件返回 {len(plugin_models_list)} 个模型")
-                        # 获取静态配置的模型列表（如果有）
+                        # 获取静态配置的模型列表（如果有），按模型名合并去重（静态覆盖优先）
                         static_models_list = platform_config.get('models', [])
-                        # 合并模型列表：插件模型在前，静态模型在后
-                        models_list = plugin_models_list + static_models_list
-                        logger.info(f"平台 {platform_name} 总共 {len(models_list)} 个模型 (插件: {len(plugin_models_list)}, 静态: {len(static_models_list)})")
+                        plugin_entries = ModelEntry.parse_all(plugin_models_list)
+                        static_entries = ModelEntry.parse_all(static_models_list)
+                        model_entries = ModelEntry.merge(plugin_entries, static_entries)
+                        logger.info(f"平台 {platform_name} 总共 {len(model_entries)} 个模型 (插件: {len(plugin_entries)}, 静态: {len(static_entries)})")
                     elif plugin_config and not load_models:
                         # 不加载模型时，也需要创建插件实例（以便后续启动调度器）
                         logger.info(f"平台 {platform_name} 检测到插件配置，创建插件实例（不加载模型）")
                         # 创建插件实例但不调用 get_models
                         await self.plugin_manager.create_plugin_instance(plugin_config)
                         static_models_list = platform_config.get('models', [])
-                        models_list = []
+                        model_entries = []
                     elif load_models:
                         # 使用静态配置的模型列表
                         static_models_list = platform_config.get('models', [])
-                        models_list = static_models_list
+                        model_entries = ModelEntry.parse_all(static_models_list)
                     else:
                         # 不加载模型，只记录平台存在
-                        models_list = []
+                        model_entries = []
 
                     # 应用黑名单过滤
                     blacklist = platform_config.get('blacklist', [])
-                    if blacklist and load_models and models_list:
+                    if blacklist and load_models and model_entries:
                         filtered = [
-                            m for m in models_list
-                            if not any(fnmatch.fnmatch(m, p) for p in blacklist)
+                            entry for entry in model_entries
+                            if not any(fnmatch.fnmatch(entry.name, p) for p in blacklist)
                         ]
-                        removed = len(models_list) - len(filtered)
+                        removed = len(model_entries) - len(filtered)
                         if removed > 0:
                             logger.info(f"平台 {platform_name} 黑名单过滤: 移除 {removed} 个模型")
-                        models_list = filtered
+                        model_entries = filtered
 
                     timeout = platform_config.get('timeout', 30)
                     weight = platform_config.get('weight', 1)
@@ -117,6 +120,8 @@ class ConfigLoader:
                     quota_period = platform_config.get('quota_period')  # 支持 quota_period 配置
                     retry_count = platform_config.get('retry_count', 3)  # 单个模型重试次数
                     stream_probe_timeout = platform_config.get('stream_probe_timeout')  # 流式探测超时（可选）
+                    connect_timeout = platform_config.get('connect_timeout')  # 连接建立超时（可选）
+                    first_chunk_timeout = platform_config.get('first_chunk_timeout')  # 首块预算（可选）
 
                     # 如果有插件配置且返回了模型，或者静态配置有模型，才添加该平台
                     # 注意：如果只有插件配置但返回空列表，仍然添加平台（让定时任务去填充）
@@ -149,18 +154,25 @@ class ConfigLoader:
                     # 当 load_models=False 时，存储平台配置而不是空列表
                     if load_models:
                         models[platform_name] = []
-                        for model_name in models_list:
+                        # 平台级默认参数；模型条目可按字段覆盖
+                        platform_settings = dict(
+                            timeout=timeout,
+                            weight=weight,
+                            enabled=enabled,
+                            quota_period=quota_period,
+                            retry_count=retry_count,
+                            stream_probe_timeout=stream_probe_timeout,
+                            connect_timeout=connect_timeout,
+                            first_chunk_timeout=first_chunk_timeout,
+                        )
+                        for entry in model_entries:
+                            settings = {**platform_settings, **entry.overrides}
                             model_config = ModelConfig(
-                                name=f"{platform_name}|{model_name.replace('/', '-')}",
+                                name=f"{platform_name}|{entry.name.replace('/', '-')}",
                                 api_key=api_key,
                                 base_url=base_url,
-                                model=model_name,
-                                timeout=timeout,
-                                weight=weight,
-                                enabled=enabled,
-                                quota_period=quota_period,
-                                retry_count=retry_count,
-                                stream_probe_timeout=stream_probe_timeout,
+                                model=entry.name,
+                                **settings,
                             )
                             models[platform_name].append(model_config)
                     else:
@@ -175,6 +187,8 @@ class ConfigLoader:
                             'quota_period': quota_period,
                             'retry_count': retry_count,
                             'stream_probe_timeout': stream_probe_timeout,
+                            'connect_timeout': connect_timeout,
+                            'first_chunk_timeout': first_chunk_timeout,
                         }
 
                 # 只在加载模型时打印详细日志

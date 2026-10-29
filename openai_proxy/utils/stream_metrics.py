@@ -11,10 +11,14 @@
 """
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+# 首块耗时告警阈值（秒）：超过即单独打一条 WARNING，便于检索慢请求
+SLOW_FIRST_CHUNK_WARNING = float(os.getenv("SLOW_FIRST_CHUNK_WARNING", "15"))
 
 # 输出/输入 token 字段：不同上游、不同协议的命名不一致
 _OUTPUT_TOKEN_KEYS = ("completion_tokens", "output_tokens")
@@ -154,10 +158,23 @@ class StreamPerformanceMonitor:
                 "throughput": self._ratio(self.output_tokens, total),
             }
             logger.info(self._format(stats))
+            self._warn_slow_first_chunk(stats)
             return stats
         except Exception as e:  # noqa: BLE001 - 埋点不得影响主流程
             logger.warning(f"输出速度埋点汇总失败: {e}", exc_info=True)
             return {}
+
+    @staticmethod
+    def _warn_slow_first_chunk(stats: Dict[str, Any]) -> None:
+        """首块耗时超阈值时单独告警，便于快速定位链路/上游慢请求"""
+        ttft = stats.get("ttft")
+        if not ttft or ttft < SLOW_FIRST_CHUNK_WARNING:
+            return
+        logger.warning(
+            f"首块耗时过长: 模型={stats['model']} 请求={stats['request_id'] or '-'} "
+            f"上游id={stats['upstream_id'] or '-'} 首块={ttft:.2f}s "
+            f"阈值={SLOW_FIRST_CHUNK_WARNING:.0f}s 总耗时={stats['total']:.2f}s"
+        )
 
     def _collect(self, payload: Dict[str, Any]) -> None:
         """从单条响应体/事件中累积 token 用量与输出字符数"""

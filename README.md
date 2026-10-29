@@ -50,6 +50,7 @@
 | **流式工具调用缓冲**     | 智能缓冲检测流式响应中的非标准工具调用，零延迟切换                           |
 | **工具能力测试**         | 新增模型时自动测试 tool call 能力，只保留真正支持的模型                      |
 | **模型重试机制**         | 单模型支持多次重试（可配置 `retry_count`），基于错误类型智能重试             |
+| **首块预算 & 故障转移**  | 首块超过预算（默认 20s，`first_chunk_timeout`）即切换模型，避免连接卡死干等  |
 | **模型别名 & 黑名单**    | `all_aliases` 支持多别名，`blacklist` 支持 `*` 通配符过滤                    |
 | **GATEWAY_API_KEY 认证** | 可选 Bearer Token 认证保护所有 API 接口                                      |
 | **Redis 缓存 & 会话**    | 响应缓存 + Responses API 会话历史，Redis 不可用时自动降级为文件              |
@@ -309,6 +310,16 @@ RESPONSES_SESSION_TTL=86400
 
 # 流探超时（可选）：探测上游是否返回有效内容的最长等待秒数
 # STREAM_PROBE_TIMEOUT=8
+
+# 首块预算（可选）：从发起请求到「响应头 + 首个有效内容」的最长等待秒数，
+# 超出即放弃当前模型并执行故障转移（覆盖 DNS/TCP/TLS、上游排队与等响应头）
+# STREAM_FIRST_CHUNK_TIMEOUT=20
+
+# 连接建立超时（可选）：只覆盖 DNS + TCP + TLS，避免连接卡死吃掉整个 timeout
+# STREAM_CONNECT_TIMEOUT=5
+
+# 首块耗时告警阈值（可选）：统计日志中首块超过该值会额外打一条 WARNING
+# SLOW_FIRST_CHUNK_WARNING=15
 ```
 
 ### 平台配置示例
@@ -322,6 +333,8 @@ modelscope:
   enabled: true
   quota_period: "daily"       # 额度刷新周期
   retry_count: 3              # 单模型重试次数
+  connect_timeout: 5          # 连接建立超时（DNS+TCP+TLS），默认取全局配置
+  first_chunk_timeout: 20     # 首块预算，超时即故障转移，默认取全局配置
   plugin:                     # 插件配置（可选）
     code: "plugin.modelscope"
     cache_timeout: 3600       # 模型列表缓存时间（秒）
@@ -336,6 +349,29 @@ modelscope:
     - "iic/*"
   models: []                  # 静态模型列表（可选）
 ```
+
+### 模型级配置覆盖
+
+`models` 列表支持两种写法，可混用：字符串表示继承平台配置，对象表示只覆盖指定字段。
+
+```yaml
+example-platform:
+  baseUrl: "https://api.example.com/v1"
+  apiKey: "${EXAMPLE_PLATFORM_API_KEY}"
+  timeout: 120
+  connect_timeout: 5
+  first_chunk_timeout: 20          # 平台级默认：首块超过 20s 就切下一个模型
+  models:
+    - "model-a"                    # 继承平台级的 20s
+    - name: "model-b"              # 该模型首块更慢，单独放宽到 45s
+      first_chunk_timeout: 45
+      retry_count: 1
+```
+
+- 可覆盖字段：`timeout`、`weight`、`enabled`、`quota_period`、`retry_count`、`stream_probe_timeout`、`connect_timeout`、`first_chunk_timeout`、`enable_tool_call_conversion`
+- 连接信息（`baseUrl` / `apiKey`）**不允许**在模型级别覆盖，始终来自平台配置；写了只告警不生效
+- 取值优先级：**模型级 > 平台级 > 环境变量默认值**，且 `connect_timeout` / `first_chunk_timeout` 不会超过该模型的 `timeout`
+- 插件动态发现的模型若在 `models` 里再次声明，按模型名去重（不会重复调用），静态声明中的覆盖优先生效
 
 ### 工具调用能力测试
 

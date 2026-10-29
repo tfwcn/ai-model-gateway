@@ -28,7 +28,7 @@ modelscope:
       enable_tool_capability_test: true
       max_concurrent_tests: 1 # 串行测试，避免限流
       test_timeout_seconds: 60
-  models: [] # 静态配置的模型（可选）
+  models: [] # 静态配置的模型（可选）：可写字符串，也可写对象做模型级覆盖（见文件末尾说明）
   # 黑名单：爬虫抓取但无法使用的模型，支持 * 通配符匹配
   # 示例：
   #   - "Qwen/Qwen2.5-7B-Instruct"  # 精确匹配
@@ -39,6 +39,8 @@ modelscope:
   enabled: true
   quota_period: "daily" # 每日额度刷新
   retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
+  # connect_timeout: 5 # 连接建立超时（DNS+TCP+TLS），默认取全局配置
+  # first_chunk_timeout: 20 # 首块预算，超时即切换模型，默认取全局配置
 
 # openai:
 #   baseUrl: "https://api.openai.com/v1"
@@ -140,3 +142,25 @@ nvidia:
 #   enabled: true
 #   retry_count: 1 # 本地模型无需重试，设为1
 #   # 无quota_period配置，表示无额度限制，始终可用
+
+# ===== 模型级配置（可选）=====
+# models 列表支持两种写法，可混用：
+#   1) 字符串：只声明模型，参数全部继承平台级配置
+#   2) 对象：声明模型（name/model）+ 覆盖部分参数
+# 可覆盖字段：timeout / weight / enabled / quota_period / retry_count /
+#             stream_probe_timeout / connect_timeout / first_chunk_timeout /
+#             enable_tool_call_conversion
+# 连接信息（baseUrl / apiKey）不允许在模型级别覆盖，始终来自平台配置。
+#
+# 示例：同一平台里给慢模型更宽的首块预算，给不稳定模型更激进的预算
+# example-platform:
+#   baseUrl: "https://api.example.com/v1"
+#   apiKey: "${EXAMPLE_PLATFORM_API_KEY}"
+#   timeout: 120
+#   connect_timeout: 5
+#   first_chunk_timeout: 20        # 平台级默认：首块超过 20s 就切下一个模型
+#   models:
+#     - "model-a"                  # 继承上面的 20s
+#     - name: "model-b"            # 该模型首块更慢，单独放宽到 45s
+#       first_chunk_timeout: 45
+#       retry_count: 1

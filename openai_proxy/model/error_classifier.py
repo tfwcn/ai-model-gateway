@@ -13,6 +13,7 @@ class ErrorCategory(Enum):
     """错误分类枚举"""
     # 网络相关错误
     NETWORK_TIMEOUT = "network_timeout"  # 网络超时
+    FIRST_CHUNK_TIMEOUT = "first_chunk_timeout"  # 首块超时（响应头/首块迟迟不来）
     NETWORK_CONNECTION_ERROR = "network_connection_error"  # 网络连接错误
     NETWORK_DNS_ERROR = "network_dns_error"  # DNS解析错误
     
@@ -76,6 +77,13 @@ class ErrorClassifier:
             "is_retryable": True,
             "should_disable_model": False,
             "retry_delay_seconds": 1.0,
+        },
+        # 首块超时：上游迟迟不返回响应头/首块，属于链路或上游拥塞，重试意义有限，
+        # 主要是尽快让上层切换到下一个模型（不重试同一模型的等待）
+        ErrorCategory.FIRST_CHUNK_TIMEOUT: {
+            "is_retryable": False,
+            "should_disable_model": False,
+            "retry_delay_seconds": 0.0,
         },
         ErrorCategory.NETWORK_CONNECTION_ERROR: {
             "is_retryable": True,
@@ -246,6 +254,41 @@ class ErrorClassifier:
         )
     
     @classmethod
+    def classify_first_chunk_timeout(cls, model_name: str, elapsed_time: float, budget: float) -> ClassifiedError:
+        """
+        分类首块超时错误
+
+        与普通「请求超时」区分开：它表示从发起请求到拿到响应头+首块的等待已经超出预算，
+        典型场景是上游连接建立卡住、上游前置网关排队或供应商拥塞。上层应尽快切换模型，
+        而不是在同一个模型上继续等待。
+
+        Args:
+            model_name: 模型名称
+            elapsed_time: 已耗时（秒）
+            budget: 首块预算（秒）
+
+        Returns:
+            ClassifiedError: 分类后的错误
+        """
+        strategy = cls.ERROR_STRATEGIES[ErrorCategory.FIRST_CHUNK_TIMEOUT]
+        message = (
+            f"模型 {model_name} 首块超时 (已等待: {elapsed_time:.2f}秒, 首块预算: {budget:g}秒)"
+        )
+
+        return ClassifiedError(
+            category=ErrorCategory.FIRST_CHUNK_TIMEOUT,
+            message=message,
+            is_retryable=strategy["is_retryable"],
+            should_disable_model=strategy["should_disable_model"],
+            retry_delay_seconds=strategy["retry_delay_seconds"],
+            metadata={
+                "model_name": model_name,
+                "elapsed_time": elapsed_time,
+                "first_chunk_budget": budget,
+            }
+        )
+
+    @classmethod
     def classify_connection_error(cls, exception: Exception, model_name: str) -> ClassifiedError:
         """
         分类连接错误
@@ -384,6 +427,7 @@ class ErrorClassifier:
         """
         category_descriptions = {
             ErrorCategory.NETWORK_TIMEOUT: "网络超时",
+            ErrorCategory.FIRST_CHUNK_TIMEOUT: "首块超时",
             ErrorCategory.NETWORK_CONNECTION_ERROR: "网络连接错误",
             ErrorCategory.NETWORK_DNS_ERROR: "DNS解析错误",
             ErrorCategory.HTTP_400_BAD_REQUEST: "请求格式错误",

@@ -88,3 +88,57 @@ class KeepAliveStream:
             await queue.put(exc)
         finally:
             await queue.put(self._DONE)
+
+
+class UpstreamStartHeartbeat:
+    """
+    等待上游返回「流对象」期间的 SSE 心跳。
+
+    设计动机：
+    - KeepAliveStream 只能在上游已经返回流对象之后才开始工作，
+      而「建立连接 → 上游排队 → 首块」这段等待可能长达数十秒，
+      此时客户端一个字节都收不到，容易误判为卡死或被中间层掐断连接。
+    - 本类把这段等待变成「静默期产出心跳、结束后交回结果」的异步迭代器：
+
+        waiter = UpstreamStartHeartbeat(manager.chat_completion_stream(payload))
+        async for data in waiter:
+            yield data            # 静默期下发 SSE 注释行
+        upstream_stream = waiter.result
+
+    职责单一：只做心跳注入，不处理上游结果，异常在迭代结束后原样抛出。
+    """
+
+    # 复用 KeepAliveStream 的 SSE 注释行，两处心跳格式保持一致
+    HEARTBEAT: bytes = KeepAliveStream.HEARTBEAT
+
+    def __init__(self, target, interval: Optional[float] = None):
+        """
+        Args:
+            target: 需要等待的可等待对象（通常是流式调用的协程）
+            interval: 心跳间隔（秒），None 时取环境变量默认值；<=0 表示关闭心跳
+        """
+        self._target = target
+        self.interval = DEFAULT_INTERVAL if interval is None else interval
+        self.result = None
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        task = asyncio.ensure_future(self._target)
+        try:
+            if self.interval <= 0:
+                self.result = await task
+                return
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=self.interval)
+                if done:
+                    break
+                yield self.HEARTBEAT
+            # 上游已返回：异常在此抛出，交给调用方原有逻辑处理
+            self.result = task.result()
+        finally:
+            # 客户端断开或异常退出时，确保上游任务被回收
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass

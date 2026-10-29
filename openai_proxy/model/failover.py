@@ -14,12 +14,16 @@ from fastapi.responses import StreamingResponse
 from openai_proxy.models import ModelConfig
 from openai_proxy.model.state import ModelStateManager
 from openai_proxy.model.error_classifier import ErrorClassifier, ClassifiedError
+from openai_proxy.model.stream_budget import StreamBudget, StreamProbeResult, FirstChunkTimeout
 from openai_proxy.utils.tool_call_converter import ToolCallConverter
 from openai_proxy.utils.streaming_tool_call_buffer import StreamingToolCallBuffer
 from openai_proxy.utils.sse_parser import SSEEventParser
 from openai_proxy.utils.stream_metrics import report_non_stream_usage
 
 logger = logging.getLogger(__name__)
+
+# 读取首块数据的硬超时（秒）：上游已回响应头但迟迟不给首块的兜底
+READ_FIRST_CHUNK_TIMEOUT = 5.0
 
 
 class ModelFailoverManager:
@@ -32,12 +36,88 @@ class ModelFailoverManager:
         self.model_state_manager = ModelStateManager()
         # 流式内容探测超时（秒）：超过该时间仍无内容则触发故障转移
         self.stream_probe_timeout = float(os.getenv("STREAM_PROBE_TIMEOUT", "10"))
+        # 首块预算（秒）：从发起请求到「响应头 + 首个有效内容」的最长等待，
+        # 超出即放弃当前模型交由上层故障转移（覆盖连接建立、上游排队与响应头等待）
+        self.first_chunk_timeout = float(os.getenv("STREAM_FIRST_CHUNK_TIMEOUT", "20"))
+        # 连接建立超时（秒）：只覆盖 DNS + TCP + TLS，避免连接卡死吃掉整个 timeout
+        self.connect_timeout = float(os.getenv("STREAM_CONNECT_TIMEOUT", "5"))
 
     def _get_probe_timeout(self, model_config: ModelConfig) -> float:
         """获取探测超时：优先使用模型单独配置，否则使用全局配置"""
         if model_config.stream_probe_timeout is not None:
             return float(model_config.stream_probe_timeout)
         return self.stream_probe_timeout
+
+    def _get_first_chunk_timeout(self, model_config: ModelConfig) -> float:
+        """获取首块预算：优先模型配置，其次全局配置，且不超过模型总超时"""
+        budget = model_config.first_chunk_timeout
+        budget = self.first_chunk_timeout if budget is None else float(budget)
+        return min(float(budget), float(model_config.timeout))
+
+    def _get_connect_timeout(self, model_config: ModelConfig) -> float:
+        """获取连接建立超时：优先模型配置，其次全局配置，且不超过模型总超时"""
+        connect_timeout = model_config.connect_timeout
+        connect_timeout = self.connect_timeout if connect_timeout is None else float(connect_timeout)
+        return min(float(connect_timeout), float(model_config.timeout))
+
+    def _build_stream_timeout(self, model_config: ModelConfig) -> aiohttp.ClientTimeout:
+        """构造流式请求超时：连接类用短超时，流式间隙由 sock_read 兜底，总时长不设限"""
+        connect_timeout = self._get_connect_timeout(model_config)
+        return aiohttp.ClientTimeout(
+            connect=connect_timeout,        # 连接建立超时
+            sock_connect=connect_timeout,   # socket连接超时
+            total=None,                     # 无总超时限制（流式可长跑）
+            sock_read=model_config.timeout  # TTFB + 流式间隙兜底
+        )
+
+    async def _open_stream_response(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        request_body: Dict[str, Any],
+        headers: Dict[str, str],
+        model_config: ModelConfig,
+        budget: StreamBudget,
+        request_id: str = "",
+    ) -> aiohttp.ClientResponse:
+        """在首块预算内打开流式响应（DNS/TCP/TLS + 等待响应头）
+
+        Args:
+            budget: 首块预算，耗尽即判定该模型异常
+
+        Raises:
+            FirstChunkTimeout: 等待响应头超出首块预算（含连接建立超时）
+        """
+        rid = f"[{request_id}] " if request_id else ""
+        if budget.exhausted:
+            raise FirstChunkTimeout(f"模型 {model_config.name} 首块预算已耗尽，未发出请求")
+
+        try:
+            # 用首块预算约束「连接建立 + 等待响应头」整段等待
+            # 注：这里用 wait_for 而非 asyncio.timeout，以兼容 Python 3.10 运行时
+            return await asyncio.wait_for(
+                session.post(
+                    url,
+                    json=request_body,
+                    headers=headers,
+                    timeout=self._build_stream_timeout(model_config),
+                ),
+                timeout=budget.remaining,
+            )
+        except TimeoutError as exc:
+            # post 阶段只覆盖「连接 + 发送 + 等响应头」，超时即首块未按时到达
+            logger.info(f"{rid}模型 {model_config.name} 等待响应头超出预算，触发故障转移")
+            raise FirstChunkTimeout(
+                f"模型 {model_config.name} 等待响应头超时（连接建立或上游未响应）"
+            ) from exc
+
+    def _first_chunk_timeout_error(
+        self, model_config: ModelConfig, budget: StreamBudget
+    ) -> ClassifiedError:
+        """构造首块超时的分类错误，供上层切换模型"""
+        return ErrorClassifier.classify_first_chunk_timeout(
+            model_config.name, budget.elapsed(), budget.total_seconds
+        )
 
     def _parse_model_selector(self, model_selector: str) -> Tuple[str, Optional[str]]:
         """
@@ -166,12 +246,16 @@ class ModelFailoverManager:
         model_config: ModelConfig,
         first_chunk: Optional[bytes],
         request_id: str = "",
-    ) -> tuple[bool, List[bytes]]:
+        budget: Optional[StreamBudget] = None,
+    ) -> StreamProbeResult:
         """
         探测流式响应是否包含实际内容。
 
         宽松策略：仅过滤纯 keep-alive 注释，只要收到任何有效 data 行即视为有内容。
         只有在整个探测窗口内完全无有效数据时才判定为空。
+
+        Args:
+            budget: 首块预算，传入时探测窗口不会超过预算截止时间
         """
         buffered: List[bytes] = []
         rid = f"[{request_id}] " if request_id else ""
@@ -179,29 +263,34 @@ class ModelFailoverManager:
         # 首块有效数据直接视为有内容
         if first_chunk and not self._is_only_keepalive(first_chunk):
             buffered.append(first_chunk)
-            return True, buffered
+            return StreamProbeResult(True, buffered)
         if first_chunk:
             # 首块仅为 keep-alive，仍需继续探测
             buffered.append(first_chunk)
 
         probe_timeout = self._get_probe_timeout(model_config)
         probe_deadline = time.time() + min(probe_timeout, model_config.timeout)
+        if budget is not None:
+            # 探测窗口不得超过首块预算
+            probe_deadline = min(probe_deadline, budget.deadline)
         try:
             while True:
                 remaining = probe_deadline - time.time()
                 if remaining <= 0:
-                    # 探测超时：检查是否全为 keep-alive
+                    # 探测结束：检查是否全为 keep-alive
                     has_valid = any(not self._is_only_keepalive(c) for c in buffered)
+                    exhausted = budget is not None and budget.exhausted
                     if not has_valid:
-                        logger.info(
-                            f"{rid}模型 {model_config.name} 流式探测超时，未收到有效数据，触发故障转移"
-                        )
-                        return False, buffered
+                        if not exhausted:
+                            logger.info(
+                                f"{rid}模型 {model_config.name} 流式探测超时，未收到有效数据，触发故障转移"
+                            )
+                        return StreamProbeResult(False, buffered, exhausted)
                     total = sum(len(c) for c in buffered)
                     logger.info(
                         f"{rid}模型 {model_config.name} 流式探测超时，但已收到 {total} 字节有效数据，继续转发"
                     )
-                    return True, buffered
+                    return StreamProbeResult(True, buffered)
 
                 chunk = await asyncio.wait_for(
                     response.content.read(8192),
@@ -210,30 +299,34 @@ class ModelFailoverManager:
                 if not chunk:
                     has_valid = any(not self._is_only_keepalive(c) for c in buffered)
                     if not has_valid:
-                        logger.warning(
-                            f"{rid}模型 {model_config.name} 流式响应结束但未收到有效数据"
-                        )
-                        return False, buffered
+                        exhausted = budget is not None and budget.exhausted
+                        if not exhausted:
+                            logger.warning(
+                                f"{rid}模型 {model_config.name} 流式响应结束但未收到有效数据"
+                            )
+                        return StreamProbeResult(False, buffered, exhausted)
                     total = sum(len(c) for c in buffered)
                     logger.info(
                         f"{rid}模型 {model_config.name} 流式响应结束，已收到 {total} 字节有效数据"
                     )
-                    return True, buffered
+                    return StreamProbeResult(True, buffered)
                 buffered.append(chunk)
                 if not self._is_only_keepalive(chunk):
-                    return True, buffered
+                    return StreamProbeResult(True, buffered)
                 # 仅为 keep-alive，继续探测
         except asyncio.TimeoutError:
             has_valid = any(not self._is_only_keepalive(c) for c in buffered)
+            exhausted = budget is not None and budget.exhausted
             if not has_valid:
-                logger.info(
-                    f"{rid}模型 {model_config.name} 流式内容探测读取超时，未收到有效数据，触发故障转移"
-                )
-                return False, buffered
+                if not exhausted:
+                    logger.info(
+                        f"{rid}模型 {model_config.name} 流式内容探测读取超时，未收到有效数据，触发故障转移"
+                    )
+                return StreamProbeResult(False, buffered, exhausted)
             logger.info(
                 f"{rid}模型 {model_config.name} 流式内容探测读取超时，但已收到有效数据，继续转发"
             )
-            return True, buffered
+            return StreamProbeResult(True, buffered)
 
     async def call_model_stream(self, model_config: ModelConfig, request_data: Dict[str, Any]) -> tuple[bool, Any]:
         """
@@ -263,32 +356,25 @@ class ModelFailoverManager:
         request_id = uuid.uuid4().hex[:8]
         try:
             start_time = time.time()
+            # 首块预算：从发起到「响应头 + 首个有效内容」的等待上限
+            budget = StreamBudget(model_config.name, self._get_first_chunk_timeout(model_config), start_time)
             logger.info(f"[{request_id}] 调用模型: {model_config.name} ({model_config.model}) - 流式")
 
-            # 流式响应 - 设置精确的超时控制
-            # connect: 连接建立超时
-            # sock_connect: socket连接超时
-            # total: None 表示流式传输无总时间限制
-            # sock_read: 每次读取间隔超时，覆盖 TTFB + 流式间隙
-            response = await session.post(
-                url,
-                json=request_body,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(
-                    connect=model_config.timeout,      # 连接建立超时
-                    sock_connect=model_config.timeout,  # socket连接超时
-                    total=None,                        # 无总超时限制
-                    sock_read=model_config.timeout     # TTFB + 流式间隙兜底
-                )
+            # 打开流式响应：受首块预算保护，避免连接建立/上游排队无限期等待
+            response = await self._open_stream_response(
+                session, url, request_body, headers, model_config, budget, request_id
             )
             elapsed_time = time.time() - start_time
 
             # 读取首块数据（8192字节），同时检测 JSON 错误响应
             try:
                 content_type = response.headers.get("Content-Type", "")
+                # 读取超时取「首块预算剩余」与硬超时的较小值；
+                # 预算已耗尽时该值非正，wait_for 会立即超时并走下面的预算分支
+                read_timeout = min(READ_FIRST_CHUNK_TIMEOUT, budget.remaining)
                 first_chunk = await asyncio.wait_for(
                     response.content.read(8192),
-                    timeout=5
+                    timeout=read_timeout
                 )
 
                 if not first_chunk:
@@ -334,13 +420,17 @@ class ModelFailoverManager:
                     first_chunk_for_wrapper = first_chunk
 
                 # 探测流式响应是否收到有效数据（宽松策略）
-                has_content, buffered_chunks = await self._probe_stream_content(
-                    response, model_config, first_chunk_for_wrapper, request_id=request_id
+                probe = await self._probe_stream_content(
+                    response, model_config, first_chunk_for_wrapper,
+                    request_id=request_id, budget=budget,
                 )
-                if not has_content:
+                if not probe.has_content:
+                    response.close()
+                    if probe.budget_exhausted:
+                        # 首块预算耗尽：交由上层切换模型，不再按「响应为空」处理
+                        return False, self._first_chunk_timeout_error(model_config, budget)
                     error_msg = f"模型 {model_config.name} 流式响应为空（未收到有效数据）"
                     logger.warning(f"[{request_id}] {error_msg}")
-                    response.close()
                     classified_error = ErrorClassifier.classify_invalid_response(
                         model_config.name, error_msg
                     )
@@ -363,7 +453,7 @@ class ModelFailoverManager:
                             if chunk:
                                 yield chunk
 
-                wrapped_response = StreamResponseWrapper(response, buffered_chunks)
+                wrapped_response = StreamResponseWrapper(response, probe.chunks)
                 # 埋点元信息：上层据此统计首块耗时、总耗时与输出速度
                 wrapped_response.model_name = model_config.name
                 wrapped_response.request_id = request_id
@@ -371,11 +461,17 @@ class ModelFailoverManager:
                 return True, wrapped_response
 
             except asyncio.TimeoutError:
+                # 预算先于硬超时到期时，按首块超时上报，交由上层切换模型
+                if budget.exhausted:
+                    response.close()
+                    classified_error = self._first_chunk_timeout_error(model_config, budget)
+                    logger.warning(f"[{request_id}] {classified_error.message}")
+                    return False, classified_error
                 error_msg = f"模型 {model_config.name} 首块数据读取超时"
                 logger.warning(f"[{request_id}] {error_msg}")
                 response.close()
                 classified_error = ErrorClassifier.classify_timeout_error(
-                    model_config.name, 5, 5
+                    model_config.name, READ_FIRST_CHUNK_TIMEOUT, READ_FIRST_CHUNK_TIMEOUT
                 )
                 return False, classified_error
             except Exception as e:
@@ -384,6 +480,12 @@ class ModelFailoverManager:
                 classified_error = ErrorClassifier.classify_unknown_error(e, model_config.name, time.time() - start_time)
                 return False, classified_error
 
+        except FirstChunkTimeout:
+            # 首块预算耗尽（连接建立/上游排队/响应头等待超长）
+            classified_error = self._first_chunk_timeout_error(model_config, budget)
+            logger.warning(classified_error.message)
+            logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
+            return False, classified_error
         except asyncio.TimeoutError:
             elapsed_time = time.time() - start_time
             # 使用错误分类器进行分类
@@ -437,12 +539,17 @@ class ModelFailoverManager:
             start_time = time.time()
             logger.info(f"调用模型: {model_config.name} ({model_config.model}) - 非流式")
 
-            # 普通响应 - 保持总超时行为
+            # 普通响应 - 总超时保持原语义，连接建立单独用短超时
+            connect_timeout = self._get_connect_timeout(model_config)
             async with session.post(
                 url,
                 json=request_body,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=model_config.timeout)
+                timeout=aiohttp.ClientTimeout(
+                    connect=connect_timeout,
+                    sock_connect=connect_timeout,
+                    total=model_config.timeout
+                )
             ) as response:
                 elapsed_time = time.time() - start_time
 

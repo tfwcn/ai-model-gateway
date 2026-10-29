@@ -16,6 +16,8 @@ class ModelConfig:
     enable_tool_call_conversion: bool = True  # 是否启用工具调用格式转换
     retry_count: int = 3  # 单个模型调用失败时的重试次数
     stream_probe_timeout: Optional[float] = None  # 流式探测超时（秒），None 则使用全局配置
+    connect_timeout: Optional[float] = None  # 连接建立超时（DNS+TCP+TLS，秒），None 则按 timeout 推导
+    first_chunk_timeout: Optional[float] = None  # 首块预算（秒）：从发起到拿到响应头+首块的最长等待，None 则按 timeout 推导
 
 
 def _infer_capabilities(model_id: str) -> List[str]:
@@ -49,6 +51,8 @@ def model_config_to_dict(platform: str, model_config: ModelConfig) -> Dict[str, 
             "weight": model_config.weight,
             "enabled": model_config.enabled,
             "retry_count": model_config.retry_count,
+            "connect_timeout": model_config.connect_timeout,
+            "first_chunk_timeout": model_config.first_chunk_timeout,
             **({"quota_period": model_config.quota_period} if model_config.quota_period else {})
         }
     }
