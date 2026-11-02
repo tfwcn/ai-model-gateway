@@ -5,6 +5,7 @@ AI Model Gateway 的监控、日志和运维说明。
 ## 📋 目录
 
 - [Prometheus 监控](#prometheus-监控)
+- [用量与性能审计](#用量与性能审计)
 - [健康检查端点](#健康检查端点)
 - [日志管理](#日志管理)
 - [性能优化](#性能优化)
@@ -18,20 +19,35 @@ AI Model Gateway 的监控、日志和运维说明。
 
 项目内置 Prometheus 指标收集，默认在 `/metrics` 端点暴露。
 
+> ⚠️ `/metrics` 与所有 `/admin/*` 一样受 `GATEWAY_API_KEY` 保护：
+> 未配置该密钥时返回 `403 {"error":{"code":"admin_disabled"}}`；配置了却没带密钥返回 `401`。
+
 ```bash
-curl http://localhost:8000/metrics
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" http://localhost:8000/metrics
 ```
 
 ### 关键指标
 
 | 指标名称 | 类型 | 描述 |
 |---------|------|------|
-| `http_requests_total` | Counter | 总请求数 |
-| `http_request_duration_seconds` | Histogram | 请求延迟分布 |
-| `model_failover_total` | Counter | 故障转移次数 |
-| `cache_hits_total` | Counter | 缓存命中数 |
-| `cache_misses_total` | Counter | 缓存未命中数 |
-| `error_classification_total` | Counter | 按类型的错误计数 |
+| `proxy_requests_total` | Counter | 总请求数，标签 `platform` / `status` / `error_type` |
+| `proxy_errors_total` | Counter | 按分类统计的错误数 |
+| `proxy_request_duration_seconds` | Histogram | 请求延迟分布 |
+| `proxy_failover_total` | Counter | 故障转移次数，标签 `from_platform` / `to_platform` |
+| `proxy_stream_ttft_seconds` | Histogram | 流式首块耗时分布 |
+| `proxy_stream_duration_seconds` | Histogram | 上游调用总耗时分布 |
+| `proxy_stream_throughput_tokens_per_second` | Histogram | 输出速度分布（端到端 tokens/s） |
+| `proxy_stream_tokens_total` | Counter | 上游回报的 token 用量，标签 `token_type` |
+| `proxy_usage_missing_total` | Counter | 上游没有回报 usage 的调用次数（这类调用的用量统计不完整） |
+| `platform_availability` | Gauge | 平台/模型可用性（1=可用，0=不可用） |
+| `cache_hits_total` / `cache_misses_total` | Counter | 缓存命中/未命中 |
+| `active_connections` / `pending_requests` | Gauge | 活跃连接数 / 待处理请求数 |
+
+标签默认不含 `model`：爬虫模式下模型数量很大，`model` 标签会把指标基数撑爆。要按模型看 Prometheus 数据，
+用环境变量 `METRICS_LABEL_MODEL=true` **并在启动前**设好（指标注册时就读它，`models.yaml` 里的
+`audit.metrics_label_model` 目前不改变标签）；打开后前四个计数与三个流式直方图会多出 `model` 标签。
+
+关掉 Prometheus 打点：`AUDIT_PROMETHEUS=false`（`/metrics` 返回 404）。
 
 ### Grafana 仪表板示例
 
@@ -45,7 +61,7 @@ curl http://localhost:8000/metrics
         "type": "graph",
         "targets": [
           {
-            "expr": "rate(http_requests_total[5m])"
+            "expr": "rate(proxy_requests_total[5m])"
           }
         ]
       },
@@ -54,7 +70,25 @@ curl http://localhost:8000/metrics
         "type": "piechart",
         "targets": [
           {
-            "expr": "error_classification_total"
+            "expr": "rate(proxy_errors_total[5m])"
+          }
+        ]
+      },
+      {
+        "title": "P95 Time To First Chunk",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(proxy_stream_ttft_seconds_bucket[5m]))"
+          }
+        ]
+      },
+      {
+        "title": "Failovers",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(proxy_failover_total[5m])"
           }
         ]
       }
@@ -81,6 +115,57 @@ spec:
       path: /metrics
       interval: 30s
 ```
+
+---
+
+---
+
+## 用量与性能审计
+
+Prometheus 适合看趋势与告警，**要下钻到「哪一次请求、哪一次切换、为什么失败」要看审计记录**：
+一次上游尝试一行，落在 SQLite（默认 `data/audit.db`）。
+
+### 管理接口
+
+都需要 `Authorization: Bearer <GATEWAY_API_KEY>`：
+
+```bash
+# 按模型聚合用量与性能（成功率、P95、首块、tokens/s）
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/usage/summary?group_by=model&since=24h&sort=p95"
+
+# 按天看趋势
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/usage/timeseries?bucket=day&since=30d"
+
+# 只看失败的尝试
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/audit?outcome=failure&limit=20"
+
+# 还原一次请求的完整故障转移链
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/audit/chain/<gateway_request_id>"
+
+# 审计自身健康状态：行数、缓冲、丢弃、写库失败、最近刷盘
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/audit/stats"
+```
+
+### 命令行（不需要网关在跑）
+
+```bash
+python manage.py usage summary --group-by model --since 7d
+python manage.py usage attempts --outcome failure --limit 20
+python manage.py usage stats
+```
+
+### 管理台
+
+`http://localhost:8000/admin/ui/` → 「用量与性能」「审计明细」两个标签页，
+点任意一行审计记录就能展开它所属请求的整条故障转移链。
+
+口径要点：**成功率只统计已收尾的尝试**（`finalized=1`），正在转发的流式请求记为 `stream_open`，不进分母。
+完整说明见 [AUDIT.md](AUDIT.md)，接口字段见 [../web/API.md](../web/API.md)。
 
 ---
 
@@ -282,8 +367,8 @@ tail -f logs/app.log | grep ERROR
 
 **排查步骤：**
 ```bash
-# 检查缓存统计
-curl http://localhost:8000/metrics | grep cache
+# 检查缓存统计（/metrics 需要管理密钥）
+curl -H "Authorization: Bearer $GATEWAY_API_KEY" http://localhost:8000/metrics | grep cache
 
 # 清除缓存重试
 curl -X POST http://localhost:8000/cache/clear
@@ -305,6 +390,10 @@ grep "failover" logs/app.log
 
 # 查看模型状态
 curl http://localhost:8000/health/detailed | jq '.components.models'
+
+# 直接看审计里的故障转移链：先试了谁、为什么换、最后成没成
+python manage.py usage attempts --outcome failure --limit 5
+python manage.py usage chain <gateway_request_id>
 ```
 
 **解决方案：**
@@ -327,6 +416,9 @@ DEBUG_MODE=true
 
 ## 相关文档
 
+- [审计与用量统计](./AUDIT.md)
+- [管理台前端](./ADMIN_UI.md)
+- [命令行管理工具](./CONFIG_CLI.md)
 - [配置指南](./CONFIGURATION_GUIDE.md)
 - [负载均衡策略](./LOAD_BALANCING.md)
 - [错误分类系统](./error-classification.md)

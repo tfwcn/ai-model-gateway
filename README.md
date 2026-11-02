@@ -15,7 +15,7 @@
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
-**[快速开始](#-快速开始)** · **[API 参考](#-api-参考)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[监控运维](docs/MONITORING.md)** · **[贡献指南](#-贡献指南)**
+**[快速开始](#-快速开始)** · **[API 参考](#-api-参考)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[监控运维](docs/MONITORING.md)** · **[审计与管理台](#-观测与管理)** · **[贡献指南](#-贡献指南)**
 
 ---
 
@@ -57,6 +57,8 @@
 | **SSE 事件标准化**       | 统一 SSE 格式，消除多端点重复代码                                            |
 | **错误分类系统**         | 7 种错误类型（超时/连接/认证/限流/服务器/格式/模型），精细控制重试和禁用策略 |
 | **SKIP_PLUGIN_SCRAPER**  | 跳过插件爬虫直接使用缓存，适合离线环境或加速启动                             |
+| **用量与性能审计**   | 一次上游尝试一行：成功率、P95 耗时、首块耗时、tokens/s、故障转移链、错误分类 |
+| **管理台 & 命令行**  | `/admin/ui/` 网页与 `manage.py` 都能看审计、改模型配置（保留 YAML 注释）     |
 | **Docker 一键部署**      | 内置 Redis、Playwright，开箱即用的容器化部署方案                             |
 
 ### 对比传统方案
@@ -154,7 +156,11 @@ curl http://localhost:8000/v1/responses \
 | `/v1/models`           | GET  | 获取可用模型列表（支持筛选/分页，需认证） |
 | `/health`              | GET  | 基本健康检查（免认证）                    |
 | `/health/detailed`     | GET  | 详细健康检查                              |
-| `/metrics`             | GET  | Prometheus 监控指标                       |
+| `/metrics`             | GET  | Prometheus 监控指标（需管理密钥）             |
+| `/admin/usage/*`       | GET  | 用量与性能聚合（需管理密钥）                  |
+| `/admin/audit*`        | GET  | 审计明细与故障转移链（需管理密钥）            |
+| `/admin/config/*`      | GET/POST | 配置读取、预演、写盘、回滚（需管理密钥）  |
+| `/admin/ui/`           | GET  | 管理台前端（静态壳免密钥，数据接口仍需密钥）  |
 
 ### 模型选择策略
 
@@ -308,6 +314,10 @@ RESPONSES_SESSION_TTL=86400
 # 设为 0 可关闭心跳
 # SSE_KEEPALIVE_INTERVAL=1.0
 
+# [DONE] 收尾窗口（可选）：转发完终止标记 [DONE] 之后，还为「可能跟在后面的 usage 尾片」多等这么多秒；
+# 到期即收尾并释放上游连接。审计据此把「[DONE] 已发完后客户端才关闭」记为 success，而不是客户端中断
+# SSE_DONE_DRAIN_TIMEOUT=0.5
+
 # 流探超时（可选）：探测上游是否返回有效内容的最长等待秒数
 # STREAM_PROBE_TIMEOUT=8
 
@@ -320,6 +330,20 @@ RESPONSES_SESSION_TTL=86400
 
 # 首块耗时告警阈值（可选）：统计日志中首块超过该值会额外打一条 WARNING
 # SLOW_FIRST_CHUNK_WARNING=15
+
+# 审计与用量统计（可选）：一次上游尝试一行，写入 SQLite
+# 优先级：默认值 < 这里的 AUDIT_* < models.yaml 顶层 audit: 段
+# AUDIT_ENABLED=true                  # 总开关，关闭后转发热路径零开销
+# AUDIT_DB_PATH=data/audit.db         # 审计库路径
+# AUDIT_RETENTION_DAYS=30             # 启动时自动清理更早的记录，0 表示不清理
+# AUDIT_RECORD_FAILED_ONLY=false      # 只记失败尝试，省磁盘但看不到用量
+# AUDIT_PROMETHEUS=true               # 审计落库时同步喂 Prometheus
+
+# 管理接口与管理台（/admin/* 与 /metrics 都需要 GATEWAY_API_KEY）
+# ADMIN_UI_ENABLED=true               # 管理台前端 /admin/ui，false 则返回 404
+# CONFIG_API_ENABLED=true             # 配置读写接口 /admin/config/*，false 则不提供
+# CONFIG_BACKUP_DIR=data/config_backups   # 每次写盘前的自动备份目录
+# MODEL_CONFIG_FILE=models.yaml       # 命令行默认读取的配置文件
 ```
 
 ### 平台配置示例
@@ -392,6 +416,47 @@ modelscope:
 
 ---
 
+## 📊 观测与管理
+
+网关的每一次上游调用都会记一行审计（默认写入 `data/audit.db`），用来回答「谁被用了多少、慢在哪里、为什么失败」。
+
+统计口径：**一次客户端请求 = 一个 `gateway_request_id`，每次上游尝试 = 一行**，因此可以完整还原故障转移链。
+成功率只统计已收尾的尝试（`finalized=1`），正在转发的流式请求记为 `stream_open`，不进分母。
+
+### 管理台
+
+```text
+http://localhost:8000/admin/ui/     # 打开后输入 GATEWAY_API_KEY 连接
+```
+
+四个标签页：用量与性能、审计明细、模型配置、备份与回滚。
+纯静态页面（无构建、无外部依赖），密钥只存在浏览器 `sessionStorage`；**密钥内容永不下发**，配置视图只给出它引用的环境变量名与是否已设置。
+
+### 命令行
+
+```bash
+# 看用量与性能
+python manage.py usage summary --group-by model --since 7d
+python manage.py usage models --sort p95              # 谁最慢
+python manage.py usage attempts --outcome failure     # 只看失败的尝试
+python manage.py usage chain <gateway_request_id>     # 还原整条故障转移链
+
+# 看与改配置（写盘前先备份，--dry-run 先看行级差异）
+python manage.py config document
+python manage.py platform set example-platform --field weight --value 5 --dry-run
+python manage.py model set example-platform model-a --field first_chunk_timeout --value 45
+python manage.py config backups
+python manage.py config rollback models.yaml.20260101T000000Z.bak
+```
+
+改配置有三种等价做法：管理台页面、`manage.py`、直接编辑 `models.yaml`。
+后两种改完之后，调用 `POST /admin/config/reload`（带 `GATEWAY_API_KEY`）即可进程内生效；
+涉及新增/删除平台、插件结构变化的改动**需要你自行重启服务**，网关永远不会自行重启。
+
+详见 [🧾 审计与用量统计](docs/AUDIT.md)、[🖥️ 管理台前端](docs/ADMIN_UI.md)、[⌨️ 命令行管理工具](docs/CONFIG_CLI.md)。
+
+---
+
 ## 📖 详细文档
 
 ### 配置与部署
@@ -403,6 +468,10 @@ modelscope:
 
 ### 高级功能
 
+- [🧾 审计与用量统计](docs/AUDIT.md)
+- [🖥️ 管理台前端](docs/ADMIN_UI.md)
+- [⌨️ 命令行管理工具](docs/CONFIG_CLI.md)
+- [📡 管理接口契约](web/API.md)
 - [📊 监控与运维](docs/MONITORING.md)
 - [⚡ 负载均衡策略](docs/LOAD_BALANCING.md)
 - [🛡️ 错误分类系统](docs/error-classification.md)

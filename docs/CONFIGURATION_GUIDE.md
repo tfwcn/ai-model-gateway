@@ -4,6 +4,11 @@
 
 > 💡 **重要提示：** 本项目支持**任何提供 OpenAI 兼容 API** 的平台。对于有专用插件的平台（ModelScope、NVIDIA、OpenRouter），可以自动获取免费模型列表；对于其他平台，需要手动配置模型信息。
 
+> 📖 **单个字段到底控制什么**（默认值、取值单位、写法示例、改完是热重载还是需要重启、容易踩的坑）
+> 只有一份来源：`openai_proxy/config_store/field_docs.py`，管理台「模型配置」页与
+> `GET /admin/config/schema` 直接展示它（见 [管理台前端](ADMIN_UI.md) 的「字段字典」一节）。
+> 本文讲的是结构、写法与环境变量，不重复逐字段语义。
+
 ## 📋 目录
 
 - [环境变量配置](#环境变量配置)
@@ -11,6 +16,8 @@
 - [插件系统详解](#插件系统详解)
 - [OpenClaw 集成配置](#openclaw-集成配置)
 - [高级配置选项](#高级配置选项)
+  - [审计与用量统计（顶层 `audit:` 段）](#审计与用量统计顶层-audit-段)
+  - [管理接口与管理台](#管理接口与管理台)
 
 ---
 
@@ -230,10 +237,57 @@ monitoring:
   scrape_interval: 30s
 ```
 
+### 审计与用量统计（顶层 `audit:` 段）
+
+每次上游调用都会记一行审计（用量、耗时、首块、tokens/s、故障转移、错误分类），落在 SQLite。
+优先级：**内置默认值 → `AUDIT_*` 环境变量 → `models.yaml` 顶层 `audit:` 段**（YAML 最高）。
+
+```yaml
+audit:
+  enabled: true
+  db_path: "data/audit.db"
+  retention_days: 30          # 启动时自动清理更早的记录；小于 1 的取值会退回默认 30（写不出「永不清理」）
+  queue_size: 10000           # 内存队列容量，满了丢弃最旧行并计数
+  batch_size: 200             # 单次写库的最大行数
+  flush_interval: 2.0         # 后台刷盘间隔（秒）
+  record_failed_only: false   # 只记失败尝试，省磁盘但看不到用量
+  include_request_meta: false # 是否记录消息条数；任何情况下都不记录消息内容
+  prometheus_enabled: true    # 审计落库时同步喂 Prometheus
+  metrics_label_model: false  # ⚠️ 目前真正生效的是环境变量 METRICS_LABEL_MODEL（启动时读）
+```
+
+⚠️ **这一段的每个字段都只在启动时应用一次**：改完 `audit:` 段必须自行重启，进程内热重载不会应用它。
+
+对应环境变量：`AUDIT_ENABLED`、`AUDIT_DB_PATH`、`AUDIT_RETENTION_DAYS`、`AUDIT_QUEUE_SIZE`、
+`AUDIT_BATCH_SIZE`、`AUDIT_FLUSH_INTERVAL`、`AUDIT_RECORD_FAILED_ONLY`、`AUDIT_INCLUDE_REQUEST_META`、
+`AUDIT_PROMETHEUS`、`METRICS_LABEL_MODEL`。
+
+完整说明（统计口径、字段清单、查询方式）见 [审计与用量统计](./AUDIT.md)。
+
+### 管理接口与管理台
+
+`/admin/*` 与 `/metrics` 一律要求 `GATEWAY_API_KEY`；未配置该密钥时管理接口返回 403（默认不对外裸露）。
+
+```env
+GATEWAY_API_KEY=sk-your-secret-key
+
+ADMIN_UI_ENABLED=true        # 管理台前端 /admin/ui（false 则不提供）
+CONFIG_API_ENABLED=true      # 配置读写接口 /admin/config/*（false 则不提供）
+CONFIG_BACKUP_DIR=data/config_backups   # 每次写盘前的自动备份目录
+MODEL_CONFIG_FILE=models.yaml           # 命令行默认读取的配置文件
+```
+
+改配置有三种等价做法：管理台页面、`manage.py` 命令行、直接编辑 `models.yaml`。
+无论哪种都不会自动重启服务：需要重启时只会提示，由你自己动手。
+详见 [管理台前端](./ADMIN_UI.md) 与 [命令行管理工具](./CONFIG_CLI.md)。
+
 ---
 
 ## 相关文档
 
+- [审计与用量统计](./AUDIT.md)
+- [管理台前端](./ADMIN_UI.md)
+- [命令行管理工具](./CONFIG_CLI.md)
 - [监控与运维指南](./MONITORING.md)
 - [负载均衡策略](./LOAD_BALANCING.md)
 - [部署指南](./DEPLOYMENT.md)

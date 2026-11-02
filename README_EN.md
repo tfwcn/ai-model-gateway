@@ -15,7 +15,7 @@
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
-**[Quick Start](#-quick-start)** · **[API Reference](#-api-reference)** · **[Configuration Guide](docs/CONFIGURATION_GUIDE.md)** · **[Monitoring](docs/MONITORING.md)** · **[Contributing](#-contributing)**
+**[Quick Start](#-quick-start)** · **[API Reference](#-api-reference)** · **[Configuration Guide](docs/CONFIGURATION_GUIDE.md)** · **[Monitoring](docs/MONITORING.md)** · **[Observability & Admin](#-observability--administration)** · **[Contributing](#-contributing)**
 
 ---
 
@@ -57,6 +57,8 @@ Are you facing these issues?
 | **SSE Normalization**          | Unified SSE event format, eliminating duplicate code across endpoints            |
 | **Error Classification**       | 7 error types (timeout/connection/auth/rate-limit/server/format/model)           |
 | **SKIP_PLUGIN_SCRAPER**        | Skip plugin scraper and use cached models, ideal for offline environments        |
+| **Usage & Performance Audit**  | One row per upstream attempt: success rate, P95, TTFT, tokens/s, failover chain  |
+| **Admin UI & CLI**             | `/admin/ui/` web page and `manage.py` both read audits and edit model config     |
 | **Docker One-click Deploy**    | Built-in Redis, Playwright, ready-to-run containerized deployment                |
 
 ### 📊 Comparison with Traditional Solutions
@@ -151,7 +153,11 @@ curl http://localhost:8000/v1/responses \
 | `/v1/models`           | GET    | List models with filtering/pagination (auth required) |
 | `/health`              | GET    | Basic health check (no auth)                          |
 | `/health/detailed`     | GET    | Detailed health check                                 |
-| `/metrics`             | GET    | Prometheus metrics                                    |
+| `/metrics`             | GET    | Prometheus metrics (admin key required)               |
+| `/admin/usage/*`       | GET    | Usage & performance aggregates (admin key required)   |
+| `/admin/audit*`        | GET    | Audit details and failover chains (admin key required)|
+| `/admin/config/*`      | GET/POST | Config read, dry-run plan, apply, rollback          |
+| `/admin/ui/`           | GET    | Admin UI shell (no key needed; its data calls do)     |
 
 ### Model Selection
 
@@ -242,6 +248,20 @@ REDIS_URL=redis://localhost:6379       # Optional Redis
 # DEBUG=true                           # Enable DEBUG level logs (default INFO)
 # ENABLE_CONSOLE_LOGS=false            # Disable console output (default true)
 # LOG_DIR=logs                         # Log directory (default logs/)
+
+# Usage & performance audit (one row per upstream attempt, stored in SQLite)
+# Priority: built-in defaults < AUDIT_* here < top-level `audit:` section in models.yaml
+# AUDIT_ENABLED=true                   # Master switch; when off the forwarding hot path costs nothing
+# AUDIT_DB_PATH=data/audit.db          # Audit database path
+# AUDIT_RETENTION_DAYS=30              # Older records are pruned at startup, 0 disables pruning
+# AUDIT_RECORD_FAILED_ONLY=false       # Log failures only (saves disk, loses usage stats)
+# AUDIT_PROMETHEUS=true                # Feed Prometheus while writing audit rows
+
+# Admin endpoints and admin UI (/admin/* and /metrics both require GATEWAY_API_KEY)
+# ADMIN_UI_ENABLED=true                # Serve /admin/ui, false returns 404
+# CONFIG_API_ENABLED=true              # Expose /admin/config/*, false does not mount them
+# CONFIG_BACKUP_DIR=data/config_backups   # Automatic backup directory used before every write
+# MODEL_CONFIG_FILE=models.yaml        # Config file the CLI reads by default
 ```
 
 ### Platform Config Example
@@ -274,12 +294,61 @@ See [📖 Configuration Guide](docs/CONFIGURATION_GUIDE.md) for details.
 
 ---
 
+## 📊 Observability & Administration
+
+Every upstream attempt is recorded as one audit row (default database: `data/audit.db`), which answers
+"who was used how much, where is it slow, why did it fail".
+
+Accounting rules: **one client request = one `gateway_request_id`, one upstream attempt = one row**, so a full
+failover chain can be reconstructed. Success rate only counts finalized attempts (`finalized=1`); a stream that is
+still being forwarded is recorded as `stream_open` and stays out of the denominator.
+
+### Admin UI
+
+```text
+http://localhost:8000/admin/ui/     # open it, then enter GATEWAY_API_KEY to connect
+```
+
+Four tabs: usage & performance, audit details, model config, backups & rollback. Pure static pages (no build step,
+no external dependencies). The key lives only in browser `sessionStorage`, and **key values are never sent to the
+browser**: the config view only shows which environment variable a key references and whether it is set.
+
+### Command line
+
+```bash
+# Usage and performance
+python manage.py usage summary --group-by model --since 7d
+python manage.py usage models --sort p95              # slowest models
+python manage.py usage attempts --outcome failure     # failed attempts only
+python manage.py usage chain <gateway_request_id>     # reconstruct the failover chain
+
+# Read and edit config (always backed up before writing; --dry-run shows the diff first)
+python manage.py config document
+python manage.py platform set example-platform --field weight --value 5 --dry-run
+python manage.py model set example-platform model-a --field first_chunk_timeout --value 45
+python manage.py config backups
+python manage.py config rollback models.yaml.20260101T000000Z.bak
+```
+
+There are three equivalent ways to change config: the admin UI, `manage.py`, or editing `models.yaml` directly.
+After the last two, call `POST /admin/config/reload` (with `GATEWAY_API_KEY`) to apply changes in-process.
+Changes that add/remove a platform or alter `plugin` structure **require you to restart the service yourself** —
+the gateway never restarts itself.
+
+See [🧾 Audit & Usage Stats](docs/AUDIT.md), [🖥️ Admin UI](docs/ADMIN_UI.md), [⌨️ CLI Tool](docs/CONFIG_CLI.md).
+
+---
+
 ## 📖 Documentation
 
 - [🔧 Configuration Guide](docs/CONFIGURATION_GUIDE.md)
 - [🐳 Docker Deployment](docs/DEPLOYMENT.md)
 - [🚨 Security](docs/SECURITY.md)
 - [📋 Roadmap](docs/ROADMAP.md)
+- [🧾 Audit & Usage Stats](docs/AUDIT.md)
+- [🖥️ Admin UI](docs/ADMIN_UI.md)
+- [⌨️ CLI Tool](docs/CONFIG_CLI.md)
+- [📡 Admin API Contract](web/API.md)
 - [📊 Monitoring](docs/MONITORING.md)
 - [⚡ Load Balancing](docs/LOAD_BALANCING.md)
 - [🛡️ Error Classification](docs/error-classification.md)

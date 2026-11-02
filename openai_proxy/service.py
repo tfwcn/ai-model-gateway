@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from openai_proxy.admin_ui import AdminUiStatic
 from openai_proxy.core.cache import MemoryCache
 from openai_proxy.models import ModelConfig, list_available_models
 from openai_proxy.core.config_loader import ConfigLoader
@@ -16,14 +17,43 @@ from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
 from openai_proxy.utils.sse_parser import SSEEventParser
-from openai_proxy.utils.keepalive import KeepAliveStream, UpstreamStartHeartbeat
+from openai_proxy.utils.keepalive import KeepAliveStream, UpstreamStartHeartbeat, HeartbeatCounter
 from openai_proxy.utils.logger import sanitize_payload
 from openai_proxy.utils.stream_metrics import StreamPerformanceMonitor
+from openai_proxy.utils.stream_terminator import StreamTerminator, is_done_event
+from openai_proxy.audit import AuditContext, AuditManager, load_metrics_collector
+from openai_proxy.audit.routes import build_audit_router
+from openai_proxy.config_store.routes import build_config_router
+from openai_proxy.config_store.service import ConfigCommandService
 
 logger = logging.getLogger(__name__)
 
 
-async def _forward_normalized_sse(upstream_stream):
+async def _finish_stream_audit(audit_ctx: Optional[AuditContext], monitor: StreamPerformanceMonitor, completed: bool,
+                               keepalive: Any = None, done_sent: bool = False) -> None:
+    """
+    收尾一次流式调用的审计（绝不外抛异常，否则破坏响应收尾）
+
+    completed=False 说明转发循环没有正常走完（通常是客户端关闭连接）；
+    done_sent=True 说明 [DONE] 已经转发给客户端，内容其实已经发完，
+    此时即使连接被关也不算「客户端中断」，结局仍记 success。
+    """
+    if audit_ctx is None:
+        return
+    try:
+        stats = monitor.finish()
+        # 心跳计数对象可能是 HeartbeatCounter（共享）或带 heartbeat_count 的包裹层
+        heartbeat_count = getattr(keepalive, "count", None)
+        if heartbeat_count is None:
+            heartbeat_count = getattr(keepalive, "heartbeat_count", 0)
+        if heartbeat_count:
+            audit_ctx.record_keepalive(int(heartbeat_count))
+        audit_ctx.finalize_last(stats, aborted=not completed, done_sent=done_sent)
+    except Exception as e:  # noqa: BLE001 - 审计收尾不得影响响应
+        logger.debug(f"流式审计收尾失败: {e}")
+
+
+async def _forward_normalized_sse(upstream_stream, audit_ctx: Optional[AuditContext] = None, keepalive: Any = None):
     """
     标准化 SSE 流转发（公共逻辑）
 
@@ -31,12 +61,20 @@ async def _forward_normalized_sse(upstream_stream):
     消除 /v1/chat/completions 与 /v1/responses 间的重复代码。
 
     同时埋点：统计首块耗时、总耗时与输出 token，输出 tokens/s。
+
+    转发节奏由 StreamTerminator 控制：[DONE] 一发出去就认定内容已发完，
+    只再用一个很短的收尾窗口等可能跟在后面的 usage 尾片，不再死等上游结束响应体。
     """
     parser = SSEEventParser(normalize=True)
     monitor = StreamPerformanceMonitor.from_stream(upstream_stream)
-    done_sent = False
+    terminator = StreamTerminator(upstream_stream)
+    completed = False
     try:
-        async for chunk in upstream_stream:
+        while True:
+            chunk = await terminator.next_chunk()
+            if chunk is None:
+                # 上游真的结束，或收尾窗口到期：两种情况都算转发走完
+                break
             if not chunk:
                 continue
             try:
@@ -45,21 +83,27 @@ async def _forward_normalized_sse(upstream_stream):
                     if not event.strip():
                         continue
                     monitor.observe(event)
+                    # 先标记再交出：客户端很可能收到 [DONE] 就关连接去执行工具，
+                    # 这时 [DONE] 已经算发出去了，不能再把这次关闭记成中断
+                    if is_done_event(event):
+                        terminator.mark_done()
                     yield (event + "\n\n").encode("utf-8")
-                    if "[DONE]" in event:
-                        done_sent = True
             except Exception as e:
                 logger.error(f"SSE normalization error: {e}", exc_info=True)
                 yield chunk  # 降级：透传原始 chunk
-        if not done_sent:
+        if not terminator.done_seen:
             logger.info("Upstream did not send [DONE], appending termination marker")
+            terminator.mark_done()
             yield b"data: [DONE]\n\n"
+        completed = True
     finally:
-        # 客户端提前断开时也会走到这里，落一条不完整的统计便于排查
-        monitor.finish()
+        # 客户端提前断开时也会走到这里：先释放上游，再落一条统计便于排查
+        await terminator.release()
+        await _finish_stream_audit(audit_ctx, monitor, completed, keepalive, terminator.done_seen)
 
 
-async def _convert_responses_sse(upstream_stream, adapter, stream_context):
+async def _convert_responses_sse(upstream_stream, adapter, stream_context,
+                                audit_ctx: Optional[AuditContext] = None, keepalive: Any = None):
     """
     Responses API 专用：标准化 + Chat→Responses 协议转换。
 
@@ -68,14 +112,20 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
     context_token = adapter.activate_context(stream_context)
     parser = SSEEventParser(normalize=True)
     monitor = StreamPerformanceMonitor.from_stream(upstream_stream)
+    terminator = StreamTerminator(upstream_stream)
     chunk_count = 0
+    completed = False
     try:
         # 流刚开始即下发打开事件（queued/created/in_progress），消除首 token 前的静默
         opening = adapter.build_stream_open_events()
         if opening:
             yield opening.encode("utf-8")
 
-        async for chunk in upstream_stream:
+        while True:
+            chunk = await terminator.next_chunk()
+            if chunk is None:
+                # 上游真的结束，或 [DONE] 后的收尾窗口到期：都算转发走完
+                break
             chunk_count += 1
             if not chunk:
                 continue
@@ -85,6 +135,9 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
                     if not event.strip():
                         continue
                     monitor.observe(event)
+                    # 终止标记要在交给适配器改写之前识别（改写后事件已被拆成多条）
+                    if is_done_event(event):
+                        terminator.mark_done()
                     for line in event.split("\n"):
                         stripped = line.strip()
                         if stripped.lower().startswith("data:"):
@@ -98,8 +151,14 @@ async def _convert_responses_sse(upstream_stream, adapter, stream_context):
                     logger.error(f"Problematic chunk preview: {chunk[:200]}")
                 except Exception:
                     pass
+        # 循环正常走完：Responses 链路总会把终止事件交给客户端
+        # （上游的 [DONE]，或上层在流尾补发的 response.completed + [DONE]）
+        terminator.mark_done()
+        completed = True
     finally:
-        monitor.finish()
+        # 客户端提前断开时也会走到这里：先释放上游，再落审计
+        await terminator.release()
+        await _finish_stream_audit(audit_ctx, monitor, completed, keepalive, terminator.done_seen)
         adapter.reset_context(context_token)
 
 
@@ -117,6 +176,38 @@ class OpenAIProxyService:
         cache_ttl = int(os.getenv("MODELS_API_CACHE_TTL", "300"))
         self.model_list_cache = MemoryCache(default_ttl=cache_ttl)
 
+        # 审计与用量统计：库与后台刷盘任务在 initialize() 里打开
+        self.audit = AuditManager(metrics=load_metrics_collector())
+        # 插件结构快照：reload 时据此判断「进程内无法生效，需要重启」
+        self._platform_snapshot: Dict[str, Any] = {}
+        # 主事件循环：配置接口在工作线程里触发热重载时需要把协程投回这个循环
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        # 配置编辑服务：接口与 CLI 共用同一套补丁
+        self._config_service: Optional[ConfigCommandService] = None
+
+    def build_config_service(self) -> ConfigCommandService:
+        """
+        配置编辑服务（懒创建）
+
+        写盘成功后尝试进程内热重载；插件/爬虫结构变化会标记 needs_restart，
+        由用户自行重启（服务不会自行重启）。
+        """
+        if self._config_service is None:
+            self._config_service = ConfigCommandService(
+                config_file=self.config_loader.config_file,
+                backup_dir=os.getenv("CONFIG_BACKUP_DIR", "data/config_backups"),
+                reload_callback=self._reload_models_blocking,
+                audit_recorder=lambda op, detail="", success=True: self.audit.record_config_change(op, detail, success),
+            )
+        return self._config_service
+
+    def _reload_models_blocking(self) -> Dict[str, Any]:
+        """在工作线程里同步等待进程内重载完成（协程必须回到它自己的事件循环执行）"""
+        if self._main_loop is None or self._main_loop.is_closed():
+            return {"reloaded": False, "needs_restart": True, "message": "服务未启动，配置将在下次启动时生效"}
+        future = asyncio.run_coroutine_threadsafe(self.reload_models(), self._main_loop)
+        return future.result(timeout=120)
+
     async def initialize(self):
         """异步初始化服务
 
@@ -131,6 +222,9 @@ class OpenAIProxyService:
         """
         # 检查是否跳过插件爬虫
         skip_scraper = os.getenv("SKIP_PLUGIN_SCRAPER", "false").lower() == "true"
+
+        # 记录主事件循环：配置接口在工作线程里触发热重载时要投回这个循环
+        self._main_loop = asyncio.get_running_loop()
 
         if skip_scraper:
             logger.info("=" * 60)
@@ -160,6 +254,10 @@ class OpenAIProxyService:
         # 第五步：初始化 Responses API 适配器和会话存储
         self.session_store = DualModeSessionStore()
         self.responses_adapter = ResponsesAdapter(session_store=self.session_store)
+
+        # 第六步：打开审计（配置来自 models.yaml 顶层 audit: 段）
+        self.audit.apply_yaml(self.config_loader.audit_config)
+        await self.audit.start()
 
     async def _start_plugin_schedulers_for_platforms(self, platforms: Dict[str, Any]):
         """
@@ -231,6 +329,41 @@ class OpenAIProxyService:
             await self.failover_manager.close()
         if self.session_store:
             await self.session_store.close()
+        # 排空审计缓冲并关闭库
+        await self.audit.close()
+
+    async def reload_models(self) -> Dict[str, Any]:
+        """
+        进程内重载模型配置：只重建模型表与别名，不重启插件调度器
+
+        aiohttp 会话与进行中的流保持不变（流各自持有已取出的对象），
+        因此模型级/平台级参数立即生效；插件结构（爬虫参数）变化需要用户自行重启。
+
+        Returns:
+            {"reloaded": bool, "needs_restart": bool, "message": str}
+        """
+        try:
+            platforms = await self.config_loader.load_platforms_only()
+            snapshot = {
+                name: (cfg.get("plugin") if isinstance(cfg, dict) else None)
+                for name, cfg in platforms.items()
+            }
+            needs_restart = bool(self._platform_snapshot) and snapshot != self._platform_snapshot
+            self._platform_snapshot = snapshot
+
+            self.models = await self.config_loader.load_config()
+            # 复用同一个故障转移管理器（保住 aiohttp 会话），只替换模型表
+            self.failover_manager.models = self.models
+            self.failover_manager.all_aliases = self.config_loader.all_aliases
+
+            await self.model_list_cache.clear()
+
+            message = "模型配置已重载" + ("；插件结构有变化，重启服务后完全生效" if needs_restart else "")
+            logger.info(message)
+            return {"reloaded": True, "needs_restart": needs_restart, "message": message}
+        except Exception as exc:  # noqa: BLE001 - 重载失败时保留旧配置继续服务
+            logger.error(f"重载模型配置失败，继续使用旧配置: {exc}", exc_info=True)
+            return {"reloaded": False, "needs_restart": True, "message": f"重载失败: {exc}"}
 
     async def _stop_plugin_schedulers(self):
         """停止所有插件的定时任务调度器"""
@@ -249,6 +382,25 @@ class OpenAIProxyService:
                         logger.error(f"✗ 停止平台 [{platform_name}] 的插件调度器失败: {e}")
         except Exception as e:
             logger.error(f"停止插件调度器时出错: {e}")
+
+    def _mount_admin_ui(self, app: FastAPI) -> None:
+        """挂载管理台前端（纯静态文件，不需要构建步骤）
+
+        前端只是 /admin/* 接口的另一个客户端：静态壳本身不含任何敏感数据，
+        因此允许无密钥加载；它拿到的数据仍然一律要求 GATEWAY_API_KEY。
+        只暴露转发接口的部署可以用 ADMIN_UI_ENABLED=false 整体关闭。
+        """
+        if os.getenv("ADMIN_UI_ENABLED", "true").strip().lower() != "true":
+            logger.info("管理台前端已关闭（ADMIN_UI_ENABLED=false）")
+            return
+
+        web_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))
+        if not os.path.isdir(web_dir):
+            logger.warning(f"管理台前端目录不存在，已跳过挂载: {web_dir}")
+            return
+
+        app.mount("/admin/ui", AdminUiStatic(html=True, directory=web_dir))
+        logger.info(f"管理台前端已挂载: /admin/ui -> {web_dir}")
 
     def create_app(self) -> FastAPI:
         """创建FastAPI应用"""
@@ -272,10 +424,28 @@ class OpenAIProxyService:
         app = FastAPI(title="AI Model Gateway", version="1.0.0", lifespan=lifespan)
 
         gateway_api_key = os.getenv("GATEWAY_API_KEY", "")
+        # 管理端路径：审计与配置接口。未配置 GATEWAY_API_KEY 时一律拒绝，避免用量与配置对外裸露
+        ADMIN_PATHS = ("/admin", "/metrics")
+        # 前端静态壳不含敏感数据，允许无鉴权加载（数据接口仍需密钥）
+        UI_PATH = "/admin/ui"
+
+        def _is_ui_asset(path: str) -> bool:
+            return path == UI_PATH or path.startswith(UI_PATH + "/")
 
         @app.middleware("http")
         async def auth_middleware(request: Request, call_next):
-            if gateway_api_key and request.url.path != "/health":
+            path = request.url.path
+            if _is_ui_asset(path):
+                return await call_next(request)
+
+            is_admin = path.startswith(ADMIN_PATHS)
+            if is_admin and not gateway_api_key:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {"message": "管理接口需要配置 GATEWAY_API_KEY", "type": "auth_error", "code": "admin_disabled"}}
+                )
+
+            if gateway_api_key and path != "/health":
                 auth_header = request.headers.get("Authorization", "")
                 if not auth_header.startswith("Bearer ") or auth_header[7:] != gateway_api_key:
                     return JSONResponse(
@@ -283,6 +453,15 @@ class OpenAIProxyService:
                         content={"error": {"message": "Invalid or missing API key", "type": "auth_error", "code": "unauthorized"}}
                     )
             return await call_next(request)
+
+        # 审计与用量接口
+        app.include_router(build_audit_router(lambda: self.audit))
+
+        # 配置管理接口（可用 CONFIG_API_ENABLED=false 整体关闭）
+        if os.getenv("CONFIG_API_ENABLED", "true").lower() == "true":
+            app.include_router(build_config_router(self.build_config_service, lambda: self.models))
+
+        self._mount_admin_ui(app)
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
@@ -307,22 +486,36 @@ class OpenAIProxyService:
 
                 raise HTTPException(status_code=400, detail="messages参数是必需的")
 
-            if request_data.get("stream", False):
+            # 审计上下文：贯穿整条故障转移链
+            is_stream = bool(request_data.get("stream", False))
+            audit_ctx = self.audit.new_context(
+                endpoint="chat_completions",
+                selector=str(request_data.get("model", "all")),
+                stream=is_stream,
+                msg_count=len(request_data.get("messages") or []),
+            )
+
+            if is_stream:
                 # 流式响应处理
                 async def stream_generator():
+                    # 心跳计数：等待上游流对象阶段 + 上游首 token 静默阶段共用一个计数器
+                    heartbeat = HeartbeatCounter()
                     try:
                         # 等待上游返回流对象的静默期（连接建立/上游排队/首块等待）同样下发心跳，
                         # 否则客户端在这段时间收不到任何字节，无法区分「仍在处理」与「已卡死」
                         waiter = UpstreamStartHeartbeat(
-                            self.failover_manager.chat_completion_stream(request_data)
+                            self.failover_manager.chat_completion_stream(request_data, audit_ctx),
+                            counter=heartbeat,
                         )
                         async for data in waiter:
                             yield data
+                        audit_ctx.record_keepalive(heartbeat.count)
                         result = waiter.result
                         if hasattr(result, '__aiter__'):
                             logger.info("SSE normalization enabled for /v1/chat/completions")
                             # 包裹心跳：上游首 token 前静默期下发 SSE 注释，避免客户端等待空白
-                            async for data in KeepAliveStream(_forward_normalized_sse(result)):
+                            forwarder = _forward_normalized_sse(result, audit_ctx, heartbeat)
+                            async for data in KeepAliveStream(forwarder, counter=heartbeat):
                                 yield data
                         else:
                             # 如果返回的是普通响应但请求是流式的，转换为流式格式
@@ -360,7 +553,7 @@ class OpenAIProxyService:
             else:
                 # 普通响应
 
-                result = await self.failover_manager.chat_completion_non_stream(request_data)
+                result = await self.failover_manager.chat_completion_non_stream(request_data, audit_ctx)
 
                 return result
 
@@ -386,7 +579,15 @@ class OpenAIProxyService:
             logger.debug(json.dumps(sanitize_payload(chat_payload), indent=2, ensure_ascii=False))
             logger.debug("=" * 80)
 
-            is_stream = chat_payload.get("stream", False)
+            is_stream = bool(chat_payload.get("stream", False))
+
+            # 审计上下文：/v1/responses 走的是同一套 failover，endpoint 区分开便于统计
+            audit_ctx = self.audit.new_context(
+                endpoint="responses",
+                selector=str(chat_payload.get("model", "all")),
+                stream=is_stream,
+                msg_count=len(chat_payload.get("messages") or []),
+            )
 
             # StreamingResponse 会在独立协程中迭代生成器，必须显式保留本请求的上下文。
             stream_context = self.responses_adapter.context
@@ -394,18 +595,22 @@ class OpenAIProxyService:
             if is_stream:
                 async def stream_generator():
                     context_token = self.responses_adapter.activate_context(stream_context)
+                    heartbeat = HeartbeatCounter()
                     try:
                         # 同 /v1/chat/completions：等待上游流对象的静默期也要下发心跳
                         waiter = UpstreamStartHeartbeat(
-                            self.failover_manager.chat_completion_stream(chat_payload)
+                            self.failover_manager.chat_completion_stream(chat_payload, audit_ctx),
+                            counter=heartbeat,
                         )
                         async for data in waiter:
                             yield data
+                        audit_ctx.record_keepalive(heartbeat.count)
                         upstream_stream = waiter.result
                         # 包裹心跳：思考阶段/首 token 前静默期下发 SSE 注释
-                        async for data in KeepAliveStream(
-                            _convert_responses_sse(upstream_stream, self.responses_adapter, stream_context)
-                        ):
+                        forwarder = _convert_responses_sse(
+                            upstream_stream, self.responses_adapter, stream_context, audit_ctx, heartbeat
+                        )
+                        async for data in KeepAliveStream(forwarder, counter=heartbeat):
                             yield data
                         # 上游流结束,检查是否已发出完成事件（ModelScope 等不发 [DONE] 的上游）
                         if not self.responses_adapter.context.has_received_done:
@@ -422,7 +627,7 @@ class OpenAIProxyService:
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:
                 # 非流式处理逻辑
-                chat_response = await self.failover_manager.chat_completion_non_stream(chat_payload)
+                chat_response = await self.failover_manager.chat_completion_non_stream(chat_payload, audit_ctx)
 
                 logger.debug("=" * 80)
                 logger.debug("📤 [UPSTREAM RESPONSE] Chat Completions Response:")

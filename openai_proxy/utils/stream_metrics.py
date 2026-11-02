@@ -88,9 +88,11 @@ def _delta_text_length(payload: Dict[str, Any]) -> int:
 class StreamPerformanceMonitor:
     """单次模型调用的性能埋点：首块耗时、总耗时、token 用量与输出速度"""
 
-    def __init__(self, model_name: str = "unknown", request_id: str = "", started_at: Optional[float] = None):
+    def __init__(self, model_name: str = "unknown", request_id: str = "", started_at: Optional[float] = None,
+                 attempt_key: str = ""):
         self.model_name = model_name
         self.request_id = request_id
+        self.attempt_key = attempt_key
         self.started_at = started_at if started_at is not None else time.time()
         self.first_chunk_at: Optional[float] = None
         self.upstream_id = ""
@@ -107,6 +109,7 @@ class StreamPerformanceMonitor:
             model_name=getattr(upstream_stream, "model_name", "unknown"),
             request_id=getattr(upstream_stream, "request_id", ""),
             started_at=getattr(upstream_stream, "started_at", None),
+            attempt_key=getattr(upstream_stream, "attempt_key", ""),
         )
 
     def observe(self, event: str) -> None:
@@ -146,6 +149,7 @@ class StreamPerformanceMonitor:
             stats = {
                 "model": self.model_name,
                 "request_id": self.request_id,
+                "attempt_key": self.attempt_key,
                 "upstream_id": self.upstream_id,
                 "has_usage": self.has_usage,
                 "ttft": ttft,
@@ -252,3 +256,25 @@ def report_non_stream_usage(model_name: str, started_at: float, response: Any, r
     monitor = StreamPerformanceMonitor(model_name=model_name, request_id=request_id, started_at=started_at)
     monitor.record_response(response)
     return monitor.finish()
+
+
+def summarize_response(response: Any) -> Dict[str, Any]:
+    """
+    从非流式响应体提取统计（不写日志）
+
+    供审计层复用同一套 usage 字段兼容逻辑，避免两处各写一份字段名映射。
+    """
+    monitor = StreamPerformanceMonitor(model_name="unknown", started_at=time.time())
+    monitor.record_response(response)
+    finished_at = time.time()
+    return {
+        "has_usage": monitor.has_usage,
+        "ttft": None,
+        "total": finished_at - monitor.started_at,
+        "input_tokens": monitor.input_tokens,
+        "cached_tokens": monitor.cached_tokens,
+        "output_tokens": monitor.output_tokens,
+        "output_chars": monitor.output_chars,
+        "throughput": monitor._ratio(monitor.output_tokens, finished_at - monitor.started_at),
+        "upstream_id": monitor.upstream_id,
+    }

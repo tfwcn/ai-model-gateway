@@ -20,6 +20,9 @@ from openai_proxy.utils.streaming_tool_call_buffer import StreamingToolCallBuffe
 from openai_proxy.utils.sse_parser import SSEEventParser
 from openai_proxy.utils.stream_metrics import report_non_stream_usage
 
+# 仅用于类型标注：审计上下文由服务层创建并向下透传，failover 只负责在调用点落一条 attempt
+from openai_proxy.audit.context import AuditContext
+
 logger = logging.getLogger(__name__)
 
 # 读取首块数据的硬超时（秒）：上游已回响应头但迟迟不给首块的兜底
@@ -667,6 +670,7 @@ class ModelFailoverManager:
         model_config: ModelConfig,
         request_data: Dict[str, Any],
         is_stream: bool,
+        audit_ctx: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
         max_retries = model_config.retry_count
         """
@@ -676,6 +680,7 @@ class ModelFailoverManager:
             model_config: 模型配置
             request_data: 请求数据
             is_stream: 是否为流式调用
+            audit_ctx: 审计上下文（None 时不落审计）
             max_retries: 最大重试次数，默认3次
 
         Returns:
@@ -683,9 +688,15 @@ class ModelFailoverManager:
         """
         for attempt in range(1, max_retries + 1):
             if is_stream:
-                success, result = await self.call_model_stream(model_config, request_data)
+                call = self.call_model_stream(model_config, request_data)
             else:
-                success, result = await self.call_model_non_stream(model_config, request_data)
+                call = self.call_model_non_stream(model_config, request_data)
+
+            # 审计包一层：每次重试落一条 attempt，结论由返回值决定
+            if audit_ctx is not None:
+                success, result = await audit_ctx.run_attempt(model_config, call, retry_seq=attempt)
+            else:
+                success, result = await call
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（{'流式' if is_stream else '非流式'}）")
@@ -736,7 +747,9 @@ class ModelFailoverManager:
         logger.error(f"模型 {model_config.name} 在 {max_retries} 次尝试后仍失败: {last_error}")
         return {"success": False, "error": last_error, "data": None}
 
-    async def _try_platform_models_non_stream(self, platform_name: str, platform_models: List[ModelConfig], request_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _try_platform_models_non_stream(self, platform_name: str, platform_models: List[ModelConfig],
+                                              request_data: Dict[str, Any],
+                                              audit_ctx: Optional[AuditContext] = None) -> Dict[str, Any]:
         """尝试平台内的模型（非流式），支持轮询机制"""
         # 过滤启用且当前周期内可用的模型
         available_models = []
@@ -754,7 +767,11 @@ class ModelFailoverManager:
         # 按顺序尝试每个模型
         for i, model_config in enumerate(models_to_try):
 
-            success, result = await self.call_model_non_stream(model_config, request_data)
+            call = self.call_model_non_stream(model_config, request_data)
+            if audit_ctx is not None:
+                success, result = await audit_ctx.run_attempt(model_config, call)
+            else:
+                success, result = await call
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（非流式）")
@@ -800,7 +817,9 @@ class ModelFailoverManager:
 
         return {"success": False, "error": "未知错误", "data": None}
 
-    async def _try_platform_models_stream(self, platform_name: str, platform_models: List[ModelConfig], request_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _try_platform_models_stream(self, platform_name: str, platform_models: List[ModelConfig],
+                                          request_data: Dict[str, Any],
+                                          audit_ctx: Optional[AuditContext] = None) -> Dict[str, Any]:
         """尝试平台内的模型（流式），支持轮询机制"""
         # 过滤启用且当前周期内可用的模型
         available_models = []
@@ -818,7 +837,11 @@ class ModelFailoverManager:
         # 按顺序尝试每个模型
         for i, model_config in enumerate(models_to_try):
 
-            success, result = await self.call_model_stream(model_config, request_data)
+            call = self.call_model_stream(model_config, request_data)
+            if audit_ctx is not None:
+                success, result = await audit_ctx.run_attempt(model_config, call)
+            else:
+                success, result = await call
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（流式）")
@@ -907,7 +930,8 @@ class ModelFailoverManager:
 
         return result
 
-    async def _try_platforms_by_weight(self, platforms: Dict[str, List[ModelConfig]], request_data: Dict[str, Any], is_stream: bool) -> Dict[str, Any]:
+    async def _try_platforms_by_weight(self, platforms: Dict[str, List[ModelConfig]], request_data: Dict[str, Any],
+                                       is_stream: bool, audit_ctx: Optional[AuditContext] = None) -> Dict[str, Any]:
         """按权重降序尝试各平台的模型
 
         Args:
@@ -933,16 +957,17 @@ class ModelFailoverManager:
         last_error = None
         for platform_name in platforms_to_try:
             if is_stream:
-                result = await self._try_platform_models_stream(platform_name, platforms[platform_name], request_data)
+                result = await self._try_platform_models_stream(platform_name, platforms[platform_name], request_data, audit_ctx)
             else:
-                result = await self._try_platform_models_non_stream(platform_name, platforms[platform_name], request_data)
+                result = await self._try_platform_models_non_stream(platform_name, platforms[platform_name], request_data, audit_ctx)
             if result["success"]:
                 return result
             last_error = result["error"]
 
         return {"success": False, "error": last_error, "data": None}
 
-    async def chat_completion_non_stream(self, request_data: Dict[str, Any]) -> Any:
+    async def chat_completion_non_stream(self, request_data: Dict[str, Any],
+                                         audit_ctx: Optional[AuditContext] = None) -> Any:
         """
         执行非流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
@@ -970,7 +995,7 @@ class ModelFailoverManager:
             if not platforms:
                 raise HTTPException(status_code=400, detail=f"别名 '{model_selector}' 未匹配到任何模型")
 
-            result = await self._try_platforms_by_weight(platforms, request_data, is_stream=False)
+            result = await self._try_platforms_by_weight(platforms, request_data, is_stream=False, audit_ctx=audit_ctx)
             if result["success"]:
                 return result["data"]
             raise HTTPException(status_code=500, detail=f"别名 '{model_selector}' 所有模型都不可用: {result['error']}")
@@ -1002,7 +1027,7 @@ class ModelFailoverManager:
             last_error = None
             for platform_name in platforms_to_try:
                 platform_models = self.models[platform_name]
-                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data)
+                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data, audit_ctx)
                 if result["success"]:
                     return result["data"]
                 else:
@@ -1020,7 +1045,7 @@ class ModelFailoverManager:
             if model_name is None:
                 # 模式2: {platform} - 指定平台的所有模型
                 platform_models = self.models[platform_name]
-                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data)
+                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data, audit_ctx)
                 if result["success"]:
                     return result["data"]
                 else:
@@ -1041,7 +1066,7 @@ class ModelFailoverManager:
 
                 # 模式3: 指定单个模型，使用带重试的方法调用
                 retry_result = await self._try_single_model_with_retry(
-                    target_model, request_data, is_stream=False
+                    target_model, request_data, is_stream=False, audit_ctx=audit_ctx
                 )
                 if retry_result["success"]:
                     logger.info(f"模型 {target_model.name} 调用成功（非流式）")
@@ -1051,7 +1076,8 @@ class ModelFailoverManager:
                     logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
                     raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
 
-    async def chat_completion_stream(self, request_data: Dict[str, Any]) -> Any:
+    async def chat_completion_stream(self, request_data: Dict[str, Any],
+                                     audit_ctx: Optional[AuditContext] = None) -> Any:
         """
         执行流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
@@ -1080,7 +1106,7 @@ class ModelFailoverManager:
             if not platforms:
                 raise HTTPException(status_code=400, detail=f"别名 '{model_selector}' 未匹配到任何模型")
 
-            result = await self._try_platforms_by_weight(platforms, request_data, is_stream=True)
+            result = await self._try_platforms_by_weight(platforms, request_data, is_stream=True, audit_ctx=audit_ctx)
             if result["success"]:
                 return result["data"]
             raise HTTPException(status_code=500, detail=f"别名 '{model_selector}' 所有模型都不可用: {result['error']}")
@@ -1112,7 +1138,7 @@ class ModelFailoverManager:
             last_error = None
             for platform_name in platforms_to_try:
                 platform_models = self.models[platform_name]
-                result = await self._try_platform_models_stream(platform_name, platform_models, request_data)
+                result = await self._try_platform_models_stream(platform_name, platform_models, request_data, audit_ctx)
                 if result["success"]:
                     return result["data"]
                 else:
@@ -1130,7 +1156,7 @@ class ModelFailoverManager:
             if model_name is None:
                 # 模式2: {platform} - 指定平台的所有模型
                 platform_models = self.models[platform_name]
-                result = await self._try_platform_models_stream(platform_name, platform_models, request_data)
+                result = await self._try_platform_models_stream(platform_name, platform_models, request_data, audit_ctx)
                 if result["success"]:
                     return result["data"]
                 else:
@@ -1151,7 +1177,7 @@ class ModelFailoverManager:
 
                 # 模式3: 指定单个模型，使用带重试的方法调用
                 retry_result = await self._try_single_model_with_retry(
-                    target_model, request_data, is_stream=True
+                    target_model, request_data, is_stream=True, audit_ctx=audit_ctx
                 )
                 if retry_result["success"]:
                     logger.info(f"模型 {target_model.name} 调用成功（流式）")

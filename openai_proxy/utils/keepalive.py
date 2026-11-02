@@ -22,6 +22,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_INTERVAL = float(os.getenv("SSE_KEEPALIVE_INTERVAL", "1.0"))
 
 
+class HeartbeatCounter:
+    """
+    心跳计数容器
+
+    心跳包裹层在外部，审计收尾在内部生成器的 finally 里；
+    共享同一个计数对象才能让转发器收尾时读到当时的心跳次数。
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def increment(self) -> None:
+        self.count += 1
+
+
 class KeepAliveStream:
     """
     把任意异步字节流包裹为"空闲即发心跳"的流。
@@ -29,6 +44,8 @@ class KeepAliveStream:
     职责单一：只负责在源流静默期插入注释行，不解析、不改写任何业务数据。
     通过后台任务把源流泵入队列，主循环带超时地从队列取值，
     从而在等待源流的同一事件循环内插入心跳，避免阻塞。
+
+    心跳次数记录在 heartbeat_count（以及可选的共享 counter）上，供审计统计上游静默时长。
     """
 
     # SSE 注释行，以冒号开头，标准客户端解析时忽略
@@ -36,14 +53,25 @@ class KeepAliveStream:
     # 源流结束的哨兵标记
     _DONE = object()
 
-    def __init__(self, source: AsyncIterator[bytes], interval: Optional[float] = None):
+    def __init__(self, source: AsyncIterator[bytes], interval: Optional[float] = None,
+                 counter: Optional[HeartbeatCounter] = None):
         """
         Args:
             source: 需要包裹的异步字节流
             interval: 心跳间隔（秒），None 时取环境变量默认值
+            counter: 共享心跳计数（审计用）
         """
         self.source = source
         self.interval = DEFAULT_INTERVAL if interval is None else interval
+        self.counter = counter
+        # 已下发的心跳次数
+        self.heartbeat_count = 0
+
+    def _beat(self) -> None:
+        """记录一次心跳（本地计数 + 共享计数）"""
+        self.heartbeat_count += 1
+        if self.counter is not None:
+            self.counter.increment()
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         if self.interval <= 0:
@@ -60,6 +88,7 @@ class KeepAliveStream:
                     item = await asyncio.wait_for(queue.get(), timeout=self.interval)
                 except asyncio.TimeoutError:
                     # 空闲超时：下发心跳，继续等待
+                    self._beat()
                     yield self.HEARTBEAT
                     continue
                 if item is self._DONE:
@@ -111,15 +140,19 @@ class UpstreamStartHeartbeat:
     # 复用 KeepAliveStream 的 SSE 注释行，两处心跳格式保持一致
     HEARTBEAT: bytes = KeepAliveStream.HEARTBEAT
 
-    def __init__(self, target, interval: Optional[float] = None):
+    def __init__(self, target, interval: Optional[float] = None, counter: Optional[HeartbeatCounter] = None):
         """
         Args:
             target: 需要等待的可等待对象（通常是流式调用的协程）
             interval: 心跳间隔（秒），None 时取环境变量默认值；<=0 表示关闭心跳
+            counter: 共享心跳计数（审计用）
         """
         self._target = target
         self.interval = DEFAULT_INTERVAL if interval is None else interval
+        self.counter = counter
         self.result = None
+        # 等待上游返回流对象期间下发的心跳次数（审计用）
+        self.heartbeat_count = 0
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         task = asyncio.ensure_future(self._target)
@@ -131,6 +164,9 @@ class UpstreamStartHeartbeat:
                 done, _ = await asyncio.wait({task}, timeout=self.interval)
                 if done:
                     break
+                self.heartbeat_count += 1
+                if self.counter is not None:
+                    self.counter.increment()
                 yield self.HEARTBEAT
             # 上游已返回：异常在此抛出，交给调用方原有逻辑处理
             self.result = task.result()

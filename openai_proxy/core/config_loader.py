@@ -18,6 +18,8 @@ class ConfigLoader:
         self.config_file = config_file
         self.plugin_manager = PluginManager()
         self.all_aliases: Dict[str, List[str]] = {}
+        # 顶层 audit: 段（审计与用量统计配置），由服务层读取
+        self.audit_config: Dict[str, Any] = {}
 
     async def load_config(self) -> Dict[str, List[ModelConfig]]:
         """加载模型配置"""
@@ -46,6 +48,10 @@ class ConfigLoader:
 
                 # 解析新格式的配置
                 raw_aliases = config_data.pop('all_aliases', {}) or {}
+
+                # 顶层审计段：不属于平台配置，先取出交给服务层
+                raw_audit = config_data.pop('audit', {}) or {}
+                self.audit_config = raw_audit if isinstance(raw_audit, dict) else {}
                 if isinstance(raw_aliases, dict):
                     self.all_aliases = {
                         k: v if isinstance(v, list) else []
