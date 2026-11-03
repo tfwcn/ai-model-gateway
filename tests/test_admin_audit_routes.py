@@ -55,6 +55,7 @@ def _client(tmp_path) -> TestClient:
         _attempt("r2-1", "2026-01-01T10:01:00.000+00:00", "example-platform|model-a", "failure").to_row(),
         _attempt("r2-2", "2026-01-01T10:01:05.000+00:00", "example-platform|model-b", "success").to_row(),
     ])
+    store.aggregate_usage()
 
     service = OpenAIProxyService(config_file="models.yaml")
     service.audit = AuditManager(AuditConfig(db_path=db_path, prometheus_enabled=True))
@@ -82,7 +83,7 @@ class TestAuth:
         monkeypatch.setenv("GATEWAY_API_KEY", _KEY)
         client = _client(tmp_path)
 
-        response = client.get("/admin/usage/summary")
+        response = client.post("/admin/usage/summary")
         assert response.status_code == 401
 
     @pytest.mark.unit
@@ -90,8 +91,35 @@ class TestAuth:
         monkeypatch.setenv("GATEWAY_API_KEY", _KEY)
         client = _client(tmp_path)
 
-        response = client.get("/admin/usage/summary", headers={"Authorization": "Bearer wrong"})
+        response = client.post("/admin/usage/summary", headers={"Authorization": "Bearer wrong"})
         assert response.status_code == 401
+        assert response.json()["error"]["code"] == "unauthorized"
+
+    @pytest.mark.unit
+    def test_转发接口错误形状保持不变(self, tmp_path, monkeypatch):
+        """/v1/* 不参与统一错误改造：仍然返回 detail，而不是 error"""
+        monkeypatch.setenv("GATEWAY_API_KEY", _KEY)
+        client = _client(tmp_path)
+
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {_KEY}"},
+                               json={"messages": []})
+
+        assert response.status_code == 400
+        body = response.json()
+        assert "detail" in body
+        assert "error" not in body
+
+    @pytest.mark.unit
+    def test_转发接口的鉴权错误形状保持不变(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_API_KEY", _KEY)
+        client = _client(tmp_path)
+
+        response = client.get("/v1/models")
+
+        assert response.status_code == 401
+        body = response.json()
+        assert body["error"]["code"] == "unauthorized"
+        assert body["error"]["type"] == "auth_error"
 
     @pytest.mark.unit
     def test_健康检查始终不需要密钥(self, tmp_path, monkeypatch):
@@ -113,12 +141,29 @@ class TestUsageEndpoints:
     """用量与性能统计接口"""
 
     @pytest.mark.unit
+    def test_每日用量返回输入输出缓存token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_API_KEY", _KEY)
+        client = _client(tmp_path)
+        headers = {"Authorization": f"Bearer {_KEY}"}
+
+        payload = client.post("/admin/usage/daily", headers=headers).json()
+
+        assert payload["count"] == 1
+        row = payload["items"][0]
+        assert row["day"] == "2026-01-01"
+        assert row["api_user"] == "admin"
+        assert row["attempts"] == 3 and row["requests"] == 2
+        assert row["input_tokens"] == 200
+        assert row["output_tokens"] == 400
+        assert payload["totals"]["output_tokens"] == 400
+
+    @pytest.mark.unit
     def test_summary按模型聚合(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GATEWAY_API_KEY", _KEY)
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.get("/admin/usage/summary?group_by=model&since=2026-01-01", headers=headers).json()
+        payload = client.post("/admin/usage/summary?group_by=model&since=2026-01-01", headers=headers).json()
 
         by_model = {item["bucket"]: item for item in payload["items"]}
         assert by_model["example-platform|model-a"]["attempts"] == 2
@@ -134,7 +179,7 @@ class TestUsageEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        assert client.get("/admin/usage/summary?group_by=nope", headers=headers).status_code == 400
+        assert client.post("/admin/usage/summary?group_by=nope", headers=headers).status_code == 400
 
     @pytest.mark.unit
     def test_timeseries按小时出点(self, tmp_path, monkeypatch):
@@ -142,7 +187,7 @@ class TestUsageEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.get("/admin/usage/timeseries?bucket=hour&since=2026-01-01", headers=headers).json()
+        payload = client.post("/admin/usage/timeseries?bucket=hour&since=2026-01-01", headers=headers).json()
 
         assert [point["bucket"] for point in payload["points"]] == ["2026-01-01T10"]
 
@@ -152,7 +197,7 @@ class TestUsageEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        assert client.get("/admin/usage/timeseries?since=昨天", headers=headers).status_code == 400
+        assert client.post("/admin/usage/timeseries?since=昨天", headers=headers).status_code == 400
 
     @pytest.mark.unit
     def test_模型榜可用任意维度排序(self, tmp_path, monkeypatch):
@@ -160,7 +205,7 @@ class TestUsageEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.get("/admin/usage/models?sort=tokens", headers=headers).json()
+        payload = client.post("/admin/usage/models?sort=tokens", headers=headers).json()
 
         assert payload["items"][0]["bucket"] == "example-platform|model-a"
 
@@ -170,7 +215,7 @@ class TestUsageEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        assert client.get("/admin/usage/models?sort=random", headers=headers).status_code == 400
+        assert client.post("/admin/usage/models?sort=random", headers=headers).status_code == 400
 
 
 class TestAuditEndpoints:
@@ -182,7 +227,7 @@ class TestAuditEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.get("/admin/audit?outcome=failure", headers=headers).json()
+        payload = client.post("/admin/audit?outcome=failure", headers=headers).json()
 
         assert payload["total"] == 1
         assert payload["items"][0]["outcome"] == "failure"
@@ -193,7 +238,7 @@ class TestAuditEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        assert client.get("/admin/audit?outcome=nope", headers=headers).status_code == 400
+        assert client.post("/admin/audit?outcome=nope", headers=headers).status_code == 400
 
     @pytest.mark.unit
     def test_可以还原一次请求的故障转移链(self, tmp_path, monkeypatch):
@@ -201,7 +246,7 @@ class TestAuditEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.get("/admin/audit/chain/r2", headers=headers).json()
+        payload = client.post("/admin/audit/chain/r2", headers=headers).json()
 
         assert [item["attempt_seq"] for item in payload["attempts"]] == [1, 2]
         assert [item["model_name"] for item in payload["attempts"]] == [
@@ -215,7 +260,7 @@ class TestAuditEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.get("/admin/audit/stats", headers=headers).json()
+        payload = client.post("/admin/audit/stats", headers=headers).json()
 
         assert payload["store"]["rows"] == 3
         assert payload["config"]["db_path"].endswith("audit.db")
@@ -228,10 +273,11 @@ class TestAuditEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        payload = client.delete("/admin/audit?before=2026-01-01T10:01:00.000%2B00:00", headers=headers).json()
+        payload = client.post("/admin/audit/prune", headers=headers,
+                              json={"before": "2026-01-01T10:01:00.000+00:00"}).json()
 
         assert payload["deleted"] == 1
-        assert client.get("/admin/audit", headers=headers).json()["total"] == 2
+        assert client.post("/admin/audit", headers=headers).json()["total"] == 2
 
     @pytest.mark.unit
     def test_非法清理时间返回400(self, tmp_path, monkeypatch):
@@ -239,7 +285,8 @@ class TestAuditEndpoints:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        assert client.delete("/admin/audit?before=not-a-time", headers=headers).status_code == 400
+        assert client.post("/admin/audit/prune", headers=headers,
+                           json={"before": "not-a-time"}).status_code == 400
 
 
 class TestMetricsEndpoint:
@@ -251,7 +298,7 @@ class TestMetricsEndpoint:
         client = _client(tmp_path)
         headers = {"Authorization": f"Bearer {_KEY}"}
 
-        response = client.get("/metrics", headers=headers)
+        response = client.post("/metrics", headers=headers)
 
         assert response.status_code == 200
         assert "proxy_requests_total" in response.text
@@ -265,6 +312,6 @@ class TestMetricsEndpoint:
         service.audit = AuditManager(AuditConfig(db_path=db_path, prometheus_enabled=False))
         client = TestClient(service.create_app())
 
-        response = client.get("/metrics", headers={"Authorization": f"Bearer {_KEY}"})
+        response = client.post("/metrics", headers={"Authorization": f"Bearer {_KEY}"})
 
         assert response.status_code == 404

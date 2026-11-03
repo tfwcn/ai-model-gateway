@@ -26,7 +26,7 @@ from openai_proxy.cli.codes import EXIT_USAGE
 
 # 用量统计支持的排序键与聚合维度（与 /admin/usage 接口保持一致）
 SORT_CHOICES = ("requests", "p95", "duration", "ttft", "throughput", "failover", "errors", "tokens")
-GROUP_CHOICES = ("model", "platform", "endpoint", "selector", "outcome", "error", "day", "hour")
+GROUP_CHOICES = ("model", "platform", "user", "endpoint", "selector", "outcome", "error", "day", "hour")
 
 
 class CliArgumentParser(argparse.ArgumentParser):
@@ -204,6 +204,10 @@ def _add_usage_group(groups) -> None:
     timeseries.add_argument("--bucket", choices=("hour", "day"), default="hour")
     _add_filters(timeseries)
 
+    daily = _action(actions, "daily", "全量日用量（按天/用户，不受明细保留期影响）", "usage_daily")
+    _add_filters(daily)
+    daily.add_argument("--limit", type=int, default=200)
+
     attempts = _action(actions, "attempts", "审计明细下钻", "usage_attempts")
     _add_filters(attempts)
     attempts.add_argument("--outcome", choices=("success", "failure", "aborted", "stream_open"))
@@ -255,6 +259,7 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--platform", help="只看某个平台")
     parser.add_argument("--model", help="只看某个模型（模型名，不是 selector）")
     parser.add_argument("--endpoint", help="只看某个入口：chat_completions/responses")
+    parser.add_argument("--user", help="只看某个用户标签（GATEWAY_USER_KEYS 里配的名称）")
 
 
 # ---------- 取值解析 ----------

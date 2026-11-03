@@ -2,17 +2,20 @@
 
 网关的每一次上游调用都会写一行审计记录，用来回答三类问题：
 
-- **用量**：哪个模型/平台被用了多少、消耗多少 tokens
+- **用量**：哪个模型/平台/用户被用了多少、消耗多少 tokens
 - **性能**：首块耗时、总耗时、P95、tokens/s
 - **可靠性**：失败率、故障转移了多少次、失败原因是什么
 
-示例一律使用占位符：`example-platform` / `https://api.example.com/v1` / `${EXAMPLE_PLATFORM_API_KEY}` / `model-a`。
+保留策略是分开的：**审计明细默认保留 30 天**，用于下钻与排障；
+**全量日用量永久保留**（`usage_daily` 表，按日期 + 用户累加），不会因为明细清理而丢历史。
+所有示例使用占位符：`example-platform` / `https://api.example.com/v1` / `${EXAMPLE_PLATFORM_API_KEY}` / `model-a`。
 
 ---
 
 ## 📋 目录
 
 - [记录粒度](#记录粒度)
+- [全量日用量](#全量日用量)
 - [结局与统计口径](#结局与统计口径)
 - [记录哪些字段](#记录哪些字段)
 - [配置项](#配置项)
@@ -38,6 +41,19 @@ gateway_request_id = 1a2b3c4d
 流式调用会分两段写：
 1. 首个有效内容拿到后立刻落一行 `outcome=stream_open`（`finalized=0`），保证「已经在转发的请求」即使进程被杀也留有痕迹；
 2. 流结束时补齐 tokens/耗时，并按「[DONE] 是否已转发」改写结局：发完了记 `success`，没发完就被掐掉记 `aborted`。
+
+## 全量日用量
+
+明细会被清理，用量不能跟着丢。落库后采集器会把「已收尾但还没汇总」的明细累加进 `usage_daily`：
+
+```text
+usage_daily(day, api_user) = 每天的请求数、尝试数、成功/失败/中断数、重试数、输入/缓存/输出 tokens
+```
+
+- 主键 `(day, api_user)`：既能按天看总量，也能区分用户；
+- 只累加、不删除：清理 `audit_attempts` 不会影响这里；
+- `aggregated` 标记保证每条明细只汇总一次；
+- `config_write` 的配置变更审计不计入用量。
 
 ## 结局与统计口径
 
@@ -74,16 +90,19 @@ failover_count = 同一请求里 attempt_seq > 1 的尝试数
 
 | 分组 | 字段 |
 | --- | --- |
-| 身份 | `attempt_key`、`gateway_request_id`、`request_id`、`upstream_id` |
+| 身份 | `attempt_key`、`gateway_request_id`、`api_user`（用户标签）、`request_id`、`upstream_id` |
 | 入口 | `endpoint`（`chat_completions` / `responses` / `config_write`）、`stream`、`selector` |
 | 目标 | `platform`、`model_name`、`model_id`、`attempt_seq`、`retry_seq`、`disabled_model` |
 | 时间 | `ts`（UTC 毫秒 ISO，分桶依据） |
 | 结局 | `outcome`、`finalized`、`http_status`、`error_category`、`error_code`、`done_sent`（[DONE] 是否已转发） |
 | 性能 | `duration_ms`、`probe_ms`、`ttft_ms`、`throughput`（tokens/s） |
 | 用量 | `has_usage`、`input_tokens`、`cached_tokens`、`output_tokens`、`output_chars` |
-| 其它 | `tool_call_converted`、`keepalive_count`（补发的心跳条数）、`msg_count` |
+| 其它 | `tool_call_converted`、`keepalive_count`（补发的心跳条数）、`msg_count`、`aggregated`（是否已进入日汇总） |
 
 **只记录消息条数，绝不记录消息内容、密钥或请求体。**
+
+`api_user` 来自用户级密钥：管理密钥、未启用鉴权与历史行都记 `admin`，用户密钥记创建时填写的标签。
+用户密钥本身只以 SHA-256 摘要存放在 `data/api_keys.db`（可由 `API_KEYS_DB_PATH` 调整），与审计库分开。
 
 通过管理接口/命令行改配置时也会写一行 `endpoint=config_write` 的审计行，`selector` 是补丁操作名，方便回答「这个权重是谁什么时候改的」。
 
@@ -108,7 +127,7 @@ audit:
 | --- | --- | --- | --- |
 | `enabled` | `AUDIT_ENABLED` | `true` | 关掉后热路径完全不走审计代码 |
 | `db_path` | `AUDIT_DB_PATH` | `data/audit.db` | 审计库路径；查询工具按同一条规则解析它 |
-| `retention_days` | `AUDIT_RETENTION_DAYS` | `30` | 启动时自动删除更早的记录；小于 1 的取值会被归一化回默认 30（写不出「永不清理」，要长期保留就写一个大天数） |
+| `retention_days` | `AUDIT_RETENTION_DAYS` | `30` | 审计**明细**保留天数，启动时与运行中每小时检查并清理更早的行；全量日用量不受影响 |
 | `queue_size` | `AUDIT_QUEUE_SIZE` | `10000` | 内存队列容量，写库跟不上时丢弃最旧行并计数 |
 | `batch_size` | `AUDIT_BATCH_SIZE` | `200` | 单次写库的最大行数 |
 | `flush_interval` | `AUDIT_FLUSH_INTERVAL` | `2.0` | 后台刷盘间隔（秒） |
@@ -135,6 +154,13 @@ audit:
 # 按模型看用量与性能
 python manage.py usage summary --group-by model --since 7d
 
+# 按用户看流量（用户标签来自管理台「用户密钥」页）
+python manage.py usage summary --group-by user --since 30d
+python manage.py usage attempts --user user-a --limit 20
+
+# 全量日用量：输入 / 缓存 / 输出 tokens（不受明细保留期影响）
+python manage.py usage daily --since 90d
+
 # 谁最慢 / 谁最不稳定 / 谁是用量大户
 python manage.py usage models --sort p95
 python manage.py usage models --sort errors
@@ -157,19 +183,22 @@ python manage.py usage stats
 
 ### HTTP 接口
 
-全部需要 `Authorization: Bearer <GATEWAY_API_KEY>`，字段契约见 [../web/API.md](../web/API.md)。
+全部需要 `Authorization: Bearer <GATEWAY_API_KEY>`，并且统一用 POST（包括查询），字段契约见 [../web/API.md](../web/API.md)。
 
 ```bash
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  "http://localhost:8000/admin/usage/summary?group_by=model&since=24h&sort=p95"
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/usage/summary?group_by=user&since=30d"
 
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/usage/summary?group_by=model&since=24h&sort=p95&user=user-a"
+
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit?outcome=failure&limit=20"
 
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit/chain/1a2b3c4d"
 
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit/stats"
 ```
 
@@ -181,7 +210,7 @@ curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
 ## 保留与清理
 
 - 启动时按 `retention_days` 自动清理；
-- 手动清理：`python manage.py usage prune --before 30d`，或 `DELETE /admin/audit?before=2026-01-01`；
+- 手动清理：`python manage.py usage prune --before 30d`，或 `POST /admin/audit/prune`，body `{"before": "2026-01-01"}`；
 - 库体积、最旧/最新记录时间可以从 `usage stats` 或 `/admin/audit/stats` 看到。
 
 审计库就是一个普通 SQLite 文件，可以直接备份、拷贝到别处再查：

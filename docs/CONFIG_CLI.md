@@ -75,7 +75,7 @@ python manage.py config rollback models.yaml.20260101T000000Z.bak
 
 `config fields` 就是管理台「模型配置」页里的那份字段字典（同一个来源 `openai_proxy/config_store/field_docs.py`
 与 `config_guide.py`）：每个能改的字段给出它控制什么、默认值、取值单位与边界、`models.yaml` 里的写法示例、
-改完是热重载还是需要重启，以及容易踩的坑。加 `--json` 时输出与 `GET /admin/config/schema` 的 `docs`/`sections` 完全一致。
+改完是热重载还是需要重启，以及容易踩的坑。加 `--json` 时输出与 `POST /admin/config/schema` 的 `docs`/`sections` 完全一致。
 
 `config validate` 的输出区分两类：
 
@@ -162,14 +162,15 @@ python manage.py audit set --field retention_days --value 45 # 写 models.yaml �
 ```bash
 python manage.py usage summary --group-by model --since 7d      # 聚合：用量 + 性能
 python manage.py usage models --sort p95                        # 谁最慢
+python manage.py usage daily --since 90d                        # 全量日用量（按天/用户，含输入/缓存/输出 tokens）
 python manage.py usage timeseries --bucket day --since 30d      # 趋势
 python manage.py usage attempts --outcome failure --limit 20    # 明细下钻
 python manage.py usage chain 1a2b3c4d                           # 还原整条故障转移链
 python manage.py usage stats                                    # 审计自身健康状态
-python manage.py usage prune --before 30d                       # 清理旧记录
+python manage.py usage prune --before 30d                       # 清理旧明细（全量日用量不受影响）
 ```
 
-聚合维度 `--group-by`：`model` / `platform` / `endpoint` / `selector` / `outcome` / `error` / `day` / `hour`。
+聚合维度 `--group-by`：`model` / `platform` / `user` / `endpoint` / `selector` / `outcome` / `error` / `day` / `hour`。
 排序 `--sort`：`requests` / `p95` / `duration` / `ttft` / `throughput` / `failover` / `errors` / `tokens`。
 过滤：`--since` / `--until`（ISO 时间、日期或 `7d`、`24h`、`30m`）、`--platform`、`--model`、`--endpoint`。
 

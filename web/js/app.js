@@ -9,12 +9,14 @@ import { Api, ApiError } from "./api.js";
 import { el } from "./ui.js";
 import { renderUsage } from "./view_usage.js";
 import { renderAudit } from "./view_audit.js";
+import { renderUsers } from "./view_users.js";
 import { renderConfig } from "./view_config.js";
 import { renderBackups } from "./view_backups.js";
 
 const VIEWS = {
   usage: { title: "用量与性能", render: renderUsage },
   audit: { title: "审计明细", render: renderAudit },
+  users: { title: "用户密钥", render: renderUsers },
   config: { title: "模型配置", render: renderConfig },
   backups: { title: "备份与回滚", render: renderBackups },
 };
@@ -110,6 +112,10 @@ class AdminApp {
         return;
       }
       if (error.status === 403) {
+        if (error.code === "forbidden") {
+          this.notice("当前密钥没有管理权限：请用 GATEWAY_API_KEY 连接", "bad");
+          return;
+        }
         this.notice("网关未配置 GATEWAY_API_KEY，管理接口已关闭", "bad");
         return;
       }

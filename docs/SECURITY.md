@@ -49,8 +49,8 @@ echo "your-api-key" | docker secret create modelscope_key -
 
 ```yaml
 # ❌ 绝对不要这样做！
-modelscope:
-  apiKey: "sk-1234567890abcdef"  # 泄露风险！
+example-platform:
+  apiKey: "hardcoded-secret"  # 泄露风险！
 ```
 
 **不要提交到版本控制：**
@@ -103,21 +103,27 @@ spec:
 
 ### API 认证
 
-通过 `GATEWAY_API_KEY` 环境变量启用 Bearer Token 认证：
+网关有两类密钥：
+
+- **管理密钥**：`GATEWAY_API_KEY`，管理台与 `/admin/*`、`/metrics` 使用；
+- **用户级密钥**：在管理台「用户密钥」页新增/删除，只访问 `/v1/*`，用于按用户统计流量。
 
 ```env
-GATEWAY_API_KEY=sk-your-secret-key
+GATEWAY_API_KEY=sk-your-admin-key
+# 用户密钥库路径（默认 data/api_keys.db）
+API_KEYS_DB_PATH=data/api_keys.db
 ```
 
-- 设置后，客户端请求需携带 `Authorization: Bearer <key>` 头
-- `/health` 端点不受认证限制
-- 留空则跳过认证（默认行为）
+- 用户密钥明文只在创建时返回一次；SQLite 里只保存 SHA-256 摘要与可读前缀；
+- 删除用户后密钥立即失效，审计历史保留；
+- `/health` 端点不受认证限制；
+- 两类密钥都为空时跳过认证（默认行为，仅建议内网使用）。
 
 **示例：**
 
 ```bash
 curl http://localhost:8100/v1/chat/completions \
-  -H "Authorization: Bearer sk-your-secret-key" \
+  -H "Authorization: Bearer sk-your-user-key" \
   -H "Content-Type: application/json" \
   -d '{"model": "all", "messages": [{"role": "user", "content": "Hello"}]}'
 ```

@@ -31,6 +31,8 @@ class AuditManager:
         self.query_service: UsageQueryService = UsageQueryService(self.store)
         self._metrics = metrics
         self._started = False
+        # 保留期清理任务：长期运行的进程也要按天清掉过期明细
+        self._retention_task: Optional[asyncio.Task] = None
 
     # ---------- 生命周期 ----------
 
@@ -51,6 +53,8 @@ class AuditManager:
         try:
             store = SqliteAuditStore(self.config.db_path)
             await asyncio.to_thread(store.init_schema)
+            # 先把历史已收尾明细补进全量日汇总，再清理过期明细（否则会漏掉最后一批用量）
+            await asyncio.to_thread(store.aggregate_usage)
             removed = await asyncio.to_thread(store.prune_old, self.config.retention_days)
             if removed:
                 logger.info(f"审计记录按保留期清理: 删除 {removed} 条（{self.config.retention_days} 天前）")
@@ -61,6 +65,7 @@ class AuditManager:
                 self.config, store, metrics=self._metrics or load_metrics_collector()
             )
             self.collector.start()
+            self._retention_task = asyncio.create_task(self._retention_loop())
         except Exception as exc:  # noqa: BLE001 - 审计故障不能阻止网关启动
             logger.error(f"审计初始化失败，已降级为关闭审计: {exc}", exc_info=True)
             self.config.enabled = False
@@ -68,8 +73,36 @@ class AuditManager:
             self.query_service = UsageQueryService(self.store)
             self.collector = None
 
+    async def _retention_loop(self) -> None:
+        """定期把新明细补进日汇总并清理过期明细（长期运行也不会无限增长）"""
+        if self.config.retention_days <= 0:
+            return
+        while True:
+            try:
+                await asyncio.sleep(6 * 3600)
+            except asyncio.CancelledError:
+                return
+            try:
+                await asyncio.to_thread(self.store.aggregate_usage)
+                removed = await asyncio.to_thread(self.store.prune_old, self.config.retention_days)
+                if removed:
+                    logger.info(
+                        f"审计记录按保留期清理: 删除 {removed} 条（{self.config.retention_days} 天前）"
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001 - 清理失败只告警，等下一轮
+                logger.warning(f"审计保留期清理失败，将在下一轮重试: {exc}")
+
     async def close(self) -> None:
         """排空缓冲并关闭库"""
+        if self._retention_task is not None:
+            self._retention_task.cancel()
+            try:
+                await self._retention_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 关闭阶段不抛
+                pass
+            self._retention_task = None
         if self.collector is not None:
             await self.collector.close()
             self.collector = None
@@ -88,6 +121,7 @@ class AuditManager:
         selector: str = "",
         stream: bool = False,
         msg_count: Optional[int] = None,
+        api_user: str = "",
     ) -> AuditContext:
         """创建一次请求的审计上下文（审计关闭时 collector 为 None，全部退化为空操作）"""
         return AuditContext(
@@ -96,6 +130,7 @@ class AuditManager:
             selector=selector,
             stream=stream,
             msg_count=msg_count if self.config.include_request_meta else None,
+            api_user=api_user,
         )
 
     def record_config_change(

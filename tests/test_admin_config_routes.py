@@ -109,7 +109,7 @@ class TestAuth:
     def test_未配置网关密钥时配置接口整体拒绝(self, tmp_path):
         client, _, _, _ = _client(tmp_path, api_key=None)
 
-        response = client.get("/admin/config/document")
+        response = client.post("/admin/config/document")
 
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "admin_disabled"
@@ -118,15 +118,15 @@ class TestAuth:
     def test_缺少Bearer时返回401(self, tmp_path):
         client, _, _, _ = _client(tmp_path)
 
-        assert client.get("/admin/config/document").status_code == 401
-        assert client.get("/admin/config/document", headers=_auth("wrong-key")).status_code == 401
+        assert client.post("/admin/config/document").status_code == 401
+        assert client.post("/admin/config/document", headers=_auth("wrong-key")).status_code == 401
 
     @pytest.mark.unit
     def test_CONFIG_API_ENABLED为false时路由不存在(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CONFIG_API_ENABLED", "false")
         client, _, _, _ = _client(tmp_path)
 
-        assert client.get("/admin/config/document", headers=_auth()).status_code == 404
+        assert client.post("/admin/config/document", headers=_auth()).status_code == 404
 
 
 class TestRead:
@@ -137,7 +137,7 @@ class TestRead:
         monkeypatch.setenv("EXAMPLE_PLATFORM_API_KEY", "super-secret-value")
         client, _, _, _ = _client(tmp_path)
 
-        body = client.get("/admin/config/document", headers=_auth()).json()
+        body = client.post("/admin/config/document", headers=_auth()).json()
 
         assert "super-secret-value" not in str(body)
         platform = next(item for item in body["platforms"] if item["name"] == "example-platform")
@@ -149,7 +149,7 @@ class TestRead:
     def test_raw返回原始YAML(self, tmp_path):
         client, path, _, _ = _client(tmp_path)
 
-        body = client.get("/admin/config/raw", headers=_auth()).json()
+        body = client.post("/admin/config/raw", headers=_auth()).json()
 
         assert body["text"] == CONFIG
         assert body["version"]
@@ -160,7 +160,7 @@ class TestRead:
         monkeypatch.delenv("SCRAPER_PLATFORM_API_KEY", raising=False)
         client, _, _, _ = _client(tmp_path)
 
-        body = client.get("/admin/config/env-status", headers=_auth()).json()
+        body = client.post("/admin/config/env-status", headers=_auth()).json()
         by_env = {item["env"]: item for item in body["items"]}
 
         assert by_env["EXAMPLE_PLATFORM_API_KEY"]["set"] is True
@@ -171,8 +171,8 @@ class TestRead:
     def test_validate与schema可用于前端渲染表单(self, tmp_path):
         client, _, _, _ = _client(tmp_path)
 
-        validate = client.get("/admin/config/validate", headers=_auth()).json()
-        schema = client.get("/admin/config/schema", headers=_auth()).json()
+        validate = client.post("/admin/config/validate", headers=_auth()).json()
+        schema = client.post("/admin/config/schema", headers=_auth()).json()
 
         assert validate["valid"]
         assert "set_model_field" in schema["ops"]
@@ -186,7 +186,7 @@ class TestRead:
         from openai_proxy.config_store import schema as rules
 
         client, _, _, _ = _client(tmp_path)
-        docs = client.get("/admin/config/schema", headers=_auth()).json()["docs"]
+        docs = client.post("/admin/config/schema", headers=_auth()).json()["docs"]
 
         for scope, fields in (
             ("platform", rules.PLATFORM_FIELDS),
@@ -204,7 +204,7 @@ class TestRead:
         from openai_proxy.config_store import schema as rules
 
         client, _, _, _ = _client(tmp_path)
-        payload = client.get("/admin/config/schema", headers=_auth()).json()
+        payload = client.post("/admin/config/schema", headers=_auth()).json()
         enums = payload["enums"]
         kinds = {**rules.PLATFORM_FIELDS, **rules.MODEL_FIELDS, **rules.AUDIT_FIELDS}
 
@@ -225,7 +225,7 @@ class TestRead:
     @pytest.mark.unit
     def test_schema给出配置文件本身的结构说明(self, tmp_path):
         client, _, _, _ = _client(tmp_path)
-        sections = client.get("/admin/config/schema", headers=_auth()).json()["sections"]
+        sections = client.post("/admin/config/schema", headers=_auth()).json()["sections"]
 
         assert sections, "结构说明不能为空"
         assert all(item["title"] and item["body"] for item in sections)
@@ -237,7 +237,7 @@ class TestRead:
     def test_backups初始为空(self, tmp_path):
         client, _, _, _ = _client(tmp_path)
 
-        assert client.get("/admin/config/backups", headers=_auth()).json()["items"] == []
+        assert client.post("/admin/config/backups", headers=_auth()).json()["items"] == []
 
 
 class TestRuntimeModels:
@@ -252,7 +252,7 @@ class TestRuntimeModels:
             "example-platform": [_model("example-platform", "model-a")],
         })
 
-        body = client.get("/admin/config/models", headers=_auth()).json()
+        body = client.post("/admin/config/models", headers=_auth()).json()
 
         # 顺序稳定：按平台名排序，界面下拉不会每次刷新都换次序
         assert [item["name"] for item in body["platforms"]] == ["example-platform", "scraper-platform"]
@@ -267,7 +267,7 @@ class TestRuntimeModels:
     def test_清单里没有任何密钥与端点(self, tmp_path):
         client, _, _, _ = _client(tmp_path, runtime_models={"scraper-platform": [_model("scraper-platform", "scraped-model")]})
 
-        text = str(client.get("/admin/config/models", headers=_auth()).json())
+        text = str(client.post("/admin/config/models", headers=_auth()).json())
 
         for forbidden in ("sk-should-never-leak", "api.example.com", "api_key", "apiKey", "base_url"):
             assert forbidden not in text, f"运行时清单泄露了 {forbidden}"
@@ -277,7 +277,7 @@ class TestRuntimeModels:
         # 只加载平台、还没加载模型时，models[平台] 是平台配置字典而不是模型列表：这种条目要跳过
         client, _, _, _ = _client(tmp_path, runtime_models={"example-platform": {"baseUrl": "https://api.example.com/v1"}})
 
-        body = client.get("/admin/config/models", headers=_auth()).json()
+        body = client.post("/admin/config/models", headers=_auth()).json()
 
         assert body["platforms"] == [] and body["loaded"] is False and body["total"] == 0
         assert body["note"], "没有候选时必须说明为什么是空的，否则界面看着像坏了"
@@ -286,19 +286,19 @@ class TestRuntimeModels:
     def test_清单同样要密钥(self, tmp_path):
         client, _, _, _ = _client(tmp_path, runtime_models={"scraper-platform": [_model("scraper-platform", "scraped-model")]})
 
-        assert client.get("/admin/config/models").status_code == 401
-        assert client.get("/admin/config/models", headers=_auth("wrong-key")).status_code == 401
+        assert client.post("/admin/config/models").status_code == 401
+        assert client.post("/admin/config/models", headers=_auth("wrong-key")).status_code == 401
 
     @pytest.mark.unit
     def test_清单读的是进程当下这份而不是启动时的快照(self, tmp_path):
         runtime = {"scraper-platform": [_model("scraper-platform", "old-model")]}
         client, _, _, _ = _client(tmp_path, runtime_models=runtime)
 
-        assert client.get("/admin/config/models", headers=_auth()).json()["total"] == 1
+        assert client.post("/admin/config/models", headers=_auth()).json()["total"] == 1
 
         # 热重载会换掉平台里的模型：接口每次都要读最新的表，否则下拉里全是已经不存在的模型
         runtime["scraper-platform"] = [_model("scraper-platform", "new-model")]
-        after = client.get("/admin/config/models", headers=_auth()).json()
+        after = client.post("/admin/config/models", headers=_auth()).json()
 
         assert after["platforms"][0]["models"][0]["name"] == "new-model"
 
@@ -363,7 +363,7 @@ class TestApply:
     @pytest.mark.unit
     def test_apply写盘并备份且触发热重载(self, tmp_path):
         client, path, reloaded, recorder = _client(tmp_path)
-        version = client.get("/admin/config/raw", headers=_auth()).json()["version"]
+        version = client.post("/admin/config/raw", headers=_auth()).json()["version"]
 
         response = client.post("/admin/config/apply", headers=_auth(), json={
             "ops": [
@@ -382,7 +382,7 @@ class TestApply:
         content = _text(path)
         assert "weight: 3" in content and '"model-new"' in content
         # 写盘前的内容一定被备份了
-        assert client.get("/admin/config/backups", headers=_auth()).json()["items"][0]["note"] == "界面测试"
+        assert client.post("/admin/config/backups", headers=_auth()).json()["items"][0]["note"] == "界面测试"
 
     @pytest.mark.unit
     def test_行内注释在改取值后仍然保留(self, tmp_path):
@@ -404,13 +404,13 @@ class TestApply:
         })
 
         assert response.status_code == 409
-        assert "刷新" in response.json()["detail"]["message"]
+        assert "刷新" in response.json()["error"]["message"]
         assert _text(path) == CONFIG
 
     @pytest.mark.unit
     def test_IfMatch头也可以做并发检查(self, tmp_path):
         client, _, _, _ = _client(tmp_path)
-        version = client.get("/admin/config/raw", headers=_auth()).json()["version"]
+        version = client.post("/admin/config/raw", headers=_auth()).json()["version"]
         headers = dict(_auth())
         headers["If-Match"] = f'"{version}"'
 
@@ -442,7 +442,7 @@ class TestApply:
         })
 
         assert response.status_code == 400
-        assert "ghost" in response.json()["detail"]["errors"][0]["message"]
+        assert "ghost" in response.json()["error"]["details"]["errors"][0]["message"]
         assert _text(path) == CONFIG
         assert reloaded == []
 
@@ -455,7 +455,7 @@ class TestApply:
         })
 
         assert response.status_code == 400
-        detail = response.json()["detail"]["errors"][0]
+        detail = response.json()["error"]["details"]["errors"][0]
         assert "blacklist" in detail["message"]
         assert detail["path"].endswith("blacklist")
 
@@ -546,7 +546,7 @@ class TestApply:
         })
 
         assert response.status_code == 400
-        assert "没有字段" in response.json()["detail"]["errors"][0]["message"]
+        assert "没有字段" in response.json()["error"]["details"]["errors"][0]["message"]
         assert _text(path) == CONFIG
 
     @pytest.mark.unit
@@ -578,7 +578,7 @@ class TestApply:
         })
 
         assert response.status_code == 400
-        detail = response.json()["detail"]
+        detail = response.json()["error"]["details"]
         assert "只试一次请写 1" in detail["errors"][0]["message"]
         assert _text(path) == CONFIG
 
@@ -605,7 +605,7 @@ class TestApply:
         client.post("/admin/config/apply", headers=_auth(), json={
             "ops": [{"op": "set_alias_selectors", "alias": "cheap", "selectors": ["example-platform|model-a"]}],
         })
-        version = client.get("/admin/config/document", headers=_auth()).json()["version"]
+        version = client.post("/admin/config/document", headers=_auth()).json()["version"]
 
         body = client.post("/admin/config/apply", headers=_auth(), json={
             "ops": [{"op": "set_alias_selectors", "alias": "cheap", "selectors": ["all"]}],

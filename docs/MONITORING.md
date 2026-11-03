@@ -131,23 +131,23 @@ Prometheus 适合看趋势与告警，**要下钻到「哪一次请求、哪一�
 
 ```bash
 # 按模型聚合用量与性能（成功率、P95、首块、tokens/s）
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/usage/summary?group_by=model&since=24h&sort=p95"
 
 # 按天看趋势
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/usage/timeseries?bucket=day&since=30d"
 
 # 只看失败的尝试
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit?outcome=failure&limit=20"
 
 # 还原一次请求的完整故障转移链
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit/chain/<gateway_request_id>"
 
 # 审计自身健康状态：行数、缓冲、丢弃、写库失败、最近刷盘
-curl -H "Authorization: Bearer $GATEWAY_API_KEY" \
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit/stats"
 ```
 

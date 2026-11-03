@@ -4,10 +4,13 @@
 `tests/test_admin_ui_routes.py` 会检查前端用到的字段是否仍然存在、文档是否覆盖了全部端点。
 
 约定：
-- 所有接口都在 `/admin` 或 `/metrics` 下，一律要求 `Authorization: Bearer <GATEWAY_API_KEY>`
-  （只有静态壳 `/admin/ui` 例外：它不含任何数据，可以无密钥加载）。
+- **非转发接口统一用 POST**：所有 `/admin/*` 接口（包括查询）都使用 POST；`/metrics` 同时保留 GET 供 Prometheus 抓取。
+  转发协议接口 `/v1/*` 不在本文范围内，方法和错误形状保持原样。
+- 管理接口一律要求 `Authorization: Bearer <GATEWAY_API_KEY>`（只有静态壳 `/admin/ui` 例外：它不含任何数据，可以无密钥加载）。
 - 网关未配置 `GATEWAY_API_KEY` 时管理接口返回 `403 {"error": {"code": "admin_disabled"}}`；
   密钥缺失或错误返回 `401`。
+- 非转发接口的错误统一为 `{"error": {"code": "...", "message": "...", "details": {...}?}}`；
+  `/v1/*` 保持原有 `{"detail": ...}` / OpenAI 兼容错误形状。
 - 时间参数统一支持三种写法：`2026-01-01T10:00:00+00:00`、`2026-01-01`、相对时间 `7d` / `24h` / `30m`。
 - 密钥永不下发：配置视图只给出它引用的环境变量名与「是否已设置」。
 - 示例一律使用占位符：`example-platform` / `https://api.example.com/v1` / `${EXAMPLE_PLATFORM_API_KEY}` / `model-a`。
@@ -16,25 +19,29 @@
 
 | 端点 | 方法 | 用途 |
 | --- | --- | --- |
-| `/admin/usage/summary` | GET | 按维度聚合用量与性能 |
-| `/admin/usage/timeseries` | GET | 按小时/天分桶的曲线 |
-| `/admin/usage/models` | GET | 模型横向对比榜 |
-| `/admin/audit` | GET | 审计明细下钻 |
-| `/admin/audit` | DELETE | 删除指定时间之前的审计记录 |
-| `/admin/audit/chain/{gateway_request_id}` | GET | 一次请求的完整故障转移链 |
-| `/admin/audit/stats` | GET | 审计自身健康状态 |
-| `/admin/config/document` | GET | 脱敏的配置视图 |
-| `/admin/config/raw` | GET | 原始 YAML 文本（只读预览） |
-| `/admin/config/schema` | GET | 字段白名单、取值边界与字段字典 |
-| `/admin/config/env-status` | GET | 配置引用的环境变量是否已设置 |
-| `/admin/config/models` | GET | 进程内当前可用的模型清单（下拉候选） |
-| `/admin/config/validate` | GET | 校验当前配置文件 |
-| `/admin/config/backups` | GET | 可回滚的备份列表 |
+| `/admin/usage/summary` | POST | 按维度聚合用量与性能 |
+| `/admin/usage/daily` | POST | 全量日用量（日期 × 用户，永久保留） |
+| `/admin/usage/timeseries` | POST | 按小时/天分桶的曲线 |
+| `/admin/usage/models` | POST | 模型横向对比榜 |
+| `/admin/audit` | POST | 审计明细下钻 |
+| `/admin/audit/prune` | POST | 删除指定时间之前的审计记录（body: `{"before": "..."}`） |
+| `/admin/audit/chain/{gateway_request_id}` | POST | 一次请求的完整故障转移链 |
+| `/admin/audit/stats` | POST | 审计自身健康状态 |
+| `/admin/users/list` | POST | 用户级密钥清单（只含前缀） |
+| `/admin/users` | POST | 新增用户并生成一次性密钥 |
+| `/admin/users/{user_id}/delete` | POST | 删除用户，密钥立即失效 |
+| `/admin/config/document` | POST | 脱敏的配置视图 |
+| `/admin/config/raw` | POST | 原始 YAML 文本（只读预览） |
+| `/admin/config/schema` | POST | 字段白名单、取值边界与字段字典 |
+| `/admin/config/env-status` | POST | 配置引用的环境变量是否已设置 |
+| `/admin/config/models` | POST | 进程内当前可用的模型清单（下拉候选） |
+| `/admin/config/validate` | POST | 校验当前配置文件 |
+| `/admin/config/backups` | POST | 可回滚的备份列表 |
 | `/admin/config/plan` | POST | 预演补丁（不写盘） |
 | `/admin/config/apply` | POST | 应用补丁并写盘 |
 | `/admin/config/rollback` | POST | 回滚到指定备份 |
 | `/admin/config/reload` | POST | 进程内重载模型配置 |
-| `/metrics` | GET | Prometheus 文本指标 |
+| `/metrics` | POST / GET | Prometheus 文本指标（GET 留给 Prometheus 抓取） |
 
 ## 统计口径
 
@@ -45,13 +52,17 @@
 - **成功率只统计 `finalized=1` 的行**：`success_rate = success / finalized`，未收尾的流不进分母。
 - `P95`/`P50` 用名次近似（`ROW_NUMBER`），只统计已收尾且 `duration_ms` 非空的尝试；缺数据的分组返回 `null`。
 - `failover_count` = 同一请求里第 2 次及之后的尝试数，即实际发生的故障转移次数。
+- `api_user` 是调用方标签：管理密钥、未启用鉴权与历史行都记 `admin`，用户级密钥记创建时填写的名称。
+  用户级密钥只以 SHA-256 摘要存放在独立的 `data/api_keys.db`（`API_KEYS_DB_PATH`），审计库里没有密钥。
+- **两套保留策略**：`audit_attempts` 明细默认保留 30 天（`AUDIT_RETENTION_DAYS`），用于下钻与排障；
+  `usage_daily` 日汇总只累加、不清理，用于永久保留输入/输出/缓存 tokens 等用量。
 
 ---
 
-## GET /admin/usage/summary
+## POST /admin/usage/summary
 
-查询参数：`group_by`（`model|platform|endpoint|selector|outcome|error|day|hour`，默认 `model`）、
-`since`、`until`、`platform`、`model`（模型名，不是 selector）、`endpoint`、`limit`（1~1000）、
+查询参数：`group_by`（`model|platform|user|endpoint|selector|outcome|error|day|hour`，默认 `model`）、
+`since`、`until`、`platform`、`model`（模型名，不是 selector）、`endpoint`、`user`（用户标签）、`limit`（1~1000）、
 `sort`（`requests|p95|duration|ttft|throughput|failover|errors|tokens`）。
 
 ```json
@@ -78,9 +89,35 @@
 `group_by` 为 `day`/`hour` 时按时间先后返回，其余按 `sort` 排序；派生列（`success_rate`、`p95_duration_ms` 等）
 不在 SQL 里，聚合后在 Python 端补齐，缺失值为 `null`。
 
-## GET /admin/usage/timeseries
+## POST /admin/usage/daily
 
-查询参数：`bucket`（`hour|day`）、`since`、`until`、`platform`、`model`、`endpoint`。
+全量日用量：按 `(日期, 用户)` 返回，数据来自独立日汇总表 `usage_daily`，**永久保留**，
+不随审计明细的 30 天保留期清理。查询参数：`since`、`until`、`user`、`limit`（1~5000）。
+
+```json
+{
+  "range": { "since": null, "until": "2026-01-03T00:00:00+00:00" },
+  "count": 2,
+  "totals": {
+    "requests": 42, "attempts": 45, "success": 43, "failure": 2, "aborted": 0, "retries": 3,
+    "input_tokens": 12000, "cached_tokens": 3000, "output_tokens": 8000, "success_rate": 0.9556
+  },
+  "items": [
+    {
+      "day": "2026-01-01", "api_user": "user-a",
+      "requests": 20, "attempts": 21, "success": 20, "failure": 1, "aborted": 0, "retries": 1,
+      "input_tokens": 6000, "cached_tokens": 1500, "output_tokens": 4000,
+      "updated_at": "2026-01-01T10:05:00.000+00:00"
+    }
+  ]
+}
+```
+
+`items` 按 `day` 升序、`api_user` 升序；`totals` 是同一筛选范围内的合计，前端直接用于顶部卡片。
+
+## POST /admin/usage/timeseries
+
+查询参数：`bucket`（`hour|day`）、`since`、`until`、`platform`、`model`、`endpoint`、`user`。
 
 ```json
 {
@@ -92,14 +129,14 @@
 
 `points` 一定按桶升序，前端直接拿来画折线。
 
-## GET /admin/usage/models
+## POST /admin/usage/models
 
-查询参数：`sort`、`since`、`until`、`limit`（1~500）。返回 `{ "sort": "...", "range": {...}, "items": [...] }`，
+查询参数：`sort`、`since`、`until`、`limit`（1~500）、`user`。返回 `{ "sort": "...", "range": {...}, "items": [...] }`，
 `items` 的字段与 `summary.items` 相同。
 
-## GET /admin/audit
+## POST /admin/audit
 
-查询参数：`since`、`until`、`platform`、`model`、`outcome`、`endpoint`、`gateway_request_id`、
+查询参数：`since`、`until`、`platform`、`model`、`outcome`、`endpoint`、`user`、`gateway_request_id`、
 `limit`（1~500）、`offset`。
 
 ```json
@@ -108,6 +145,7 @@
   "items": [
     {
       "attempt_key": "req-7-1", "gateway_request_id": "req-7", "request_id": "req-7",
+      "api_user": "user-a",
       "endpoint": "chat_completions", "stream": 1, "selector": "all",
       "platform": "example-platform", "model_name": "example-platform|model-a", "model_id": "model-a",
       "attempt_seq": 1, "retry_seq": 1,
@@ -124,14 +162,16 @@
 ```
 
 `items` 是数据库原始行（布尔列以 `0/1` 出现），列顺序与落库列一致。
-老库缺 `done_sent` 时启动会自动补列，并把历史上记成 `success` 的流式行回填成 `1`；已经记成 `aborted` 的行保持原样，旧结局不重算。
+老库缺 `done_sent` / `api_user` 时启动会自动补列：`done_sent` 会给历史上记成 `success` 的流式行回填成 `1`，
+`api_user` 留空（启动迁移会统一回填为 `admin`）；旧结局一条都不重算。
 前端按 `outcome` 上色、按 `gateway_request_id` 下钻到链路。
 
-## DELETE /admin/audit
+## POST /admin/audit/prune
 
-查询参数：`before`（必填）。返回 `{ "deleted": 12, "before": "2026-01-01T00:00:00+00:00" }`。
+请求体：`{ "before": "2026-01-01" }`（必填，支持 ISO 时间、日期或 `30d`）。
+返回 `{ "deleted": 12, "before": "2026-01-01T00:00:00.000+00:00" }`。
 
-## GET /admin/audit/chain/{gateway_request_id}
+## POST /admin/audit/chain/{gateway_request_id}
 
 ```json
 { "gateway_request_id": "req-7", "attempts": [ { "...": "同 /admin/audit 的行" } ] }
@@ -139,7 +179,7 @@
 
 没有记录时 `attempts` 为 `[]`（不是 404）。
 
-## GET /admin/audit/stats
+## POST /admin/audit/stats
 
 ```json
 {
@@ -163,7 +203,41 @@
 
 ---
 
-## GET /admin/config/document
+## POST /admin/users/list
+
+用户级密钥清单。只返回可读前缀，**永不返回明文或摘要**。
+
+```json
+{
+  "count": 1,
+  "items": [
+    { "id": 1, "name": "user-a", "key_prefix": "gw_ab12cd", "created_at": "2026-01-01T10:00:00.000+00:00" }
+  ]
+}
+```
+
+## POST /admin/users（新增用户）
+
+请求体：`{ "name": "user-a" }`（1~64 个字符，不能重名）。
+
+```json
+{
+  "user": { "id": 1, "name": "user-a", "key_prefix": "gw_ab12cd", "created_at": "..." },
+  "key": "gw_ab12cd..."
+}
+```
+
+`key` 是明文，**只在本次响应里出现一次**；数据库只保存 SHA-256 摘要，页面必须提示用户立即保存。
+用户名重复返回 `409 {"error": {"code": "user_exists"}}`；名称为空或超长返回 `400/422`。
+
+## POST /admin/users/{user_id}/delete
+
+返回 `{ "deleted": true, "id": 1 }`。删除后该用户的密钥立即失效，历史审计记录保留。
+用户不存在返回 `404`，`user_id` 非法返回 `400`。
+
+---
+
+## POST /admin/config/document
 
 ```json
 {
@@ -202,11 +276,11 @@
 
 `models` 里字符串写法的条目 `writable=false`：给它加覆盖字段会先把条目改写成对象写法（注释可能随之移动，`warnings` 会提示）。
 
-## GET /admin/config/raw
+## POST /admin/config/raw
 
 `{ "path": "...", "version": "...", "bytes": 920, "text": "原始 YAML" }`。只用于预览，写回必须走补丁接口。
 
-## GET /admin/config/schema
+## POST /admin/config/schema
 
 `{ "ops": [...], "platform_fields": {字段: 类型}, "model_fields": {...}, "audit_fields": {...}, "limits": {字段: {"min": 1, "max": 3600}}, "enums": {字段: {"values": [...], "allow_none": true}}, "docs": {...}, "sections": [...] }`。
 前端据此决定控件形状（下拉 / 带边界的 number 输入框 / 标签勾选 / 手填输入框）、取值范围提示，以及每个字段的说明（这一页本身就是文档）。
@@ -249,13 +323,13 @@
 `limits` 里的下限就是写盘会被拒绝的下限，例如 `retry_count` 是 `1~20`（写 0 会让重试分支没有兜底赋值），
 越界时报错信息里会附上原因。
 
-## GET /admin/config/env-status
+## POST /admin/config/env-status
 
 `[ { "env": "EXAMPLE_PLATFORM_API_KEY", "platform": "example-platform", "source": "yaml_placeholder", "set": true } ]`。
 `source` 为 `yaml_placeholder`（配置里写的 `${...}`）或 `platform_name_convention`（按平台名约定的环境变量）。
 **永不返回密钥内容**。
 
-## GET /admin/config/models
+## POST /admin/config/models
 
 `{ "loaded": true, "total": 46, "platforms": [ { "name": "example-platform", "models": [ { "name": "model-a", "selector": "example-platform|model-a" } ] } ], "note": "" }`。
 
@@ -264,12 +338,12 @@
 - `loaded=false` 时 `platforms` 为空、`note` 给人话说明（服务刚启动或模型加载失败），界面据此解释下拉为什么是空的。
 - 只给名字：**永不返回密钥、baseUrl 或插件参数**。
 
-## GET /admin/config/validate
+## POST /admin/config/validate
 
 `{ "version": "...", "valid": true, "errors": [], "warnings": [] }`。
 `errors` 会阻止任何写盘；`warnings` 只提示（例如环境变量当前未设置）。
 
-## GET /admin/config/backups
+## POST /admin/config/backups
 
 `{ "items": [ { "name": "models.yaml.20260101T100000Z.bak", "created_at": "...", "bytes": 920, "version": "3f236f1a...", "note": "调权重", "path": "..." } ] }`。
 
@@ -349,8 +423,10 @@
 }
 ```
 
-校验有 `errors` 时返回 `400 {"detail": {"message": "...", "errors": [...]}}`，**不写盘**；
-版本不匹配返回 `409 {"detail": {"message": "...", "expected": "...", "actual": "..."}}`。
+校验有 `errors` 时返回
+`400 {"error": {"code": "validation_failed", "message": "...", "details": {"errors": [...]}}}`，**不写盘**；
+版本不匹配返回
+`409 {"error": {"code": "version_conflict", "message": "...", "details": {"expected": "...", "actual": "..."}}}`。
 
 ## POST /admin/config/rollback
 
@@ -372,7 +448,7 @@
 无请求体。返回 `{ "reloaded": true, "needs_restart": false, "message": "模型配置已重载" }`；
 服务未提供热重载能力时返回 `409`。
 
-## GET /metrics
+## POST /metrics（GET 仍保留给 Prometheus）
 
 Prometheus 文本格式。`audit.prometheus_enabled=false` 时返回 `404`。
 
@@ -398,11 +474,33 @@ Prometheus 文本格式。`audit.prometheus_enabled=false` 时返回 `404`。
 
 ## 错误形状
 
-| 状态码 | 场景 | 响应 |
+非转发接口统一返回：
+
+```json
+{
+  "error": {
+    "code": "user_exists",
+    "message": "用户名已存在: user-a",
+    "details": { "errors": [] }
+  }
+}
+```
+
+- `code` 用于程序判断；
+- `message` 用于直接展示；
+- `details` 只在有结构化信息时出现（校验错误列表、版本冲突的 `expected` / `actual` 等）；
+- HTTP 状态码仍然保留，用来区分大类。
+
+| 状态码 | 常见 code | 场景 |
 | --- | --- | --- |
-| 400 | 参数取值非法 / 校验不通过 | `{"detail": "..."}` 或 `{"detail": {"message": "...", "errors": [...]}}` |
-| 401 | 密钥缺失或不正确 | `{"error": {"code": "unauthorized"}}` |
-| 403 | 网关未配置 `GATEWAY_API_KEY` | `{"error": {"code": "admin_disabled"}}` |
-| 404 | 接口不存在 / 前端已关闭 / 指标已关闭 | `{"detail": "..."}` |
-| 409 | 配置版本冲突 | `{"detail": {"message": "...", "expected": "...", "actual": "..."}}` |
-| 500 | 写盘被拒绝 | `{"detail": "..."}` |
+| 400 | `bad_request` / `invalid_parameter` / `invalid_name` / `invalid_user_id` / `version_mismatch` / `validation_failed` | 参数非法、用户名非法、校验不通过 |
+| 401 | `unauthorized` | 密钥缺失或不正确 |
+| 403 | `admin_disabled` / `forbidden` | 未配置管理密钥 / 用户级密钥访问管理接口 |
+| 404 | `not_found` / `user_not_found` / `metrics_disabled` / `file_not_found` | 资源不存在 |
+| 405 | `method_not_allowed` | 非转发接口用了 GET/DELETE，应改用 POST |
+| 409 | `version_conflict` / `user_exists` / `reload_unavailable` | 版本冲突、用户重名、热重载不可用 |
+| 422 | `validation_error` | 请求体不符合 schema，`details.errors` 是字段级错误 |
+| 500 | `internal_error` / `write_failed` / `key_generation_failed` | 服务内部或写盘失败 |
+| 503 | `key_store_unavailable` | 用户密钥库未就绪 |
+
+`/v1/*` 转发协议接口**不使用**上面的形状，继续保持 OpenAI/上游兼容的错误体。

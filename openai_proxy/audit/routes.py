@@ -8,12 +8,20 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, Query, Response
+from pydantic import BaseModel, Field
 
 from openai_proxy.audit.manager import AuditManager
 from openai_proxy.audit.query import UsageQueryService, parse_time
+from openai_proxy.core.api_errors import ApiError
 
 logger = logging.getLogger(__name__)
+
+
+class PruneRequest(BaseModel):
+    """清理请求：POST 方式用 JSON body 传截止时间"""
+
+    before: str = Field(..., description="ISO 时间、日期或 30d")
 
 
 def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
@@ -29,21 +37,34 @@ def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
         manager = audit_provider()
         return manager.query_service
 
-    @router.get("/admin/usage/summary")
+    @router.post("/admin/usage/summary")
     async def usage_summary(
-        group_by: str = Query("model", description="model|platform|endpoint|selector|outcome|error|day|hour"),
+        group_by: str = Query("model", description="model|platform|user|endpoint|selector|outcome|error|day|hour"),
         since: Optional[str] = Query(None, description="ISO 时间、日期或 7d/24h/30m"),
         until: Optional[str] = None,
         platform: Optional[str] = None,
         model: Optional[str] = None,
         endpoint: Optional[str] = None,
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
         limit: int = Query(100, ge=1, le=1000),
         sort: str = Query("requests", description="requests|p95|duration|ttft|throughput|failover|errors|tokens"),
     ) -> Dict[str, Any]:
         """按维度聚合用量与性能指标"""
-        return await _run(_queries().summary, group_by, since, until, platform, model, endpoint, limit, sort)
+        return await _run(
+            _queries().summary, group_by, since, until, platform, model, endpoint, limit, sort, user
+        )
 
-    @router.get("/admin/usage/timeseries")
+    @router.post("/admin/usage/daily")
+    async def usage_daily(
+        since: Optional[str] = Query(None, description="ISO 时间、日期或 7d/24h/30m"),
+        until: Optional[str] = None,
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
+        limit: int = Query(2000, ge=1, le=5000),
+    ) -> Dict[str, Any]:
+        """全量日用量（按日期 + 用户），不受审计明细保留期影响"""
+        return await _run(_queries().daily_usage, since, until, user, limit)
+
+    @router.post("/admin/usage/timeseries")
     async def usage_timeseries(
         bucket: str = Query("hour", description="hour|day"),
         since: Optional[str] = None,
@@ -51,21 +72,23 @@ def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
         platform: Optional[str] = None,
         model: Optional[str] = None,
         endpoint: Optional[str] = None,
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
     ) -> Dict[str, Any]:
         """按小时/天分桶的时序数据"""
-        return await _run(_queries().timeseries, bucket, since, until, platform, model, endpoint)
+        return await _run(_queries().timeseries, bucket, since, until, platform, model, endpoint, user)
 
-    @router.get("/admin/usage/models")
+    @router.post("/admin/usage/models")
     async def usage_models(
         sort: str = Query("requests", description="requests|p95|duration|ttft|throughput|failover|errors|tokens"),
         since: Optional[str] = None,
         until: Optional[str] = None,
         limit: int = Query(20, ge=1, le=500),
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
     ) -> Dict[str, Any]:
         """模型对比榜：慢模型、不稳定模型、用量大户"""
-        return await _run(_queries().model_ranking, sort, since, until, limit)
+        return await _run(_queries().model_ranking, sort, since, until, limit, user)
 
-    @router.get("/admin/audit")
+    @router.post("/admin/audit")
     async def audit_list(
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -74,6 +97,7 @@ def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
         outcome: Optional[str] = None,
         endpoint: Optional[str] = None,
         gateway_request_id: Optional[str] = None,
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> Dict[str, Any]:
@@ -81,37 +105,46 @@ def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
         try:
             return await asyncio.to_thread(
                 _queries().list_attempts, since, until, platform, model, outcome, endpoint,
-                gateway_request_id, limit, offset,
+                gateway_request_id, limit, offset, user,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise ApiError(400, "invalid_parameter", str(exc)) from exc
 
-    @router.get("/admin/audit/chain/{gateway_request_id}")
+    @router.post("/admin/audit/chain/{gateway_request_id}")
     async def audit_chain(gateway_request_id: str) -> Dict[str, Any]:
         """还原一次请求的完整故障转移链"""
         return await asyncio.to_thread(_queries().chain, gateway_request_id)
 
-    @router.get("/admin/audit/stats")
+    @router.post("/admin/audit/stats")
     async def audit_stats() -> Dict[str, Any]:
         """审计自身的健康状态：行数、库体积、丢弃计数、最近刷盘时间"""
         return audit_provider().health()
 
-    @router.delete("/admin/audit")
+    @router.post("/admin/audit/prune")
+    async def audit_prune_post(payload: PruneRequest) -> Dict[str, Any]:
+        """删除指定时间之前的审计记录（POST 版本，推荐）"""
+        return await _prune(payload.before)
+
     async def audit_prune(before: str = Query(..., description="ISO 时间、日期或 30d")) -> Dict[str, Any]:
-        """删除指定时间之前的审计记录"""
+        """删除指定时间之前的审计记录（保留 DELETE 以兼容旧调用）"""
+        return await _prune(before)
+
+    async def _prune(before: str) -> Dict[str, Any]:
+        """按时间清理审计明细（两种方法共用）"""
         try:
             cutoff = parse_time(before)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise ApiError(400, "invalid_parameter", str(exc)) from exc
         removed = await asyncio.to_thread(_queries().prune, cutoff)
         return {"deleted": removed, "before": cutoff}
 
+    @router.post("/metrics")
     @router.get("/metrics")
     async def metrics() -> Response:
         """Prometheus 指标（来自审计落库时的同步打点）"""
         manager = audit_provider()
         if not manager.config.prometheus_enabled:
-            raise HTTPException(status_code=404, detail="Prometheus 指标已关闭（audit.prometheus_enabled=false）")
+            raise ApiError(404, "metrics_disabled", "Prometheus 指标已关闭（audit.prometheus_enabled=false）")
         from openai_proxy.utils.metrics import metrics_collector
 
         return Response(
@@ -123,8 +156,8 @@ def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
 
 
 async def _run(func: Callable[..., Dict[str, Any]], *args: Any) -> Dict[str, Any]:
-    """在线程池执行 SQLite 查询，并把手动传入的非法参数转成 400"""
+    """在线程池执行 SQLite 查询，并把手动传入的非法参数转成统一错误"""
     try:
         return await asyncio.to_thread(func, *args)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise ApiError(400, "invalid_parameter", str(exc)) from exc

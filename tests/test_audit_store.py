@@ -122,6 +122,56 @@ class TestSchemaMigration:
         upgraded.close()
 
     @pytest.mark.unit
+    def test_老库缺api_user列时会自动补列(self, tmp_path):
+        path = str(tmp_path / "audit.db")
+        legacy = SqliteAuditStore(path)
+        legacy.init_schema()
+        legacy.insert_many([_row("req1-1")])
+        legacy._conn.execute("DROP INDEX idx_audit_user")
+        legacy._conn.execute("ALTER TABLE audit_attempts DROP COLUMN api_user")
+        legacy._conn.execute("PRAGMA user_version = 1")
+        legacy._conn.commit()
+        legacy.close()
+
+        upgraded = SqliteAuditStore(path)
+        upgraded.init_schema()
+
+        columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(audit_attempts)")}
+        rows = upgraded.query("SELECT api_user FROM audit_attempts")
+        # 历史行无法还原调用方：迁移后统一归到 admin
+        assert "api_user" in columns
+        assert rows[0]["api_user"] == "admin"
+        upgraded.close()
+
+    @pytest.mark.unit
+    def test_老库的anonymous日汇总并入admin(self, tmp_path):
+        path = str(tmp_path / "audit.db")
+        legacy = SqliteAuditStore(path)
+        legacy.init_schema()
+        legacy._conn.executemany(
+            "INSERT INTO usage_daily (day, api_user, requests, attempts, success, failure, aborted, retries, "
+            "input_tokens, cached_tokens, output_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("2026-01-01", "anonymous", 2, 2, 2, 0, 0, 0, 100, 10, 200, "2026-01-01T10:00:00.000+00:00"),
+                ("2026-01-01", "admin", 1, 1, 1, 0, 0, 0, 50, 5, 80, "2026-01-01T11:00:00.000+00:00"),
+            ],
+        )
+        legacy._conn.execute("PRAGMA user_version = 3")
+        legacy._conn.commit()
+        legacy.close()
+
+        upgraded = SqliteAuditStore(path)
+        upgraded.init_schema()
+
+        rows = upgraded.query("SELECT * FROM usage_daily")
+        assert len(rows) == 1
+        assert rows[0]["api_user"] == "admin"
+        assert rows[0]["requests"] == 3
+        assert rows[0]["input_tokens"] == 150
+        assert rows[0]["output_tokens"] == 280
+        upgraded.close()
+
+    @pytest.mark.unit
     def test_迁移只会执行一次(self, tmp_path):
         upgraded = SqliteAuditStore(self._legacy_db(tmp_path))
         upgraded.init_schema()
@@ -132,7 +182,7 @@ class TestSchemaMigration:
         upgraded.init_schema()
 
         columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(audit_attempts)")}
-        assert version == 1
+        assert version == 4
         assert "done_sent" not in columns
         upgraded.close()
 
@@ -242,6 +292,102 @@ class TestStats:
         assert stats["rows"] == 1
         assert stats["oldest"] == stats["newest"]
         assert stats["db_bytes"] > 0
+
+
+class TestUsageAggregate:
+    """全量日汇总：usage_daily 只累加、不随明细清理"""
+
+    @staticmethod
+    def _success(key: str, ts: str, api_user: str, input_tokens: int = 100, cached: int = 30, output: int = 200) -> dict:
+        attempt = AuditAttempt(
+            attempt_key=key,
+            gateway_request_id=key.rsplit("-", 1)[0],
+            endpoint="chat_completions",
+            stream=False,
+            platform="example-platform",
+            model_name="example-platform|model-a",
+            ts=ts,
+            api_user=api_user,
+        )
+        attempt.mark_success({
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output,
+                "total_tokens": input_tokens + output,
+                "prompt_tokens_details": {"cached_tokens": cached},
+            }
+        })
+        return attempt.to_row()
+
+    @pytest.mark.unit
+    def test_已收尾明细按天与用户累加(self, store):
+        store.insert_many([
+            self._success("r1-1", "2026-01-01T10:00:00.000+00:00", "user-a"),
+            dict(_row("r2-1", ts="2026-01-01T10:01:00.000+00:00", api_user="user-a")),
+            dict(_row("r3-1", ts="2026-01-02T10:00:00.000+00:00", api_user="user-b")),
+        ])
+
+        assert store.aggregate_usage() == 3
+
+        rows = store.query("SELECT * FROM usage_daily ORDER BY day, api_user")
+        first = rows[0]
+        assert (first["day"], first["api_user"]) == ("2026-01-01", "user-a")
+        assert first["requests"] == 2 and first["attempts"] == 2
+        assert first["success"] == 1 and first["failure"] == 1
+        assert first["input_tokens"] == 100 and first["cached_tokens"] == 30
+        assert first["output_tokens"] == 200
+        assert (rows[1]["day"], rows[1]["api_user"]) == ("2026-01-02", "user-b")
+
+    @pytest.mark.unit
+    def test_重复汇总不会重复计数(self, store):
+        store.insert_many([self._success("r1-1", "2026-01-01T10:00:00.000+00:00", "user-a")])
+
+        assert store.aggregate_usage() == 1
+        assert store.aggregate_usage() == 0
+
+        row = store.query("SELECT * FROM usage_daily")[0]
+        assert row["attempts"] == 1 and row["output_tokens"] == 200
+
+    @pytest.mark.unit
+    def test_未收尾的流不计入日汇总(self, store):
+        attempt = AuditAttempt(
+            attempt_key="r1-1",
+            gateway_request_id="r1",
+            endpoint="chat_completions",
+            stream=True,
+            platform="example-platform",
+            model_name="example-platform|model-a",
+            ts="2026-01-01T10:00:00.000+00:00",
+            api_user="user-a",
+        )
+        attempt.mark_stream_open()
+        store.insert_many([attempt.to_row()])
+
+        assert store.aggregate_usage() == 0
+        assert store.query("SELECT * FROM usage_daily") == []
+
+    @pytest.mark.unit
+    def test_清理明细不会删除日汇总(self, store):
+        store.insert_many([self._success("r1-1", "2026-01-01T10:00:00.000+00:00", "user-a")])
+        store.aggregate_usage()
+
+        store.prune("2026-02-01T00:00:00.000+00:00")
+
+        assert store.query("SELECT * FROM audit_attempts") == []
+        assert store.query("SELECT * FROM usage_daily")[0]["output_tokens"] == 200
+
+    @pytest.mark.unit
+    def test_配置变更不进入用量(self, store):
+        config_row = dict(
+            _row("config-1", ts="2026-01-01T10:00:00.000+00:00"),
+            endpoint="config_write",
+            outcome=OUTCOME_SUCCESS,
+            finalized=1,
+        )
+        store.insert_many([config_row])
+
+        assert store.aggregate_usage() == 1
+        assert store.query("SELECT * FROM usage_daily") == []
 
 
 class TestNullStore:

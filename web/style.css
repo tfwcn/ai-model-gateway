@@ -99,7 +99,13 @@ input[type="password"] { min-width: 220px; }
 button { cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.ghost { background: transparent; color: var(--muted); }
+button.danger { color: var(--bad); border-color: var(--bad); background: transparent; }
 button:disabled { opacity: .5; cursor: not-allowed; }
+input.key-reveal {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--chip);
+}
 
 main { padding: 16px 18px 40px; max-width: 1280px; margin: 0 auto; }
 

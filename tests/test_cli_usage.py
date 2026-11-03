@@ -108,6 +108,7 @@ def audit_db(tmp_path):
     store = SqliteAuditStore(path)
     store.init_schema()
     store.insert_many([_attempt(*row).to_row() for row in ROWS])
+    store.aggregate_usage()
     store.close()
     return path
 
@@ -178,6 +179,16 @@ class TestSummary:
 
         assert code == 0
         assert "2026-01-01" in out and "2026-01-02" in out
+
+    @pytest.mark.unit
+    def test_全量日用量显示输入输出缓存token(self, capsys, cli_args):
+        code, out, _ = run_cli(capsys, *cli_args, "usage", "daily")
+
+        assert code == 0
+        assert "全量日用量" in out
+        assert "输入" in out and "输出" in out and "缓存" in out
+        # 两条 success 各 200 输出 tokens
+        assert "400" in out
 
     @pytest.mark.unit
     def test_没有记录时给出空提示而不是崩溃(self, capsys, cli_args, audit_db):

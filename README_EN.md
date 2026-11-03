@@ -38,7 +38,7 @@ Are you facing these issues?
 - 🛡️ **Smart Error Classification**: 7 error types with precise retry/disable strategies
 - 🔧 **Tool Call Converter**: Auto-convert non-standard formats (NVIDIA JSON, Minimax XML) to OpenAI standard
 - 📡 **OpenAI Responses API**: Full `/v1/responses` endpoint with protocol conversion
-- 🔑 **Bearer Token Auth**: Optional `GATEWAY_API_KEY` to protect all endpoints
+- 🔑 **Admin + user-level keys**: `GATEWAY_API_KEY` for the admin console; per-user keys for traffic accounting
 - 📊 **Prometheus Monitoring**: Real-time metrics for requests, latency, errors
 - 🚀 **Zero Client Changes**: Fully compatible with OpenAI API
 
@@ -52,7 +52,7 @@ Are you facing these issues?
 | **Tool Capability Testing**    | Auto-test tool call support on model discovery, keep only supported models       |
 | **Model Retry Mechanism**      | Configurable `retry_count`, intelligent retry based on error type                |
 | **Model Alias & Blacklist**    | `all_aliases` for multiple aliases, `blacklist` with glob pattern matching       |
-| **GATEWAY_API_KEY Auth**       | Optional Bearer Token authentication for all API endpoints                       |
+| **GATEWAY_API_KEY Auth**       | Admin key protects `/admin/*` and `/metrics`; user keys are managed in the UI |
 | **Redis Cache & Sessions**     | Response caching + Responses API session history, auto-fallback to file storage  |
 | **SSE Normalization**          | Unified SSE event format, eliminating duplicate code across endpoints            |
 | **Error Classification**       | 7 error types (timeout/connection/auth/rate-limit/server/format/model)           |
@@ -151,12 +151,13 @@ curl http://localhost:8000/v1/responses \
 | `/v1/chat/completions` | POST   | OpenAI Chat Completions (auth required)               |
 | `/v1/responses`        | POST   | OpenAI Responses API (auth required)                  |
 | `/v1/models`           | GET    | List models with filtering/pagination (auth required) |
-| `/health`              | GET    | Basic health check (no auth)                          |
+| `/health`              | GET/POST | Basic health check (no auth)                        |
 | `/health/detailed`     | GET    | Detailed health check                                 |
-| `/metrics`             | GET    | Prometheus metrics (admin key required)               |
-| `/admin/usage/*`       | GET    | Usage & performance aggregates (admin key required)   |
-| `/admin/audit*`        | GET    | Audit details and failover chains (admin key required)|
-| `/admin/config/*`      | GET/POST | Config read, dry-run plan, apply, rollback          |
+| `/metrics`             | POST/GET | Prometheus metrics (admin key; GET for scraping)    |
+| `/admin/usage/*`       | POST   | Usage & performance aggregates (admin key required)   |
+| `/admin/audit*`        | POST   | Audit details and failover chains (admin key required)|
+| `/admin/config/*`      | POST   | Config read, dry-run plan, apply, rollback            |
+| `/admin/users*`        | POST   | Create/list/delete user keys (admin key required)     |
 | `/admin/ui/`           | GET    | Admin UI shell (no key needed; its data calls do)     |
 
 ### Model Selection
@@ -238,7 +239,8 @@ MODELSCOPE_API_KEY=your-modelscope-api-key
 OPENROUTER_API_KEY=your-openrouter-api-key
 NVIDIA_API_KEY=your-nvidia-api-key
 OPENAI_API_KEY=your-openai-api-key
-GATEWAY_API_KEY=your-gateway-api-key   # Optional auth
+GATEWAY_API_KEY=your-gateway-api-key   # admin console key; empty disables admin endpoints
+# API_KEYS_DB_PATH=data/api_keys.db    # user-level keys (add/remove in the UI)
 REDIS_URL=redis://localhost:6379       # Optional Redis
 
 # Skip plugin scraper, use cached models directly (optional)
@@ -303,13 +305,17 @@ Accounting rules: **one client request = one `gateway_request_id`, one upstream 
 failover chain can be reconstructed. Success rate only counts finalized attempts (`finalized=1`); a stream that is
 still being forwarded is recorded as `stream_open` and stays out of the denominator.
 
+Retention is split: **audit details are kept for 30 days** by default (for drill-down and troubleshooting), while
+**all-time daily usage is kept forever** (`usage_daily`, aggregated by day + user with input / cached / output tokens).
+Clearing details therefore never deletes historical usage. The daily endpoint is `POST /admin/usage/daily`.
+
 ### Admin UI
 
 ```text
 http://localhost:8000/admin/ui/     # open it, then enter GATEWAY_API_KEY to connect
 ```
 
-Four tabs: usage & performance, audit details, model config, backups & rollback. Pure static pages (no build step,
+Five tabs: usage & performance, audit details, user keys, model config, backups & rollback. Pure static pages (no build step,
 no external dependencies). The key lives only in browser `sessionStorage`, and **key values are never sent to the
 browser**: the config view only shows which environment variable a key references and whether it is set.
 
@@ -318,6 +324,7 @@ browser**: the config view only shows which environment variable a key reference
 ```bash
 # Usage and performance
 python manage.py usage summary --group-by model --since 7d
+python manage.py usage daily --since 90d              # all-time daily tokens, by user
 python manage.py usage models --sort p95              # slowest models
 python manage.py usage attempts --outcome failure     # failed attempts only
 python manage.py usage chain <gateway_request_id>     # reconstruct the failover chain

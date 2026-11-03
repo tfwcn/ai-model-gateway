@@ -30,7 +30,7 @@ FINAL_OUTCOMES = (OUTCOME_SUCCESS, OUTCOME_FAILURE, OUTCOME_ABORTED)
 
 # 落库列顺序，与 SqliteAuditStore 的建表语句一一对应
 COLUMNS = (
-    "attempt_key", "gateway_request_id", "request_id", "endpoint", "stream",
+    "attempt_key", "gateway_request_id", "api_user", "request_id", "endpoint", "stream",
     "selector", "platform", "model_name", "model_id", "attempt_seq", "retry_seq",
     "ts", "outcome", "finalized", "http_status", "error_category", "error_code",
     "disabled_model", "duration_ms", "probe_ms", "ttft_ms", "has_usage", "upstream_id",
@@ -67,6 +67,8 @@ class AuditAttempt:
     gateway_request_id: str
     endpoint: str
     stream: bool
+    # 调用方标签：来自用户级密钥的名称；未启用鉴权时为空，查询时按 admin 展示
+    api_user: str = ""
     selector: str = ""
     platform: str = ""
     model_name: str = ""

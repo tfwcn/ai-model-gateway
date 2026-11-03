@@ -230,3 +230,75 @@ class TestDetails:
 
         assert removed == 3
         assert queries.list_attempts()["total"] == 2
+
+
+class TestDailyUsage:
+    """全量日用量：按天 + 用户，不受明细清理影响"""
+
+    @pytest.fixture
+    def queries(self, tmp_path):
+        store = SqliteAuditStore(str(tmp_path / "audit.db"))
+        store.init_schema()
+        store.insert_many([
+            _usage_row("r1-1", "2026-01-01T10:00:00.000+00:00", "user-a", 100, 10, 200),
+            _usage_row("r2-1", "2026-01-02T10:00:00.000+00:00", "user-a", 50, 5, 80),
+            _usage_row("r3-1", "2026-01-02T11:00:00.000+00:00", "user-b", 30, 0, 40),
+        ])
+        store.aggregate_usage()
+        yield UsageQueryService(store)
+        store.close()
+
+    @pytest.mark.unit
+    def test_按天与用户返回token(self, queries):
+        result = queries.daily_usage()
+
+        assert result["count"] == 3
+        assert [(row["day"], row["api_user"]) for row in result["items"]] == [
+            ("2026-01-01", "user-a"),
+            ("2026-01-02", "user-a"),
+            ("2026-01-02", "user-b"),
+        ]
+        assert result["items"][0]["input_tokens"] == 100
+        assert result["items"][0]["cached_tokens"] == 10
+        assert result["items"][0]["output_tokens"] == 200
+
+    @pytest.mark.unit
+    def test_汇总合计与用户过滤(self, queries):
+        all_rows = queries.daily_usage()
+        assert all_rows["totals"]["output_tokens"] == 320
+        assert all_rows["totals"]["input_tokens"] == 180
+
+        only_user_b = queries.daily_usage(user="user-b")
+        assert only_user_b["count"] == 1
+        assert only_user_b["totals"]["output_tokens"] == 40
+
+    @pytest.mark.unit
+    def test_按日期过滤(self, queries):
+        result = queries.daily_usage(since="2026-01-02", until="2026-01-03")
+
+        assert result["count"] == 2
+        assert {row["day"] for row in result["items"]} == {"2026-01-02"}
+
+
+def _usage_row(key: str, ts: str, api_user: str, input_tokens: int, cached: int, output: int) -> dict:
+    """构造一条带 token 用量的成功审计行"""
+    attempt = AuditAttempt(
+        attempt_key=key,
+        gateway_request_id=key.rsplit("-", 1)[0],
+        endpoint="chat_completions",
+        stream=False,
+        platform="example-platform",
+        model_name="example-platform|model-a",
+        model_id="model-a",
+        ts=ts,
+        api_user=api_user,
+    )
+    attempt.mark_success({
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output,
+            "total_tokens": input_tokens + output,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        }
+    })
+    return attempt.to_row()

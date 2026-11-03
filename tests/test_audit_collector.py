@@ -43,6 +43,9 @@ class RecordingStore:
     def prune(self, before_iso):
         return 0
 
+    def aggregate_usage(self):
+        return 0
+
     def prune_old(self, retention_days):
         return 0
 

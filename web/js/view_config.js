@@ -2,7 +2,7 @@
  * 视图：模型配置
  *
  * 流程（与后端一致，避免「预演通过、写盘却不同」）：
- *   1. GET /admin/config/document + /admin/config/schema  → 渲染表单
+ *   1. POST /admin/config/document + /admin/config/schema  → 渲染表单
  *   2. 用户改动 → 攒成补丁操作（ops）
  *   3. POST /admin/config/plan  → 看行级差异与校验结果
  *   4. POST /admin/config/apply → 带 If-Match 版本号写盘（冲突返回 409）
@@ -94,11 +94,11 @@ export async function renderConfig(root, ctx) {
   async function refresh() {
     try {
       const [document, schema, runtime] = await Promise.all([
-        ctx.api.get("/admin/config/document"),
-        ctx.api.get("/admin/config/schema"),
+        ctx.api.postQuery("/admin/config/document"),
+        ctx.api.postQuery("/admin/config/schema"),
         // 爬虫平台的模型只存在于进程里：屏蔽模型与别名指向的候选要从这里拿
         // 这一路失败不该让整个配置页读不出来：候选变少而已，页面照常可用
-        ctx.api.get("/admin/config/models").catch(() => ({
+        ctx.api.postQuery("/admin/config/models").catch(() => ({
           loaded: false, total: 0, platforms: [], note: "运行时模型清单读不到，下拉里只有配置文件里的条目",
         })),
       ]);

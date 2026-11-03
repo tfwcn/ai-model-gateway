@@ -101,6 +101,7 @@ class AuditContext:
         stream: bool = False,
         gateway_request_id: Optional[str] = None,
         msg_count: Optional[int] = None,
+        api_user: str = "",
     ):
         self.collector = collector
         self.endpoint = endpoint
@@ -108,6 +109,7 @@ class AuditContext:
         self.stream = stream
         self.gateway_request_id = gateway_request_id or uuid.uuid4().hex[:8]
         self.msg_count = msg_count
+        self.api_user = (api_user or "").strip()
         self.attempt_seq = 0
         self._previous_model: str = ""
         self._last_recorder: Optional[AttemptRecorder] = None
@@ -132,6 +134,7 @@ class AuditContext:
         attempt = AuditAttempt(
             attempt_key=build_attempt_key(self.gateway_request_id, self.attempt_seq),
             gateway_request_id=self.gateway_request_id,
+            api_user=self.api_user,
             endpoint=self.endpoint,
             stream=self.stream,
             selector=self.selector,

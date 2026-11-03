@@ -19,6 +19,8 @@ from openai_proxy.audit.record import COLUMNS
 logger = logging.getLogger(__name__)
 
 TABLE = "audit_attempts"
+# 全量日汇总：审计明细按保留期清理，这张表永久保留，用于「用量不丢历史」
+USAGE_TABLE = "usage_daily"
 
 # 主键 + 常用过滤维度的索引：按时间、按模型、按结局、按请求链
 _INDEX_DDL = (
@@ -27,12 +29,17 @@ _INDEX_DDL = (
     f"CREATE INDEX IF NOT EXISTS idx_audit_outcome ON {TABLE}(outcome, ts)",
     f"CREATE INDEX IF NOT EXISTS idx_audit_greq ON {TABLE}(gateway_request_id)",
     f"CREATE INDEX IF NOT EXISTS idx_audit_endpoint ON {TABLE}(endpoint, ts)",
+    f"CREATE INDEX IF NOT EXISTS idx_audit_user ON {TABLE}(api_user, ts)",
+    # 只有「已收尾但还没汇总」的行会被扫描，索引很小
+    f"CREATE INDEX IF NOT EXISTS idx_audit_pending_agg ON {TABLE}(finalized, aggregated) "
+    f"WHERE finalized = 1 AND aggregated = 0",
 )
 
 _CREATE_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
     attempt_key         TEXT PRIMARY KEY,
     gateway_request_id  TEXT NOT NULL,
+    api_user            TEXT,
     request_id          TEXT,
     endpoint            TEXT NOT NULL,
     stream              INTEGER NOT NULL DEFAULT 0,
@@ -62,7 +69,27 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     tool_call_converted INTEGER,
     keepalive_count     INTEGER,
     msg_count           INTEGER,
-    done_sent           INTEGER NOT NULL DEFAULT 0
+    done_sent           INTEGER NOT NULL DEFAULT 0,
+    aggregated          INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+# 全量日汇总：按 (日期, 用户) 累加，不随审计明细的保留期清理
+_USAGE_DDL = f"""
+CREATE TABLE IF NOT EXISTS {USAGE_TABLE} (
+    day             TEXT NOT NULL,
+    api_user        TEXT NOT NULL,
+    requests        INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    success         INTEGER NOT NULL DEFAULT 0,
+    failure         INTEGER NOT NULL DEFAULT 0,
+    aborted         INTEGER NOT NULL DEFAULT 0,
+    retries         INTEGER NOT NULL DEFAULT 0,
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    cached_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (day, api_user)
 )
 """
 
@@ -76,6 +103,51 @@ _MIGRATIONS: Dict[int, Dict[str, Any]] = {
         "columns": {"done_sent": "INTEGER NOT NULL DEFAULT 0"},
         "statements": (
             f"UPDATE {TABLE} SET done_sent = 1 WHERE outcome = 'success' AND stream = 1",
+        ),
+    },
+    # 版本 2（api_user）：用户级密钥引入的调用方标签。历史行无法还原调用方，保持 NULL，
+    # 查询侧按 admin 展示，避免把未知来源硬塞给某个真实用户。
+    2: {
+        "columns": {"api_user": "TEXT"},
+        "statements": (),
+    },
+    # 版本 3（aggregated）：标记审计行是否已经进入 usage_daily 全量日汇总。
+    # 历史已收尾行默认 0，升级后的第一次汇总会把它们补进日汇总表。
+    3: {
+        "columns": {"aggregated": "INTEGER NOT NULL DEFAULT 0"},
+        "statements": (),
+    },
+    # 版本 4：不再区分 anonymous，历史与未鉴权流量统一归到 admin。
+    # usage_daily 的 anonymous 行先并入当天的 admin 行，再删掉；审计明细同步回填。
+    4: {
+        "columns": {},
+        "statements": (
+            f"""
+            INSERT INTO {USAGE_TABLE} (
+                day, api_user, requests, attempts, success, failure, aborted, retries,
+                input_tokens, cached_tokens, output_tokens, updated_at
+            )
+            SELECT
+                day, 'admin', SUM(requests), SUM(attempts), SUM(success), SUM(failure),
+                SUM(aborted), SUM(retries), SUM(input_tokens), SUM(cached_tokens),
+                SUM(output_tokens), MAX(updated_at)
+            FROM {USAGE_TABLE}
+            WHERE api_user = 'anonymous'
+            GROUP BY day
+            ON CONFLICT(day, api_user) DO UPDATE SET
+                requests = requests + excluded.requests,
+                attempts = attempts + excluded.attempts,
+                success = success + excluded.success,
+                failure = failure + excluded.failure,
+                aborted = aborted + excluded.aborted,
+                retries = retries + excluded.retries,
+                input_tokens = input_tokens + excluded.input_tokens,
+                cached_tokens = cached_tokens + excluded.cached_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                updated_at = excluded.updated_at
+            """,
+            f"DELETE FROM {USAGE_TABLE} WHERE api_user = 'anonymous'",
+            f"UPDATE {TABLE} SET api_user = 'admin' WHERE api_user IS NULL OR api_user = ''",
         ),
     },
 }
@@ -98,6 +170,10 @@ class AuditStore(ABC):
 
     @abstractmethod
     def prune(self, before_iso: str) -> int:
+        ...
+
+    @abstractmethod
+    def aggregate_usage(self) -> int:
         ...
 
     @abstractmethod
@@ -137,6 +213,7 @@ class SqliteAuditStore(AuditStore):
         """建表建索引，并按版本补齐老库缺少的列（幂等）"""
         with self._lock, self._conn:
             self._conn.execute(_CREATE_DDL)
+            self._conn.execute(_USAGE_DDL)
             self._migrate_schema()
             for ddl in _INDEX_DDL:
                 self._conn.execute(ddl)
@@ -202,6 +279,56 @@ class SqliteAuditStore(AuditStore):
             cursor = self._conn.execute(f"UPDATE {TABLE} SET {assignments} WHERE attempt_key = ?", params)
             return cursor.rowcount
 
+    def aggregate_usage(self) -> int:
+        """
+        把「已收尾但还没汇总」的审计行累加进全量日汇总表
+
+        与写审计行分开执行：先落明细，再一次性汇总；两步都在同一个事务里，
+        中途崩溃不会留下「算了一半」的日汇总。配置变更审计（config_write）不进入用量。
+        返回本次标记为已汇总的明细行数。
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"""
+                INSERT INTO {USAGE_TABLE} (
+                    day, api_user, requests, attempts, success, failure, aborted, retries,
+                    input_tokens, cached_tokens, output_tokens, updated_at
+                )
+                SELECT
+                    substr(ts, 1, 10) AS day,
+                    COALESCE(NULLIF(api_user, ''), 'admin') AS api_user,
+                    COUNT(DISTINCT gateway_request_id) AS requests,
+                    COUNT(*) AS attempts,
+                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success,
+                    SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failure,
+                    SUM(CASE WHEN outcome = 'aborted' THEN 1 ELSE 0 END) AS aborted,
+                    SUM(CASE WHEN retry_seq > 1 THEN 1 ELSE 0 END) AS retries,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    ? AS updated_at
+                FROM {TABLE}
+                WHERE finalized = 1 AND aggregated = 0 AND endpoint != 'config_write'
+                GROUP BY day, api_user
+                ON CONFLICT(day, api_user) DO UPDATE SET
+                    requests = requests + excluded.requests,
+                    attempts = attempts + excluded.attempts,
+                    success = success + excluded.success,
+                    failure = failure + excluded.failure,
+                    aborted = aborted + excluded.aborted,
+                    retries = retries + excluded.retries,
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    cached_tokens = cached_tokens + excluded.cached_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    updated_at = excluded.updated_at
+                """,
+                (_now_iso(),),
+            )
+            cursor = self._conn.execute(
+                f"UPDATE {TABLE} SET aggregated = 1 WHERE finalized = 1 AND aggregated = 0"
+            )
+            return cursor.rowcount
+
     def prune(self, before_iso: str) -> int:
         """删除指定时间之前的记录"""
         with self._lock, self._conn:
@@ -259,6 +386,9 @@ class NullAuditStore(AuditStore):
     def prune(self, before_iso: str) -> int:
         return 0
 
+    def aggregate_usage(self) -> int:
+        return 0
+
     def prune_old(self, retention_days: int) -> int:
         return 0
 
@@ -277,3 +407,8 @@ def _as_sql_value(value: Any) -> Any:
     if isinstance(value, bool):
         return 1 if value else 0
     return value
+
+
+def _now_iso() -> str:
+    """当前 UTC 时间（毫秒精度），写入日汇总的 updated_at"""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")

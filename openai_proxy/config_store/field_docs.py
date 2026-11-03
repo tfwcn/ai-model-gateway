@@ -161,16 +161,16 @@ AUDIT_DOCS: Dict[str, FieldDoc] = {
     ),
     "retention_days": FieldDoc(
         "保留天数",
-        "启动时清理一次早于「现在 - N 天」的审计行。",
+        "定期清理早于「现在 - N 天」的审计明细；全量日用量永久保留。",
         "天（整数）", "30 天", "retention_days: 45", RESTART,
-        "只在启动那一刻清一次，运行中不会持续回收；临时清理用 DELETE /admin/audit?before=...。"
+        "启动时清理一次，运行中每 6 小时再检查一次；临时清理用 POST /admin/audit/prune，body 传 before。"
         "下限是 1，配置层面写不出「永不清理」，要长期保留就写一个大天数。",
     ),
     "queue_size": FieldDoc(
         "缓冲行数上限",
         "内存里最多挂多少条还没落库的审计行；超限时丢弃最旧的一条并计数。",
         "行数（整数）", "10000", "queue_size: 20000", RESTART,
-        "丢弃计数在 GET /admin/audit/stats 里能看到。采集是同步非阻塞的：审计出问题不会变成转发失败。",
+        "丢弃计数在 POST /admin/audit/stats 里能看到。采集是同步非阻塞的：审计出问题不会变成转发失败。",
     ),
     "batch_size": FieldDoc(
         "刷盘块大小",
@@ -198,9 +198,9 @@ AUDIT_DOCS: Dict[str, FieldDoc] = {
     ),
     "prometheus_enabled": FieldDoc(
         "Prometheus 打点",
-        "是否把落库的审计行同时喂给 Prometheus，并暴露 GET /metrics。",
+        "是否把落库的审计行同时喂给 Prometheus，并暴露 POST /metrics（GET 保留给 Prometheus 抓取）。",
         "true/false", "true", "prometheus_enabled: true", RESTART,
-        "关掉时 GET /metrics 返回 404 并说明原因。没装 prometheus_client 时打点自动停用，服务照常运行。"
+        "关掉时 /metrics 返回 404 并说明原因。没装 prometheus_client 时打点自动停用，服务照常运行。"
         "/metrics 同样受 GATEWAY_API_KEY 保护。",
     ),
     "metrics_label_model": FieldDoc(

@@ -37,7 +37,7 @@
 - 🛡️ **智能错误分类**：7 种错误类型精细化处理，区分可重试/不可重试
 - 🔧 **工具调用格式转换**：自动将非标准 tool call 格式（NVIDIA JSON、Minimax XML）转换为标准 OpenAI 格式
 - 📡 **OpenAI Responses API**：支持 `/v1/responses` 协议转换（含流式）
-- 🔑 **Bearer Token 认证**：可选 `GATEWAY_API_KEY` 保护所有接口
+- 🔑 **管理密钥 + 用户级密钥**：`GATEWAY_API_KEY` 连接管理台，用户密钥按用户统计流量
 - 📊 **Prometheus 监控**：实时监控请求量、延迟、错误率
 - 🚀 **零客户端改造**：完全兼容 OpenAI API
 
@@ -52,7 +52,8 @@
 | **模型重试机制**         | 单模型支持多次重试（可配置 `retry_count`），基于错误类型智能重试             |
 | **首块预算 & 故障转移**  | 首块超过预算（默认 20s，`first_chunk_timeout`）即切换模型，避免连接卡死干等  |
 | **模型别名 & 黑名单**    | `all_aliases` 支持多别名，`blacklist` 支持 `*` 通配符过滤                    |
-| **GATEWAY_API_KEY 认证** | 可选 Bearer Token 认证保护所有 API 接口                                      |
+| **GATEWAY_API_KEY 认证** | 管理密钥保护 `/admin/*` 与 `/metrics`，密码永不下发                     |
+| **用户级密钥**           | 管理台可视化新增/删除用户密钥，按用户统计请求量、tokens 与失败率           |
 | **Redis 缓存 & 会话**    | 响应缓存 + Responses API 会话历史，Redis 不可用时自动降级为文件              |
 | **SSE 事件标准化**       | 统一 SSE 格式，消除多端点重复代码                                            |
 | **错误分类系统**         | 7 种错误类型（超时/连接/认证/限流/服务器/格式/模型），精细控制重试和禁用策略 |
@@ -154,12 +155,13 @@ curl http://localhost:8000/v1/responses \
 | `/v1/chat/completions` | POST | OpenAI Chat Completions（需认证）         |
 | `/v1/responses`        | POST | OpenAI Responses API（需认证）            |
 | `/v1/models`           | GET  | 获取可用模型列表（支持筛选/分页，需认证） |
-| `/health`              | GET  | 基本健康检查（免认证）                    |
+| `/health`              | GET/POST | 基本健康检查（免认证）                 |
 | `/health/detailed`     | GET  | 详细健康检查                              |
-| `/metrics`             | GET  | Prometheus 监控指标（需管理密钥）             |
-| `/admin/usage/*`       | GET  | 用量与性能聚合（需管理密钥）                  |
-| `/admin/audit*`        | GET  | 审计明细与故障转移链（需管理密钥）            |
-| `/admin/config/*`      | GET/POST | 配置读取、预演、写盘、回滚（需管理密钥）  |
+| `/metrics`             | POST/GET | Prometheus 监控指标（需管理密钥；GET 供抓取） |
+| `/admin/usage/*`       | POST | 用量与性能聚合（需管理密钥）                  |
+| `/admin/audit*`        | POST | 审计明细与故障转移链（需管理密钥）            |
+| `/admin/config/*`      | POST | 配置读取、预演、写盘、回滚（需管理密钥）      |
+| `/admin/users*`        | POST | 用户密钥新增、查询、删除（需管理密钥）        |
 | `/admin/ui/`           | GET  | 管理台前端（静态壳免密钥，数据接口仍需密钥）  |
 
 ### 模型选择策略
@@ -295,8 +297,11 @@ OPENROUTER_API_KEY=your-openrouter-api-key
 NVIDIA_API_KEY=your-nvidia-api-key
 OPENAI_API_KEY=your-openai-api-key
 
-# Gateway 认证（可选，为空则跳过）
+# Gateway 管理密钥（连接管理台 /admin/* 与 /metrics；为空则管理接口关闭）
 GATEWAY_API_KEY=your-gateway-api-key
+
+# 用户级密钥库（用户密钥在管理台「用户密钥」页新增/删除）
+# API_KEYS_DB_PATH=data/api_keys.db
 
 # Redis 配置（可选，Responses API 会话管理）
 REDIS_URL=redis://localhost:6379
@@ -335,7 +340,7 @@ RESPONSES_SESSION_TTL=86400
 # 优先级：默认值 < 这里的 AUDIT_* < models.yaml 顶层 audit: 段
 # AUDIT_ENABLED=true                  # 总开关，关闭后转发热路径零开销
 # AUDIT_DB_PATH=data/audit.db         # 审计库路径
-# AUDIT_RETENTION_DAYS=30             # 启动时自动清理更早的记录，0 表示不清理
+# AUDIT_RETENTION_DAYS=30             # 审计明细保留天数（启动时与运行中定期清理）；全量日用量永久保留
 # AUDIT_RECORD_FAILED_ONLY=false      # 只记失败尝试，省磁盘但看不到用量
 # AUDIT_PROMETHEUS=true               # 审计落库时同步喂 Prometheus
 
@@ -423,20 +428,29 @@ modelscope:
 统计口径：**一次客户端请求 = 一个 `gateway_request_id`，每次上游尝试 = 一行**，因此可以完整还原故障转移链。
 成功率只统计已收尾的尝试（`finalized=1`），正在转发的流式请求记为 `stream_open`，不进分母。
 
+保留策略分开：**审计明细默认保留 30 天**（用于下钻排障），**全量日用量永久保留**（按日期 + 用户累加输入 / 缓存 / 输出 tokens），
+所以清理明细不会把历史用量一起删掉。日汇总是独立的 `usage_daily` 表，查询接口是 `POST /admin/usage/daily`。
+
 ### 管理台
 
 ```text
 http://localhost:8000/admin/ui/     # 打开后输入 GATEWAY_API_KEY 连接
 ```
 
-四个标签页：用量与性能、审计明细、模型配置、备份与回滚。
+五个标签页：用量与性能、审计明细、用户密钥、模型配置、备份与回滚。
 纯静态页面（无构建、无外部依赖），密钥只存在浏览器 `sessionStorage`；**密钥内容永不下发**，配置视图只给出它引用的环境变量名与是否已设置。
+
+**用户级密钥**：`GATEWAY_API_KEY` 是管理台密钥；给不同用户单独发密钥时，打开「用户密钥」页填写标签并生成，
+明文只显示一次，SQLite 里只保存摘要。每把用户密钥只能访问 `/v1/*`，流量会记到对应用户标签上，
+可在「用量与性能」按用户聚合，或在命令行用 `--user` 过滤。
 
 ### 命令行
 
 ```bash
 # 看用量与性能
 python manage.py usage summary --group-by model --since 7d
+python manage.py usage summary --group-by user --since 30d   # 按用户统计流量
+python manage.py usage daily --since 90d                     # 全量日用量：输入/缓存/输出 tokens
 python manage.py usage models --sort p95              # 谁最慢
 python manage.py usage attempts --outcome failure     # 只看失败的尝试
 python manage.py usage chain <gateway_request_id>     # 还原整条故障转移链

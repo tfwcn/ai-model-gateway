@@ -76,7 +76,8 @@ class UsageCommands:
 
     def usage_summary(self, args) -> int:
         result = self._call(lambda queries: queries.summary(
-            args.group_by, args.since, args.until, args.platform, args.model, args.endpoint, args.limit, args.sort
+            args.group_by, args.since, args.until, args.platform, args.model, args.endpoint, args.limit, args.sort,
+            args.user,
         ))
         if result is None:
             return EXIT_ERROR
@@ -89,7 +90,9 @@ class UsageCommands:
         return EXIT_OK
 
     def usage_models(self, args) -> int:
-        result = self._call(lambda queries: queries.model_ranking(args.sort, args.since, args.until, args.limit))
+        result = self._call(lambda queries: queries.model_ranking(
+            args.sort, args.since, args.until, args.limit, args.user
+        ))
         if result is None:
             return EXIT_ERROR
         if self.console.as_json:
@@ -102,7 +105,7 @@ class UsageCommands:
 
     def usage_timeseries(self, args) -> int:
         result = self._call(lambda queries: queries.timeseries(
-            args.bucket, args.since, args.until, args.platform, args.model, args.endpoint
+            args.bucket, args.since, args.until, args.platform, args.model, args.endpoint, args.user
         ))
         if result is None:
             return EXIT_ERROR
@@ -114,10 +117,39 @@ class UsageCommands:
         self.console.table(_display_rows(result["points"]), _aggregate_columns("bucket"))
         return EXIT_OK
 
+    def usage_daily(self, args) -> int:
+        result = self._call(lambda queries: queries.daily_usage(
+            args.since, args.until, args.user, args.limit
+        ))
+        if result is None:
+            return EXIT_ERROR
+        if self.console.as_json:
+            self.console.emit(result)
+            return EXIT_OK
+
+        totals = result["totals"]
+        self.console.line(
+            f"全量日用量（{result['count']} 行）: "
+            f"输入 {totals.get('input_tokens', 0)} / 缓存 {totals.get('cached_tokens', 0)} / "
+            f"输出 {totals.get('output_tokens', 0)} tokens"
+        )
+        self.console.table(result["items"], [
+            ("day", "日期"),
+            ("api_user", "用户"),
+            ("requests", "请求"),
+            ("attempts", "尝试"),
+            ("input_tokens", "输入tokens"),
+            ("cached_tokens", "缓存tokens"),
+            ("output_tokens", "输出tokens"),
+            ("success", "成功"),
+            ("failure", "失败"),
+        ])
+        return EXIT_OK
+
     def usage_attempts(self, args) -> int:
         result = self._call(lambda queries: queries.list_attempts(
             args.since, args.until, args.platform, args.model, args.outcome, args.endpoint,
-            None, args.limit, args.offset
+            None, args.limit, args.offset, args.user
         ))
         if result is None:
             return EXIT_ERROR
@@ -129,6 +161,7 @@ class UsageCommands:
         self.console.table(_attempt_rows(result["items"]), [
             ("ts", "时间"),
             ("gateway_request_id", "请求"),
+            ("api_user", "用户"),
             ("attempt_seq", "第几次"),
             ("model_name", "模型"),
             ("outcome", "结果"),

@@ -163,6 +163,8 @@ class AuditCollector:
             for start in range(0, len(rows), self.config.batch_size):
                 chunk = rows[start:start + self.config.batch_size]
                 await asyncio.to_thread(self.store.insert_many, chunk)
+            # 明细写成功后再进入全量日汇总；两步一起成功才清空缓冲
+            await asyncio.to_thread(self.store.aggregate_usage)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 写库失败保留缓冲，等下次重试

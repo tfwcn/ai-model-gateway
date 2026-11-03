@@ -12,12 +12,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openai_proxy.audit.record import FINAL_OUTCOMES
-from openai_proxy.audit.store import TABLE, AuditStore
+from openai_proxy.audit.store import TABLE, USAGE_TABLE, AuditStore
 
 # group_by 取值 → SQL 分组表达式（白名单，杜绝注入）
 _GROUP_EXPRS: Dict[str, str] = {
     "model": "COALESCE(model_name, 'unknown')",
     "platform": "COALESCE(platform, 'unknown')",
+    "user": "COALESCE(NULLIF(api_user, ''), 'admin')",
     "endpoint": "endpoint",
     "selector": "COALESCE(selector, '')",
     "outcome": "outcome",
@@ -112,12 +113,13 @@ class UsageQueryService:
         endpoint: Optional[str] = None,
         limit: int = 100,
         sort: str = "requests",
+        user: Optional[str] = None,
     ) -> Dict[str, Any]:
         """按维度聚合用量与性能指标（时间维度按先后顺序返回，其余按 sort 排序）"""
         group_expr = self._group_expr(group_by)
         if sort not in _SORT_KEYS:
             raise ValueError(f"sort 只支持: {', '.join(sorted(_SORT_KEYS))}")
-        where, params = self._filters(since, until, platform, model, endpoint)
+        where, params = self._filters(since, until, platform, model, endpoint, user)
 
         rows = self.store.query(
             f"""
@@ -142,6 +144,75 @@ class UsageQueryService:
             "items": items,
         }
 
+    def daily_usage(
+        self,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        user: Optional[str] = None,
+        limit: int = 2000,
+    ) -> Dict[str, Any]:
+        """
+        全量日用量：按 (日期, 用户) 返回，不受审计明细保留期影响
+
+        数据来自 usage_daily：审计明细会被定期清理，这张表只累加、不删除，
+        因此这里能查到比审计明细更早的用量。
+        """
+        where: List[str] = ["1 = 1"]
+        params: List[Any] = []
+
+        since_iso = parse_time(since)
+        if since_iso:
+            where.append("day >= ?")
+            params.append(since_iso[:10])
+        until_iso = parse_time(until)
+        if until_iso:
+            where.append("day < ?")
+            params.append(until_iso[:10])
+        if user:
+            where.append("api_user = ?")
+            params.append(user)
+
+        clause = " AND ".join(where)
+        rows = self.store.query(
+            f"""
+            SELECT day, api_user, requests, attempts, success, failure, aborted, retries,
+                   input_tokens, cached_tokens, output_tokens, updated_at
+            FROM {USAGE_TABLE} WHERE {clause}
+            ORDER BY day ASC, api_user ASC
+            LIMIT ?
+            """,
+            params + [max(1, min(int(limit), 5000))],
+        )
+
+        totals = self.store.query(
+            f"""
+            SELECT
+                COALESCE(SUM(requests), 0) AS requests,
+                COALESCE(SUM(attempts), 0) AS attempts,
+                COALESCE(SUM(success), 0) AS success,
+                COALESCE(SUM(failure), 0) AS failure,
+                COALESCE(SUM(aborted), 0) AS aborted,
+                COALESCE(SUM(retries), 0) AS retries,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens
+            FROM {USAGE_TABLE} WHERE {clause}
+            """,
+            params,
+        )
+        summary = dict(totals[0]) if totals else {}
+        finalized = int(summary.get("success") or 0) + int(summary.get("failure") or 0) + int(summary.get("aborted") or 0)
+        summary["success_rate"] = (
+            round(int(summary.get("success") or 0) / finalized, 4) if finalized else None
+        )
+
+        return {
+            "range": {"since": parse_time(since), "until": parse_time(until) or _now_iso()},
+            "count": len(rows),
+            "totals": summary,
+            "items": rows,
+        }
+
     def timeseries(
         self,
         bucket: str = "hour",
@@ -150,12 +221,13 @@ class UsageQueryService:
         platform: Optional[str] = None,
         model: Optional[str] = None,
         endpoint: Optional[str] = None,
+        user: Optional[str] = None,
     ) -> Dict[str, Any]:
         """按小时/天分桶的时序数据，供前端画折线"""
         bucket_expr = _BUCKET_EXPRS.get(bucket)
         if bucket_expr is None:
             raise ValueError(f"bucket 只支持: {', '.join(sorted(_BUCKET_EXPRS))}")
-        where, params = self._filters(since, until, platform, model, endpoint)
+        where, params = self._filters(since, until, platform, model, endpoint, user)
 
         rows = self.store.query(
             f"""
@@ -179,11 +251,12 @@ class UsageQueryService:
         since: Optional[str] = None,
         until: Optional[str] = None,
         limit: int = 20,
+        user: Optional[str] = None,
     ) -> Dict[str, Any]:
         """模型横向对比榜：慢模型、不稳定模型、用量大户"""
         if sort not in _SORT_KEYS:
             raise ValueError(f"sort 只支持: {', '.join(sorted(_SORT_KEYS))}")
-        where, params = self._filters(since, until)
+        where, params = self._filters(since, until, user=user)
         group_expr = _GROUP_EXPRS["model"]
 
         # 分组数量等于模型数，先全量聚合再合并 P95，最后按任意维度排序
@@ -217,9 +290,10 @@ class UsageQueryService:
         gateway_request_id: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        user: Optional[str] = None,
     ) -> Dict[str, Any]:
         """审计明细下钻"""
-        where, params = self._filters(since, until, platform, model, endpoint)
+        where, params = self._filters(since, until, platform, model, endpoint, user)
         if outcome:
             if outcome not in FINAL_OUTCOMES + ("stream_open",):
                 raise ValueError(f"outcome 只支持: {', '.join(FINAL_OUTCOMES + ('stream_open',))}")
@@ -270,6 +344,7 @@ class UsageQueryService:
         platform: Optional[str] = None,
         model: Optional[str] = None,
         endpoint: Optional[str] = None,
+        user: Optional[str] = None,
     ) -> Tuple[List[str], List[Any]]:
         """组装 WHERE 条件（全部占位符绑定）"""
         where: List[str] = ["1 = 1"]
@@ -292,6 +367,10 @@ class UsageQueryService:
         if endpoint:
             where.append("endpoint = ?")
             params.append(endpoint)
+        if user:
+            # 与分组口径保持一致：历史行没有 api_user 时归到 admin
+            where.append("COALESCE(NULLIF(api_user, ''), 'admin') = ?")
+            params.append(user)
         return where, params
 
     def _percentiles(self, group_expr: str, where: Sequence[str], params: Sequence[Any]) -> Dict[str, Dict[str, Any]]:

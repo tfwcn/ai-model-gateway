@@ -48,6 +48,18 @@ export function fmtTime(value) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+/**
+ * 调用方标签的展示名
+ *
+ * admin 是管理密钥自己的流量；未启用鉴权或历史数据的空标签也按 admin 显示。
+ * 用户创建自己的标签后按原样显示。
+ */
+export function userLabel(value) {
+  const name = String(value || "").trim();
+  if (!name || name === "anonymous" || name === "admin") return "admin（管理密钥）";
+  return name;
+}
+
 export function truthyChip(value, yes = "是", no = "否") {
   return el("span", { class: value ? "chip ok" : "chip" }, value ? yes : no);
 }

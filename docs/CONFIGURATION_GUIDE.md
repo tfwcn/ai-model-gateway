@@ -6,7 +6,7 @@
 
 > 📖 **单个字段到底控制什么**（默认值、取值单位、写法示例、改完是热重载还是需要重启、容易踩的坑）
 > 只有一份来源：`openai_proxy/config_store/field_docs.py`，管理台「模型配置」页与
-> `GET /admin/config/schema` 直接展示它（见 [管理台前端](ADMIN_UI.md) 的「字段字典」一节）。
+> `POST /admin/config/schema` 直接展示它（见 [管理台前端](ADMIN_UI.md) 的「字段字典」一节）。
 > 本文讲的是结构、写法与环境变量，不重复逐字段语义。
 
 ## 📋 目录
@@ -246,7 +246,7 @@ monitoring:
 audit:
   enabled: true
   db_path: "data/audit.db"
-  retention_days: 30          # 启动时自动清理更早的记录；小于 1 的取值会退回默认 30（写不出「永不清理」）
+  retention_days: 30          # 审计明细保留天数，启动时与运行中定期清理；全量日用量永久保留
   queue_size: 10000           # 内存队列容量，满了丢弃最旧行并计数
   batch_size: 200             # 单次写库的最大行数
   flush_interval: 2.0         # 后台刷盘间隔（秒）
@@ -269,13 +269,19 @@ audit:
 `/admin/*` 与 `/metrics` 一律要求 `GATEWAY_API_KEY`；未配置该密钥时管理接口返回 403（默认不对外裸露）。
 
 ```env
-GATEWAY_API_KEY=sk-your-secret-key
+GATEWAY_API_KEY=sk-your-admin-key
+
+# 用户级密钥：在管理台「用户密钥」页新增/删除，只访问 /v1/*，用于按用户统计流量
+API_KEYS_DB_PATH=data/api_keys.db
 
 ADMIN_UI_ENABLED=true        # 管理台前端 /admin/ui（false 则不提供）
 CONFIG_API_ENABLED=true      # 配置读写接口 /admin/config/*（false 则不提供）
 CONFIG_BACKUP_DIR=data/config_backups   # 每次写盘前的自动备份目录
 MODEL_CONFIG_FILE=models.yaml           # 命令行默认读取的配置文件
 ```
+
+用户密钥只保存 SHA-256 摘要，明文只在创建时返回一次；删除后立即失效。管理密钥仍可访问数据面，
+并按 `admin` 身份记账；未启用鉴权时的流量同样记 `admin`。
 
 改配置有三种等价做法：管理台页面、`manage.py` 命令行、直接编辑 `models.yaml`。
 无论哪种都不会自动重启服务：需要重启时只会提示，由你自己动手。

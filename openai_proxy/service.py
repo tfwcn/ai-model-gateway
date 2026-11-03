@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from openai_proxy.admin_ui import AdminUiStatic
+from openai_proxy.core.api_errors import error_response, install_error_handlers, is_forward_path
 from openai_proxy.core.cache import MemoryCache
 from openai_proxy.models import ModelConfig, list_available_models
 from openai_proxy.core.config_loader import ConfigLoader
@@ -23,10 +24,18 @@ from openai_proxy.utils.stream_metrics import StreamPerformanceMonitor
 from openai_proxy.utils.stream_terminator import StreamTerminator, is_done_event
 from openai_proxy.audit import AuditContext, AuditManager, load_metrics_collector
 from openai_proxy.audit.routes import build_audit_router
+from openai_proxy.auth import ADMIN_NAME, UserKeyManager
+from openai_proxy.auth.routes import build_user_router
 from openai_proxy.config_store.routes import build_config_router
 from openai_proxy.config_store.service import ConfigCommandService
 
 logger = logging.getLogger(__name__)
+
+
+def _caller_name(request: Request) -> str:
+    """取当前请求的调用方标签；未启用鉴权时与管理密钥一样记 admin"""
+    caller = getattr(request.state, "caller", None)
+    return getattr(caller, "name", "") or ADMIN_NAME
 
 
 async def _finish_stream_audit(audit_ctx: Optional[AuditContext], monitor: StreamPerformanceMonitor, completed: bool,
@@ -178,6 +187,8 @@ class OpenAIProxyService:
 
         # 审计与用量统计：库与后台刷盘任务在 initialize() 里打开
         self.audit = AuditManager(metrics=load_metrics_collector())
+        # 用户级密钥：库在 initialize() 里打开，create_app() 时绑定到中间件与路由
+        self.user_keys: Optional[UserKeyManager] = None
         # 插件结构快照：reload 时据此判断「进程内无法生效，需要重启」
         self._platform_snapshot: Dict[str, Any] = {}
         # 主事件循环：配置接口在工作线程里触发热重载时需要把协程投回这个循环
@@ -225,6 +236,10 @@ class OpenAIProxyService:
 
         # 记录主事件循环：配置接口在工作线程里触发热重载时要投回这个循环
         self._main_loop = asyncio.get_running_loop()
+
+        # 打开用户级密钥库（失败时仅保留管理密钥，不影响转发）
+        if self.user_keys is not None:
+            await self.user_keys.start()
 
         if skip_scraper:
             logger.info("=" * 60)
@@ -329,6 +344,9 @@ class OpenAIProxyService:
             await self.failover_manager.close()
         if self.session_store:
             await self.session_store.close()
+        # 关闭用户级密钥库
+        if self.user_keys is not None:
+            await self.user_keys.close()
         # 排空审计缓冲并关闭库
         await self.audit.close()
 
@@ -422,8 +440,10 @@ class OpenAIProxyService:
             logger.info("AI Model Gateway 已关闭")
 
         app = FastAPI(title="AI Model Gateway", version="1.0.0", lifespan=lifespan)
+        install_error_handlers(app)
 
-        gateway_api_key = os.getenv("GATEWAY_API_KEY", "")
+        gateway_api_keys = UserKeyManager.from_env()
+        self.user_keys = gateway_api_keys
         # 管理端路径：审计与配置接口。未配置 GATEWAY_API_KEY 时一律拒绝，避免用量与配置对外裸露
         ADMIN_PATHS = ("/admin", "/metrics")
         # 前端静态壳不含敏感数据，允许无鉴权加载（数据接口仍需密钥）
@@ -439,23 +459,41 @@ class OpenAIProxyService:
                 return await call_next(request)
 
             is_admin = path.startswith(ADMIN_PATHS)
-            if is_admin and not gateway_api_key:
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": {"message": "管理接口需要配置 GATEWAY_API_KEY", "type": "auth_error", "code": "admin_disabled"}}
+            if is_admin and not gateway_api_keys.admin_enabled:
+                return error_response(
+                    403,
+                    "admin_disabled",
+                    "管理接口需要配置 GATEWAY_API_KEY",
                 )
 
-            if gateway_api_key and path != "/health":
+            # 调用方身份：管理密钥 → admin，用户密钥 → 对应标签；未启用鉴权时为匿名
+            caller = None
+            if gateway_api_keys.enabled and path != "/health":
                 auth_header = request.headers.get("Authorization", "")
-                if not auth_header.startswith("Bearer ") or auth_header[7:] != gateway_api_key:
-                    return JSONResponse(
-                        status_code=401,
-                        content={"error": {"message": "Invalid or missing API key", "type": "auth_error", "code": "unauthorized"}}
-                    )
+                token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+                caller = gateway_api_keys.resolve(token)
+                if caller is None:
+                    if is_forward_path(path):
+                        # 转发协议接口保持原来的鉴权错误形状
+                        return JSONResponse(
+                            status_code=401,
+                            content={"error": {"message": "Invalid or missing API key",
+                                               "type": "auth_error", "code": "unauthorized"}},
+                        )
+                    return error_response(401, "unauthorized", "Invalid or missing API key")
+
+            # 用户级密钥只能走数据面，不能读管理数据
+            if is_admin and caller is not None and not caller.is_admin:
+                return error_response(403, "forbidden", "该密钥没有管理权限")
+
+            request.state.caller = caller
             return await call_next(request)
 
         # 审计与用量接口
         app.include_router(build_audit_router(lambda: self.audit))
+
+        # 用户级密钥管理（新增/删除；只接受管理密钥）
+        app.include_router(build_user_router(lambda: self.user_keys))
 
         # 配置管理接口（可用 CONFIG_API_ENABLED=false 整体关闭）
         if os.getenv("CONFIG_API_ENABLED", "true").lower() == "true":
@@ -493,6 +531,7 @@ class OpenAIProxyService:
                 selector=str(request_data.get("model", "all")),
                 stream=is_stream,
                 msg_count=len(request_data.get("messages") or []),
+                api_user=_caller_name(request),
             )
 
             if is_stream:
@@ -587,6 +626,7 @@ class OpenAIProxyService:
                 selector=str(chat_payload.get("model", "all")),
                 stream=is_stream,
                 msg_count=len(chat_payload.get("messages") or []),
+                api_user=_caller_name(request),
             )
 
             # StreamingResponse 会在独立协程中迭代生成器，必须显式保留本请求的上下文。
@@ -733,6 +773,7 @@ class OpenAIProxyService:
             await self.model_list_cache.set(cache_key, response)
             return response
 
+        @app.post("/health")
         @app.get("/health")
         async def health_check():
             """健康检查端点"""

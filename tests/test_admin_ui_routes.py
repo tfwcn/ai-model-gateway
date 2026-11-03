@@ -181,8 +181,8 @@ class TestShell:
     def test_前端壳不会绕过管理接口的鉴权(self, tmp_path, monkeypatch):
         client = _client(tmp_path, monkeypatch)
 
-        assert client.get("/admin/audit/stats").status_code == 401
-        assert client.get("/admin/audit/stats", headers=_headers()).status_code == 200
+        assert client.post("/admin/audit/stats").status_code == 401
+        assert client.post("/admin/audit/stats", headers=_headers()).status_code == 200
 
     @pytest.mark.unit
     def test_未配置密钥时管理接口仍然403(self, tmp_path, monkeypatch):
@@ -190,7 +190,7 @@ class TestShell:
         client = _client(tmp_path, monkeypatch)
 
         assert client.get("/admin/ui/").status_code == 200
-        assert client.get("/admin/usage/summary").status_code == 403
+        assert client.post("/admin/usage/summary").status_code == 403
 
 
 class TestContract:
@@ -200,7 +200,7 @@ class TestContract:
     def test_用量接口返回前端使用的字段(self, tmp_path, monkeypatch):
         client = _client(tmp_path, monkeypatch)
 
-        summary = client.get("/admin/usage/summary", headers=_headers()).json()
+        summary = client.post("/admin/usage/summary", headers=_headers()).json()
 
         assert {"group_by", "items", "count", "range"} <= set(summary)
         for key in ("bucket", "requests", "attempts", "success_rate", "failover_count",
@@ -211,7 +211,7 @@ class TestContract:
     def test_时序接口返回按桶排序的点(self, tmp_path, monkeypatch):
         client = _client(tmp_path, monkeypatch)
 
-        series = client.get("/admin/usage/timeseries", params={"bucket": "day"}, headers=_headers()).json()
+        series = client.post("/admin/usage/timeseries", params={"bucket": "day"}, headers=_headers()).json()
 
         assert {"bucket", "points", "range"} <= set(series)
         assert [point["bucket"] for point in series["points"]] == sorted(p["bucket"] for p in series["points"])
@@ -221,27 +221,27 @@ class TestContract:
     def test_审计明细与链路接口返回尝试行(self, tmp_path, monkeypatch):
         client = _client(tmp_path, monkeypatch)
 
-        attempts = client.get("/admin/audit", headers=_headers()).json()
+        attempts = client.post("/admin/audit", headers=_headers()).json()
         assert {"total", "items"} <= set(attempts)
         for key in ("attempt_key", "gateway_request_id", "attempt_seq", "outcome",
                     "duration_ms", "error_category", "http_status", "finalized"):
             assert key in attempts["items"][0]
 
-        chain = client.get("/admin/audit/chain/r2", headers=_headers()).json()
+        chain = client.post("/admin/audit/chain/r2", headers=_headers()).json()
         assert {"gateway_request_id", "attempts"} <= set(chain)
         assert [item["attempt_seq"] for item in chain["attempts"]] == [1, 2]
 
-        missing = client.get("/admin/audit/chain/ghost", headers=_headers()).json()
+        missing = client.post("/admin/audit/chain/ghost", headers=_headers()).json()
         assert missing["attempts"] == []
 
     @pytest.mark.unit
     def test_模型榜与审计健康接口可用(self, tmp_path, monkeypatch):
         client = _client(tmp_path, monkeypatch)
 
-        ranking = client.get("/admin/usage/models", params={"sort": "p95"}, headers=_headers()).json()
+        ranking = client.post("/admin/usage/models", params={"sort": "p95"}, headers=_headers()).json()
         assert ranking["sort"] == "p95" and ranking["items"]
 
-        body = client.get("/admin/audit/stats", headers=_headers()).json()
+        body = client.post("/admin/audit/stats", headers=_headers()).json()
         assert {"config", "collector", "store"} <= set(body)
         assert body["config"]["db_path"]
         assert body["store"]["rows"] == 3
@@ -251,13 +251,13 @@ class TestContract:
         monkeypatch.setenv("EXAMPLE_PLATFORM_API_KEY", "super-secret-value")
         client = _client(tmp_path, monkeypatch)
 
-        document = client.get("/admin/config/document", headers=_headers()).json()
+        document = client.post("/admin/config/document", headers=_headers()).json()
 
         assert "super-secret-value" not in str(document)
         assert {"path", "version", "platforms", "aliases", "audit", "editable", "errors", "warnings"} <= set(document)
         assert document["editable"]["ops"]
 
-        schema = client.get("/admin/config/schema", headers=_headers()).json()
+        schema = client.post("/admin/config/schema", headers=_headers()).json()
         assert {"ops", "platform_fields", "model_fields", "audit_fields", "limits"} <= set(schema)
 
     @pytest.mark.unit
@@ -272,7 +272,7 @@ class TestContract:
         applied = client.post("/admin/config/apply", headers=_headers(), json={"ops": ops, "note": "界面调权重"}).json()
         assert {"backup", "reloaded", "needs_restart", "version_after"} <= set(applied)
 
-        backups = client.get("/admin/config/backups", headers=_headers()).json()
+        backups = client.post("/admin/config/backups", headers=_headers()).json()
         assert {"name", "created_at", "bytes", "version", "note"} <= set(backups["items"][0])
         assert "界面调权重" in backups["items"][0]["note"]
 
@@ -286,7 +286,7 @@ class TestContract:
         })
 
         assert response.status_code == 409
-        assert response.json()["detail"]["actual"]
+        assert response.json()["error"]["details"]["actual"]
 
     @pytest.mark.unit
     def test_前端字段清单与文档一致(self):
@@ -297,7 +297,7 @@ class TestContract:
 
         doc = open(path, "r", encoding="utf-8").read()
         for endpoint in ("/admin/usage/summary", "/admin/usage/timeseries", "/admin/usage/models",
-                         "/admin/audit", "/admin/audit/chain", "/admin/audit/stats",
+                         "/admin/usage/daily", "/admin/audit", "/admin/audit/chain", "/admin/audit/stats", "/admin/users",
                          "/admin/config/document", "/admin/config/plan", "/admin/config/apply",
                          "/admin/config/backups", "/admin/config/rollback", "/admin/config/reload",
                          "/admin/config/models"):

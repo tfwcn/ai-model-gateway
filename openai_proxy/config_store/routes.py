@@ -9,13 +9,14 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header
 from pydantic import BaseModel, Field
 
 from openai_proxy.config_store.editor import OPS
 from openai_proxy.config_store.runtime_models import RuntimeModelCatalog
 from openai_proxy.config_store.service import ConfigCommandService, ConfigConflict, ConfigInvalid
 from openai_proxy.config_store.writer import ConfigWriteError
+from openai_proxy.core.api_errors import ApiError
 
 logger = logging.getLogger(__name__)
 
@@ -84,42 +85,42 @@ def build_config_router(
         header = (if_match or "").strip().strip('"')
         body = (body_version or "").strip()
         if header and body and header != body:
-            raise HTTPException(status_code=400, detail="If-Match 与请求体里的 version 不一致")
+            raise ApiError(400, "version_mismatch", "If-Match 与请求体里的 version 不一致")
         return header or body or None
 
     # ---------- 读 ----------
 
-    @router.get("/admin/config/document")
+    @router.post("/admin/config/document")
     async def config_document() -> Dict[str, Any]:
         """脱敏的配置视图（含可编辑字段与支持的补丁操作）"""
         return await _run(service_provider().view)
 
-    @router.get("/admin/config/raw")
+    @router.post("/admin/config/raw")
     async def config_raw() -> Dict[str, Any]:
         """原始 YAML 文本（供只读预览；写回请使用补丁接口）"""
         return await _run(service_provider().raw_text)
 
-    @router.get("/admin/config/env-status")
+    @router.post("/admin/config/env-status")
     async def config_env_status() -> Dict[str, Any]:
         """配置引用的环境变量是否已设置（不返回密钥内容）"""
         return await _run(service_provider().env_status)
 
-    @router.get("/admin/config/validate")
+    @router.post("/admin/config/validate")
     async def config_validate() -> Dict[str, Any]:
         """校验当前配置文件"""
         return await _run(service_provider().validate)
 
-    @router.get("/admin/config/schema")
+    @router.post("/admin/config/schema")
     async def config_schema() -> Dict[str, Any]:
         """字段白名单、取值边界与字段字典（前端据此渲染表单与说明）"""
         return schema_payload()
 
-    @router.get("/admin/config/backups")
+    @router.post("/admin/config/backups")
     async def config_backups() -> Dict[str, Any]:
         """可回滚的备份列表"""
         return await _run(service_provider().backups)
 
-    @router.get("/admin/config/models")
+    @router.post("/admin/config/models")
     async def config_models() -> Dict[str, Any]:
         """
         进程内当前可用的模型清单（只有平台名与模型条目名）
@@ -165,7 +166,7 @@ def build_config_router(
         """重新加载配置（改了 models.yaml 后不重启进程也能生效）"""
         service = service_provider()
         if service.reload_callback is None:
-            raise HTTPException(status_code=409, detail="当前服务未提供热重载能力")
+            raise ApiError(409, "reload_unavailable", "当前服务未提供热重载能力")
         return await _run(service.reload_callback)
 
     return router
@@ -178,18 +179,22 @@ async def _run(func: Callable[..., Dict[str, Any]], *args: Any, **kwargs: Any) -
     except ConfigConflict as exc:
         _raise_conflict(exc.expected, exc.actual)
     except ConfigInvalid as exc:
-        raise HTTPException(status_code=400, detail={"message": exc.message, "errors": exc.errors}) from exc
+        raise ApiError(
+            400, "validation_failed", exc.message, {"errors": exc.errors}
+        ) from exc
     except ConfigWriteError as exc:
-        raise HTTPException(status_code=500, detail=exc.message) from exc
+        raise ApiError(500, "write_failed", exc.message) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise ApiError(404, "file_not_found", str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise ApiError(400, "bad_request", str(exc)) from exc
 
 
 def _raise_conflict(expected: str, actual: str) -> None:
     """版本冲突：把当前版本号带回给客户端，客户端刷新后重试即可"""
-    raise HTTPException(
-        status_code=409,
-        detail={"message": "配置文件已被修改，请刷新后重试", "expected": expected, "actual": actual},
+    raise ApiError(
+        409,
+        "version_conflict",
+        "配置文件已被修改，请刷新后重试",
+        {"expected": expected, "actual": actual},
     )

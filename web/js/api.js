@@ -17,12 +17,20 @@ const HEADER_UNSAFE = /[^\x20-\x7e]/;
 const STRIP_CHARS = /[\s\u200b\u200c\u200d\ufeff]+/g;
 
 export class ApiError extends Error {
-  constructor(status, message, detail) {
+  constructor(status, message, payload) {
     super(message);
     this.status = status;
-    this.detail = detail || null;
-    // 校验类错误后端会带 issues 列表
-    this.issues = (detail && detail.errors) || [];
+    this.payload = payload || null;
+    const body = payload || {};
+    const error = body.error || {};
+    this.code = error.code || null;
+    this.details = error.details || null;
+    // 兼容两种校验错误：旧形状 detail.errors，新形状 error.details.errors
+    this.issues = (body.detail && body.detail.errors)
+      || (this.details && this.details.errors)
+      || [];
+    // 版本冲突等业务细节：优先用新形状的 details，其次回落到旧 detail 对象
+    this.detail = body.detail && typeof body.detail === "object" ? body.detail : this.details;
   }
 }
 
@@ -92,6 +100,11 @@ export class Api {
 
   post(path, body, ifMatch) {
     return this.request("POST", path, null, body, ifMatch);
+  }
+
+  /** 非转发接口统一走 POST：查询参数放 URL，不带请求体 */
+  postQuery(path, params) {
+    return this.request("POST", path, params, undefined);
   }
 
   del(path, params) {

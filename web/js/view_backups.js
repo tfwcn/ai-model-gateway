@@ -33,8 +33,8 @@ export async function renderBackups(root, ctx) {
   async function load() {
     try {
       const [backups, validation] = await Promise.all([
-        ctx.api.get("/admin/config/backups"),
-        ctx.api.get("/admin/config/validate"),
+        ctx.api.postQuery("/admin/config/backups"),
+        ctx.api.postQuery("/admin/config/validate"),
       ]);
       renderList(listBox, backups.items, rollback);
       validateBox.replaceChildren(
