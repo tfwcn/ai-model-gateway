@@ -15,7 +15,45 @@
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
-**[快速开始](#-快速开始)** · **[API 参考](#-api-参考)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[监控运维](docs/MONITORING.md)** · **[审计与管理台](#-观测与管理)** · **[贡献指南](#-贡献指南)**
+**[快速开始](#-快速开始)** · **[管理台](#-管理台)** · **[API 参考](#-api-参考)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[监控运维](docs/MONITORING.md)** · **[贡献指南](#-贡献指南)**
+
+---
+
+## 🖥️ 管理台
+
+装好并启动服务后，先开管理台：平台权重、模型超时、黑名单、用户密钥都能在网页里点完，**不用手写 `models.yaml`**。
+
+```text
+http://localhost:8000/admin/ui/     # 打开后输入 GATEWAY_API_KEY 连接
+```
+
+五个标签页：用量与性能、审计明细、用户密钥、模型配置、备份与回滚。
+纯静态页面（无构建、无外部依赖），密钥只存在浏览器 `sessionStorage`；**密钥内容永不下发**，配置视图只给出它引用的环境变量名与是否已设置。
+
+| 想做的事 | 在管理台怎么点 |
+| --- | --- |
+| 改平台权重、模型超时、黑名单 | 「模型配置」页直接编辑；写盘前自动备份，可随时回滚 |
+| 让改动生效 | 保存后点重载，进程内生效；新增/删除平台这类结构变化才需要自行重启 |
+| 给用户发密钥 | 「用户密钥」页填写标签即可生成，流量按用户单独统计 |
+| 看谁用了多少、慢在哪里 | 「用量与性能」按用户 / 模型 / 时间维度聚合 |
+
+**用户级密钥**：`GATEWAY_API_KEY` 是管理台密钥；给不同用户单独发密钥时，打开「用户密钥」页填写标签并生成。
+密钥在 SQLite 里加密保存，可用 `POST /admin/users/key` 按用户名取回。每把用户密钥只能访问 `/v1/*` 与 `/proxy/*`，
+流量会记到对应用户标签上，可在「用量与性能」按用户聚合，或在命令行用 `--user` 过滤。
+
+数据面也支持管理密钥 + 用户名 header：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H "X-Gateway-User: user-a" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "all", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+用户名不存在时会自动创建用户和密钥，然后正常转发并记账。
+
+> 不方便开浏览器时，`manage.py` 提供等价能力，详见 [🖥️ 管理台前端](docs/ADMIN_UI.md) 与 [⌨️ 命令行管理工具](docs/CONFIG_CLI.md)。
 
 ---
 
@@ -99,6 +137,8 @@ nano .env  # 填入你的 API 密钥（可选设置 GATEWAY_API_KEY 开启认证
 ```
 
 详细配置请参考：[📖 配置指南](docs/CONFIGURATION_GUIDE.md)
+
+> 不想手写配置？按默认 `models.yaml` 启动后，用 [🖥️ 管理台](#-管理台)在网页里增删平台、改权重与超时。
 
 ### 3️⃣ 启动
 
@@ -305,6 +345,8 @@ GATEWAY_API_KEY=your-gateway-api-key
 
 # 用户级密钥库（用户密钥在管理台「用户密钥」页新增/删除）
 # API_KEYS_DB_PATH=data/api_keys.db
+# 用户密钥加密密钥（支持按用户名取回；为空时回退使用 GATEWAY_API_KEY）
+# API_KEYS_ENCRYPTION_KEY=your-random-encryption-secret
 
 # Redis 配置（可选，Responses API 会话管理）
 REDIS_URL=redis://localhost:6379
@@ -433,19 +475,7 @@ modelscope:
 
 保留策略分开：**审计明细默认保留 30 天**（用于下钻排障），**全量日用量永久保留**（按日期 + 用户累加输入 / 缓存 / 输出 tokens），
 所以清理明细不会把历史用量一起删掉。日汇总是独立的 `usage_daily` 表，查询接口是 `POST /admin/usage/daily`。
-
-### 管理台
-
-```text
-http://localhost:8000/admin/ui/     # 打开后输入 GATEWAY_API_KEY 连接
-```
-
-五个标签页：用量与性能、审计明细、用户密钥、模型配置、备份与回滚。
-纯静态页面（无构建、无外部依赖），密钥只存在浏览器 `sessionStorage`；**密钥内容永不下发**，配置视图只给出它引用的环境变量名与是否已设置。
-
-**用户级密钥**：`GATEWAY_API_KEY` 是管理台密钥；给不同用户单独发密钥时，打开「用户密钥」页填写标签并生成，
-明文只显示一次，SQLite 里只保存摘要。每把用户密钥只能访问 `/v1/*`，流量会记到对应用户标签上，
-可在「用量与性能」按用户聚合，或在命令行用 `--user` 过滤。
+管理台的入口、五个标签页与密钥用法见上文 [🖥️ 管理台](#-管理台)；`/admin/*` 与 `/metrics` 都要求 `GATEWAY_API_KEY`。
 
 ### 命令行
 

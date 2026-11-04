@@ -25,6 +25,8 @@ from openai_proxy.utils.stream_terminator import StreamTerminator, is_done_event
 from openai_proxy.audit import AuditContext, AuditManager, load_metrics_collector
 from openai_proxy.audit.routes import build_audit_router
 from openai_proxy.auth import ADMIN_NAME, UserKeyManager
+from openai_proxy.auth.crypto import KeyDecryptionFailed, KeyEncryptionUnavailable
+from openai_proxy.auth.manager import KeyGenerationFailed, UserKeyStoreUnavailable
 from openai_proxy.auth.routes import build_user_router
 from openai_proxy.config_store.routes import build_config_router
 from openai_proxy.config_store.service import ConfigCommandService
@@ -32,11 +34,8 @@ from openai_proxy.passthrough import PassthroughManager
 
 logger = logging.getLogger(__name__)
 
-
-def _caller_name(request: Request) -> str:
-    """取当前请求的调用方标签；未启用鉴权时与管理密钥一样记 admin"""
-    caller = getattr(request.state, "caller", None)
-    return getattr(caller, "name", "") or ADMIN_NAME
+# 数据面用户 header：只有携带管理密钥时才生效，用户密钥会忽略它
+USER_HEADER = "X-Gateway-User"
 
 
 async def _finish_stream_audit(audit_ctx: Optional[AuditContext], monitor: StreamPerformanceMonitor, completed: bool,
@@ -198,6 +197,46 @@ class OpenAIProxyService:
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         # 配置编辑服务：接口与 CLI 共用同一套补丁
         self._config_service: Optional[ConfigCommandService] = None
+
+    async def _resolve_api_user(self, request: Request) -> str:
+        """
+        解析数据面这次请求的审计用户名
+
+        规则：
+        - 用户密钥：忽略 X-Gateway-User，按密钥自己的用户名记账；
+        - 管理密钥没有 header：记 admin；
+        - 管理密钥带 header：用户不存在时自动创建，创建失败直接返回错误，不请求上游；
+        - 未启用鉴权：忽略 header，记 admin。
+        """
+        caller = getattr(request.state, "caller", None)
+        if caller is None:
+            return ADMIN_NAME
+        if not caller.is_admin:
+            return caller.name
+
+        name = (request.headers.get(USER_HEADER, "") or "").strip()
+        if not name:
+            return caller.name
+        if self.user_keys is None:
+            raise HTTPException(status_code=503, detail=f"{USER_HEADER} 无法解析：用户密钥库未就绪")
+
+        try:
+            return await self.user_keys.ensure_user_async(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"{USER_HEADER} 不合法: {exc}") from exc
+        except (UserKeyStoreUnavailable, KeyEncryptionUnavailable, KeyGenerationFailed) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{USER_HEADER} 自动创建用户失败: {exc}",
+            ) from exc
+        except KeyDecryptionFailed as exc:
+            raise HTTPException(status_code=500, detail=f"{USER_HEADER} 处理失败: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - 自动建用户失败不能继续请求上游
+            logger.warning(f"{USER_HEADER} 自动创建用户失败: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"{USER_HEADER} 自动创建用户失败: {exc}",
+            ) from exc
 
     def build_config_service(self) -> ConfigCommandService:
         """
@@ -453,6 +492,8 @@ class OpenAIProxyService:
 
         gateway_api_keys = UserKeyManager.from_env()
         self.user_keys = gateway_api_keys
+        # 透传接口复用同一套用户解析（管理密钥 + X-Gateway-User）
+        self.passthrough.user_resolver = self._resolve_api_user
         # 管理端路径：审计与配置接口。未配置 GATEWAY_API_KEY 时一律拒绝，避免用量与配置对外裸露
         ADMIN_PATHS = ("/admin", "/metrics")
         # 前端静态壳不含敏感数据，允许无鉴权加载（数据接口仍需密钥）
@@ -533,6 +574,9 @@ class OpenAIProxyService:
 
                 raise HTTPException(status_code=400, detail="messages参数是必需的")
 
+            # 审计用户：管理密钥可带 X-Gateway-User；需要自动建用户时在这里完成
+            api_user = await self._resolve_api_user(request)
+
             # 审计上下文：贯穿整条故障转移链
             is_stream = bool(request_data.get("stream", False))
             audit_ctx = self.audit.new_context(
@@ -540,7 +584,7 @@ class OpenAIProxyService:
                 selector=str(request_data.get("model", "all")),
                 stream=is_stream,
                 msg_count=len(request_data.get("messages") or []),
-                api_user=_caller_name(request),
+                api_user=api_user,
             )
 
             if is_stream:
@@ -629,13 +673,16 @@ class OpenAIProxyService:
 
             is_stream = bool(chat_payload.get("stream", False))
 
+            # 审计用户：与 /v1/chat/completions 同一套规则
+            api_user = await self._resolve_api_user(request)
+
             # 审计上下文：/v1/responses 走的是同一套 failover，endpoint 区分开便于统计
             audit_ctx = self.audit.new_context(
                 endpoint="responses",
                 selector=str(chat_payload.get("model", "all")),
                 stream=is_stream,
                 msg_count=len(chat_payload.get("messages") or []),
-                api_user=_caller_name(request),
+                api_user=api_user,
             )
 
             # StreamingResponse 会在独立协程中迭代生成器，必须显式保留本请求的上下文。

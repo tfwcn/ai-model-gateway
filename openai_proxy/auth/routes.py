@@ -15,11 +15,14 @@ from typing import Any, Dict
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from openai_proxy.auth.crypto import KeyDecryptionFailed, KeyEncryptionUnavailable
 from openai_proxy.auth.manager import (
     KeyGenerationFailed,
+    KeyNotRetrievable,
     UserKeyManager,
     UserKeyStoreUnavailable,
     UserNameExists,
+    UserNotFound,
 )
 from openai_proxy.auth.store import parse_user_id
 from openai_proxy.core.api_errors import ApiError
@@ -29,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 class CreateUserRequest(BaseModel):
     """新增用户：只需给一个用于统计与展示的标签"""
+
+    name: str = Field(..., min_length=1, max_length=64, description="用户标签，例如 user-a")
+
+
+class GetUserKeyRequest(BaseModel):
+    """按用户名取回密钥明文"""
 
     name: str = Field(..., min_length=1, max_length=64, description="用户标签，例如 user-a")
 
@@ -52,8 +61,13 @@ def build_user_router(manager_provider) -> APIRouter:
 
     @router.post("/admin/users", status_code=201)
     async def create_user(payload: CreateUserRequest) -> Dict[str, Any]:
-        """新增用户并生成一把用户级密钥（明文只在本次响应里出现）"""
+        """新增用户并生成一把用户级密钥（加密落库，可后续取回）"""
         return await _run(_manager().create_user, payload.name)
+
+    @router.post("/admin/users/key")
+    async def get_user_key(payload: GetUserKeyRequest) -> Dict[str, Any]:
+        """按用户名取回密钥明文（只接受管理密钥）"""
+        return await _run(_manager().get_user_key, payload.name)
 
     @router.post("/admin/users/{user_id}/delete")
     async def delete_user(user_id: str) -> Dict[str, Any]:
@@ -76,6 +90,14 @@ async def _run(func, *args: Any) -> Any:
         return await asyncio.to_thread(func, *args)
     except UserKeyStoreUnavailable as exc:
         raise ApiError(503, "key_store_unavailable", str(exc)) from exc
+    except KeyEncryptionUnavailable as exc:
+        raise ApiError(503, "key_encryption_unavailable", str(exc)) from exc
+    except UserNotFound as exc:
+        raise ApiError(404, "user_not_found", str(exc)) from exc
+    except KeyNotRetrievable as exc:
+        raise ApiError(409, "key_unavailable", str(exc)) from exc
+    except KeyDecryptionFailed as exc:
+        raise ApiError(500, "key_decrypt_failed", str(exc)) from exc
     except UserNameExists as exc:
         raise ApiError(409, "user_exists", str(exc)) from exc
     except KeyGenerationFailed as exc:

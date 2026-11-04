@@ -4,7 +4,7 @@
 对外动作：
     start()    打开库、建表、加载快照（启动时调用；失败只降级，不影响转发）
     close()    关闭库
-    create()   生成新密钥并落库（明文只在这里返回一次）
+    create()   生成新密钥并加密落库
     delete()   删除用户并刷新快照
     resolve()  请求热路径：只读内存快照
 """
@@ -15,6 +15,7 @@ import secrets
 import sqlite3
 from typing import Any, Dict, Optional
 
+from openai_proxy.auth.crypto import UserKeyCipher
 from openai_proxy.auth.keys import (
     ADMIN_KEY_ENV,
     USER_KEY_PREFIX,
@@ -48,11 +49,21 @@ class KeyGenerationFailed(RuntimeError):
     """连续生成密钥都撞上摘要（概率极低）"""
 
 
+class UserNotFound(Exception):
+    """查询/操作的用户不存在"""
+
+
+class KeyNotRetrievable(Exception):
+    """用户存在，但没有可解密的历史密钥（旧版本创建）"""
+
+
 class UserKeyManager:
     """用户级密钥的增删、持久化与内存快照"""
 
     def __init__(self, admin_key: str = "", db_path: Optional[str] = None):
-        self.registry = ApiKeyRegistry(admin_key=admin_key)
+        self.admin_key = (admin_key or "").strip()
+        self.registry = ApiKeyRegistry(admin_key=self.admin_key)
+        self.cipher = UserKeyCipher.from_env(self.admin_key)
         self.db_path = db_path or os.getenv(DB_PATH_ENV) or DEFAULT_DB_PATH
         self.store: Optional[UserKeyStore] = None
 
@@ -129,7 +140,7 @@ class UserKeyManager:
         return {"count": len(items), "items": items}
 
     def create_user(self, name: str) -> Dict[str, Any]:
-        """生成并落库一把新密钥；返回 {user, key}，key 只在此刻可见"""
+        """生成并落库一把新密钥；返回 {user, key}"""
         store = self._require_store()
         clean_name = normalize_name(name)
         if store.exists_name(clean_name):
@@ -137,14 +148,62 @@ class UserKeyManager:
 
         for _ in range(_KEY_RETRY):
             key = build_user_key()
+            ciphertext = self.cipher.encrypt(key) if self.cipher is not None else None
             try:
-                user = store.create_user(clean_name, key[:_PREFIX_VISIBLE], hash_api_key(key))
+                user = store.create_user(
+                    clean_name,
+                    key[:_PREFIX_VISIBLE],
+                    hash_api_key(key),
+                    ciphertext,
+                )
             except sqlite3.IntegrityError:
-                # 极低概率的摘要碰撞：换一把重试；用户名冲突已在上面提前拦下
+                # 用户名冲突（并发创建）优先报重名；摘要碰撞则换一把重试
+                if store.exists_name(clean_name):
+                    raise UserNameExists(f"用户名已存在: {clean_name}") from None
                 continue
             self.reload()
             return {"user": user, "key": key}
         raise KeyGenerationFailed("生成密钥失败，请重试")
+
+    def get_user_key(self, name: str) -> Dict[str, Any]:
+        """按用户名取回密钥明文（管理接口专用）"""
+        store = self._require_store()
+        clean_name = normalize_name(name)
+        record = store.get_by_name(clean_name)
+        if record is None:
+            raise UserNotFound(f"用户不存在: {clean_name}")
+        ciphertext = record.pop("key_ciphertext", None)
+        if not ciphertext or self.cipher is None:
+            raise KeyNotRetrievable(
+                f"用户 {clean_name} 的密钥是旧版本创建的，无法取回明文；请删除后重新创建"
+            )
+        return {"user": record, "key": self.cipher.decrypt(ciphertext)}
+
+    def ensure_user(self, name: str) -> str:
+        """
+        数据面用：用户名存在则直接返回；不存在则自动创建用户与密钥
+
+        返回规范化后的用户名，供审计使用。并发创建同一个名字时，
+        唯一约束会兜底，最终都返回同一个名字。
+        """
+        clean_name = normalize_name(name)
+        if self.registry.has_user_name(clean_name):
+            return clean_name
+
+        store = self._require_store()
+        if store.exists_name(clean_name):
+            self.reload()
+            return clean_name
+
+        try:
+            self.create_user(clean_name)
+        except UserNameExists:
+            self.reload()
+        return clean_name
+
+    async def ensure_user_async(self, name: str) -> str:
+        """数据面热路径的异步入口：只在需要新建用户时才碰磁盘"""
+        return await asyncio.to_thread(self.ensure_user, name)
 
     def delete_user(self, user_id: int) -> bool:
         """删除用户并立即刷新快照，已发出的密钥马上失效"""

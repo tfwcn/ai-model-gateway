@@ -164,6 +164,7 @@ python manage.py usage summary --group-by model --since 7d      # 聚合：用�
 python manage.py usage models --sort p95                        # 谁最慢
 python manage.py usage daily --since 90d                        # 全量日用量（按天/用户，含输入/缓存/输出 tokens）
 python manage.py usage dimensions --group-by model,size --since 30d  # 永久维度日汇总（透传接口）
+python manage.py usage dimensions --group-by month,user,model --since 90d  # 用户×模型 token 月报
 python manage.py usage summary --group-by dim:model,size --since 7d  # 明细范围内按维度聚合
 python manage.py usage timeseries --bucket day --since 30d      # 趋势
 python manage.py usage attempts --outcome failure --limit 20    # 明细下钻
@@ -174,8 +175,8 @@ python manage.py usage prune --before 30d                       # 清理旧明�
 
 聚合维度 `--group-by`：`model` / `platform` / `user` / `endpoint` / `selector` / `outcome` / `error` / `day` / `hour`，
 以及 `dim:model,size` 这种任意维度组合。
-`usage dimensions` 读永久表 `usage_dimension_daily`，支持 `day` / `user` / `endpoint` 与任意透传维度名，
-例如 `--group-by model,size`、`--group-by day,user,model,size`。
+`usage dimensions` 读永久表 `usage_dimension_daily`，支持 `day` / `month` / `user` / `endpoint` 与任意透传维度名，
+例如 `--group-by model,size`、`--group-by month,user,model`；结果同时给出输入/缓存/输出 tokens。
 排序 `--sort`：`requests` / `p95` / `duration` / `ttft` / `throughput` / `failover` / `errors` / `tokens`。
 过滤：`--since` / `--until`（ISO 时间、日期或 `7d`、`24h`、`30m`）、`--platform`、`--model`、`--endpoint`。
 

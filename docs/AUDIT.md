@@ -63,6 +63,7 @@ usage_daily(day, api_user) = 每天的请求数、尝试数、成功/失败/中�
 ```text
 usage_dimension_daily(day, endpoint, api_user, dimensions)
   = requests / attempts / success / failure / aborted / retries
+  + input_tokens / cached_tokens / output_tokens
 ```
 
 - `dimensions` 是完整维度组合的规范 JSON，例如
@@ -95,6 +96,8 @@ usage_dimension_daily(day, endpoint, api_user, dimensions)
 - 版本 5 起标准字段收拢到 `dimensions`：老库会重建 `audit_attempts`，把
   `platform/model_name/model_id/selector` 写进 `dimensions`，再生成虚拟列保持原有查询字段可读；
   新建的 `usage_dimension_daily` 会用已收尾明细回填一次。
+- 版本 6 给 `usage_dimension_daily` 补 `input_tokens` / `cached_tokens` / `output_tokens`，
+  并用仍保留的审计明细回填一次。
 
 **成功率只统计 `finalized=1` 的行**：
 
@@ -126,7 +129,8 @@ failover_count = 同一请求里 attempt_seq > 1 的尝试数
 **只记录消息条数，绝不记录消息内容、密钥或请求体。**
 `dimensions` 只保存配置声明的业务参数，单值截断 200 字符。
 
-`api_user` 来自用户级密钥：管理密钥、未启用鉴权与历史行都记 `admin`，用户密钥记创建时填写的标签。
+`api_user` 来自用户级密钥或数据面的 `X-Gateway-User`：管理密钥、未启用鉴权与历史行都记 `admin`，
+用户密钥记创建时填写的标签；管理密钥带 `X-Gateway-User` 时记该用户名，用户不存在会自动创建。
 用户密钥本身只以 SHA-256 摘要存放在 `data/api_keys.db`（可由 `API_KEYS_DB_PATH` 调整），与审计库分开。
 
 通过管理接口/命令行改配置时也会写一行 `endpoint=config_write` 的审计行，`selector` 是补丁操作名，方便回答「这个权重是谁什么时候改的」。
@@ -196,6 +200,9 @@ python manage.py usage timeseries --bucket day --since 30d
 
 # 透传维度：按模型 × 分辨率看永久调用量
 python manage.py usage dimensions --group-by model,size --since 30d
+
+# 用户 × 模型的 token 月报
+python manage.py usage dimensions --group-by month,user,model --since 90d
 
 # 审计明细范围内按维度聚合
 python manage.py usage summary --group-by dim:model,size --since 7d

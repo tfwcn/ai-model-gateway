@@ -22,7 +22,12 @@ from openai_proxy.auth.keys import (
     ApiKeyRegistry,
     hash_api_key,
 )
-from openai_proxy.auth.manager import UserKeyManager, UserNameExists
+from openai_proxy.auth.manager import (
+    KeyNotRetrievable,
+    UserKeyManager,
+    UserNameExists,
+    UserNotFound,
+)
 from openai_proxy.service import OpenAIProxyService
 
 _ADMIN_KEY = "test-admin-key"
@@ -97,6 +102,31 @@ class TestStore:
         instance.store.close()
 
     @pytest.mark.unit
+    def test_老库没有密文列时自动补齐(self, tmp_path):
+        db_path = str(tmp_path / "legacy.db")
+        legacy = sqlite3.connect(db_path)
+        legacy.execute(
+            "CREATE TABLE api_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, "
+            "key_prefix TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO api_users (name, key_prefix, key_hash, created_at) VALUES (?, ?, ?, ?)",
+            ("legacy", "gw_legacy", hash_api_key("gw_legacy-key"), "2026-01-01T00:00:00.000+00:00"),
+        )
+        legacy.commit()
+        legacy.close()
+
+        from openai_proxy.auth.store import UserKeyStore
+
+        store = UserKeyStore(db_path)
+        store.init_schema()
+        columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(api_users)")}
+
+        assert "key_ciphertext" in columns
+        assert store.get_by_name("legacy")["key_ciphertext"] is None
+        store.close()
+
+    @pytest.mark.unit
     def test_新增用户返回明文但库里只存摘要(self, manager):
         created = manager.create_user("user-a")
         key = created["key"]
@@ -110,6 +140,50 @@ class TestStore:
 
         rows = manager.store.snapshot()
         assert rows == {hash_api_key(key): "user-a"}
+        record = manager.store.get_by_name("user-a")
+        assert record["key_ciphertext"]
+        assert key not in record["key_ciphertext"]
+
+    @pytest.mark.unit
+    def test_可以按用户名取回同一把密钥(self, manager):
+        key = manager.create_user("user-a")["key"]
+
+        result = manager.get_user_key("user-a")
+
+        assert result["key"] == key
+        assert result["user"]["name"] == "user-a"
+
+    @pytest.mark.unit
+    def test_旧用户没有密文时无法取回(self, manager):
+        manager.store.create_user("legacy", "gw_legacy", hash_api_key("gw_legacy-key"))
+
+        with pytest.raises(KeyNotRetrievable):
+            manager.get_user_key("legacy")
+
+    @pytest.mark.unit
+    def test_取回不存在的用户报错(self, manager):
+        with pytest.raises(UserNotFound):
+            manager.get_user_key("ghost")
+
+    @pytest.mark.unit
+    def test_ensure_user不存在时自动创建(self, manager):
+        name = manager.ensure_user("user-new")
+
+        assert name == "user-new"
+        assert manager.registry.has_user_name("user-new")
+        assert manager.get_user_key("user-new")["key"].startswith("gw_")
+
+    @pytest.mark.unit
+    def test_ensure_user已存在时复用(self, manager):
+        key = manager.create_user("user-a")["key"]
+
+        assert manager.ensure_user("user-a") == "user-a"
+        assert manager.get_user_key("user-a")["key"] == key
+
+    @pytest.mark.unit
+    def test_保留名不能作为用户(self, manager):
+        with pytest.raises(ValueError):
+            manager.create_user("admin")
 
     @pytest.mark.unit
     def test_新增后立即可以鉴权(self, manager):
@@ -190,6 +264,49 @@ class TestRoutes:
         assert "key_hash" not in item
 
     @pytest.mark.unit
+    def test_可以按用户名取回密钥(self, client):
+        api, _ = client
+        created = api.post("/admin/users", headers=self._admin_headers(), json={"name": "user-a"}).json()
+
+        response = api.post("/admin/users/key", headers=self._admin_headers(), json={"name": "user-a"})
+
+        assert response.status_code == 200
+        assert response.json()["key"] == created["key"]
+
+    @pytest.mark.unit
+    def test_取回密钥只接受管理密钥(self, client):
+        api, _ = client
+        key = api.post("/admin/users", headers=self._admin_headers(), json={"name": "user-a"}).json()["key"]
+
+        response = api.post(
+            "/admin/users/key",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"name": "user-a"},
+        )
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+
+    @pytest.mark.unit
+    def test_取回不存在的用户返回404(self, client):
+        api, _ = client
+
+        response = api.post("/admin/users/key", headers=self._admin_headers(), json={"name": "ghost"})
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "user_not_found"
+
+    @pytest.mark.unit
+    def test_旧用户没有密文时返回409(self, client):
+        api, service = client
+        service.user_keys.store.create_user("legacy", "gw_legacy", hash_api_key("gw_legacy-key"))
+
+        response = api.post("/admin/users/key", headers=self._admin_headers(), json={"name": "legacy"})
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "key_unavailable"
+
+    @pytest.mark.unit
     def test_用户密钥可以访问数据面但不能访问管理接口(self, client):
         api, _ = client
         key = api.post("/admin/users", headers=self._admin_headers(), json={"name": "user-a"}).json()["key"]
@@ -264,6 +381,124 @@ class TestRoutes:
 
         assert response.status_code == 405
         assert response.json()["error"]["code"] == "method_not_allowed"
+
+
+class TestDataPlaneUserHeader:
+    """数据面：管理密钥 + X-Gateway-User"""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_API_KEY", _ADMIN_KEY)
+        monkeypatch.setenv("API_KEYS_DB_PATH", str(tmp_path / "api_keys.db"))
+        service = OpenAIProxyService(config_file="models.yaml")
+        app = service.create_app()
+        service.user_keys.start_sync()
+        yield TestClient(app), service
+
+    class _FakeFailover:
+        def __init__(self):
+            self.calls = []
+            self.seen_user = None
+
+        async def chat_completion_non_stream(self, request_data, audit_ctx):
+            self.calls.append(request_data)
+            self.seen_user = audit_ctx.api_user
+            return {"id": "req-1", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        async def close(self):
+            return None
+
+    @staticmethod
+    def _payload() -> dict:
+        return {"model": "all", "messages": [{"role": "user", "content": "hello"}]}
+
+    @pytest.mark.unit
+    def test_管理密钥带用户名时自动创建并审计(self, client):
+        api, service = client
+        fake = self._FakeFailover()
+        service.failover_manager = fake
+        headers = {"Authorization": f"Bearer {_ADMIN_KEY}", "X-Gateway-User": "user-new"}
+
+        response = api.post("/v1/chat/completions", headers=headers, json=self._payload())
+
+        assert response.status_code == 200
+        assert fake.seen_user == "user-new"
+        assert service.user_keys.registry.has_user_name("user-new")
+
+        key = api.post(
+            "/admin/users/key",
+            headers={"Authorization": f"Bearer {_ADMIN_KEY}"},
+            json={"name": "user-new"},
+        ).json()["key"]
+        assert api.get("/v1/models", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+
+    @pytest.mark.unit
+    def test_用户名已存在时复用并审计(self, client):
+        api, service = client
+        fake = self._FakeFailover()
+        service.failover_manager = fake
+        original = service.user_keys.create_user("user-a")["key"]
+        headers = {"Authorization": f"Bearer {_ADMIN_KEY}", "X-Gateway-User": "user-a"}
+
+        response = api.post("/v1/chat/completions", headers=headers, json=self._payload())
+
+        assert response.status_code == 200
+        assert fake.seen_user == "user-a"
+        assert service.user_keys.get_user_key("user-a")["key"] == original
+
+    @pytest.mark.unit
+    def test_用户密钥会忽略同名header(self, client):
+        api, service = client
+        fake = self._FakeFailover()
+        service.failover_manager = fake
+        key = service.user_keys.create_user("user-a")["key"]
+        headers = {"Authorization": f"Bearer {key}", "X-Gateway-User": "user-b"}
+
+        response = api.post("/v1/chat/completions", headers=headers, json=self._payload())
+
+        assert response.status_code == 200
+        assert fake.seen_user == "user-a"
+        assert not service.user_keys.registry.has_user_name("user-b")
+
+    @pytest.mark.unit
+    def test_管理密钥不带header时记admin(self, client):
+        api, service = client
+        fake = self._FakeFailover()
+        service.failover_manager = fake
+
+        response = api.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_ADMIN_KEY}"},
+            json=self._payload(),
+        )
+
+        assert response.status_code == 200
+        assert fake.seen_user == "admin"
+
+    @pytest.mark.unit
+    def test_保留名不能通过header创建(self, client):
+        api, service = client
+        fake = self._FakeFailover()
+        service.failover_manager = fake
+        headers = {"Authorization": f"Bearer {_ADMIN_KEY}", "X-Gateway-User": "admin"}
+
+        response = api.post("/v1/chat/completions", headers=headers, json=self._payload())
+
+        assert response.status_code == 400
+        assert fake.calls == []
+
+    @pytest.mark.unit
+    def test_自动创建失败时直接返回错误且不请求上游(self, client):
+        api, service = client
+        fake = self._FakeFailover()
+        service.failover_manager = fake
+        service.user_keys.store = None
+        headers = {"Authorization": f"Bearer {_ADMIN_KEY}", "X-Gateway-User": "user-new"}
+
+        response = api.post("/v1/chat/completions", headers=headers, json=self._payload())
+
+        assert response.status_code == 503
+        assert fake.calls == []
 
 
 class TestUsageByUser:

@@ -39,7 +39,7 @@ OPENAI_API_KEY=your-openai-api-key
 AZURE_API_KEY=your-azure-api-key
 
 # Gateway 认证密钥（可选，留空则跳过认证）
-GATEWAY_API_KEY=sk-your-secret-key
+GATEWAY_API_KEY=your-secret-key
 ```
 
 > ⚠️ **安全提示**：API 密钥绝不应该直接写在 `models.yaml` 文件中，必须通过环境变量管理。
@@ -294,7 +294,7 @@ passthrough:
 `/admin/*` 与 `/metrics` 一律要求 `GATEWAY_API_KEY`；未配置该密钥时管理接口返回 403（默认不对外裸露）。
 
 ```env
-GATEWAY_API_KEY=sk-your-admin-key
+GATEWAY_API_KEY=your-admin-key
 
 # 用户级密钥：在管理台「用户密钥」页新增/删除，只访问 /v1/*，用于按用户统计流量
 API_KEYS_DB_PATH=data/api_keys.db
@@ -305,7 +305,7 @@ CONFIG_BACKUP_DIR=data/config_backups   # 每次写盘前的自动备份目录
 MODEL_CONFIG_FILE=models.yaml           # 命令行默认读取的配置文件
 ```
 
-用户密钥只保存 SHA-256 摘要，明文只在创建时返回一次；删除后立即失效。管理密钥仍可访问数据面，
+用户密钥保存 SHA-256 摘要与加密密文，可按用户名取回；删除后立即失效。管理密钥仍可访问数据面，
 并按 `admin` 身份记账；未启用鉴权时的流量同样记 `admin`。
 
 改配置有三种等价做法：管理台页面、`manage.py` 命令行、直接编辑 `models.yaml`。

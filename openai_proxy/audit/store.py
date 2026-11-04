@@ -24,8 +24,9 @@ USAGE_TABLE = "usage_daily"
 # 维度日汇总：按「完整维度组合」累加，同样永久保留
 USAGE_DIMENSION_TABLE = "usage_dimension_daily"
 
-# 结构版本：版本 5 起标准维度改为 dimensions + 生成列
-SCHEMA_VERSION = 5
+# 结构版本：版本 5 起标准维度改为 dimensions + 生成列；版本 6 给维度日汇总加 token
+DIMENSIONS_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 主键 + 常用过滤维度的索引：按时间、按模型、按结局、按请求链
 _INDEX_DDL = (
@@ -113,6 +114,9 @@ CREATE TABLE IF NOT EXISTS {USAGE_DIMENSION_TABLE} (
     failure         INTEGER NOT NULL DEFAULT 0,
     aborted         INTEGER NOT NULL DEFAULT 0,
     retries         INTEGER NOT NULL DEFAULT 0,
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    cached_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
     updated_at      TEXT NOT NULL,
     PRIMARY KEY (day, endpoint, api_user, dimensions)
 )
@@ -276,9 +280,12 @@ class SqliteAuditStore(AuditStore):
             )
             version = target
 
-        if version < SCHEMA_VERSION:
+        if version < DIMENSIONS_VERSION:
             self._migrate_to_dimensions()
-            version = SCHEMA_VERSION
+            version = DIMENSIONS_VERSION
+
+        if version < SCHEMA_VERSION:
+            self._migrate_dimension_tokens()
 
     def _migrate_to_dimensions(self) -> None:
         """把老结构收拢为 dimensions + 生成列，并回填维度日汇总"""
@@ -312,8 +319,48 @@ class SqliteAuditStore(AuditStore):
             )
             self._conn.execute(f"DROP TABLE {legacy}")
             logger.info("审计库结构升级: 标准维度已收拢到 dimensions（老行已回填）")
-        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self._conn.execute(f"PRAGMA user_version = {DIMENSIONS_VERSION}")
         self._backfill_dimension_usage()
+
+    def _migrate_dimension_tokens(self) -> None:
+        """版本 6：给维度日汇总补 token 列，并用仍保留的审计明细回填一次"""
+        columns = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({USAGE_DIMENSION_TABLE})")}
+        for name in ("input_tokens", "cached_tokens", "output_tokens"):
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {USAGE_DIMENSION_TABLE} ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                )
+        self._conn.execute(
+            f"""
+            UPDATE {USAGE_DIMENSION_TABLE} AS u
+            SET input_tokens = COALESCE((
+                    SELECT SUM(a.input_tokens) FROM {TABLE} a
+                    WHERE substr(a.ts, 1, 10) = u.day
+                      AND a.endpoint = u.endpoint
+                      AND COALESCE(NULLIF(a.api_user, ''), 'admin') = u.api_user
+                      AND a.dimensions = u.dimensions
+                      AND a.finalized = 1 AND a.endpoint != 'config_write'
+                ), 0),
+                cached_tokens = COALESCE((
+                    SELECT SUM(a.cached_tokens) FROM {TABLE} a
+                    WHERE substr(a.ts, 1, 10) = u.day
+                      AND a.endpoint = u.endpoint
+                      AND COALESCE(NULLIF(a.api_user, ''), 'admin') = u.api_user
+                      AND a.dimensions = u.dimensions
+                      AND a.finalized = 1 AND a.endpoint != 'config_write'
+                ), 0),
+                output_tokens = COALESCE((
+                    SELECT SUM(a.output_tokens) FROM {TABLE} a
+                    WHERE substr(a.ts, 1, 10) = u.day
+                      AND a.endpoint = u.endpoint
+                      AND COALESCE(NULLIF(a.api_user, ''), 'admin') = u.api_user
+                      AND a.dimensions = u.dimensions
+                      AND a.finalized = 1 AND a.endpoint != 'config_write'
+                ), 0)
+            """
+        )
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        logger.info("审计库结构升级: 维度日汇总已补充 token 列")
 
     def _backfill_dimension_usage(self) -> None:
         """维度日汇总表首次创建时，用全部已收尾明细回填一次（不碰 usage_daily）"""
@@ -321,7 +368,8 @@ class SqliteAuditStore(AuditStore):
             f"""
             INSERT INTO {USAGE_DIMENSION_TABLE} (
                 day, endpoint, api_user, dimensions, requests, attempts,
-                success, failure, aborted, retries, updated_at
+                success, failure, aborted, retries,
+                input_tokens, cached_tokens, output_tokens, updated_at
             )
             SELECT
                 substr(ts, 1, 10) AS day,
@@ -334,6 +382,9 @@ class SqliteAuditStore(AuditStore):
                 SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failure,
                 SUM(CASE WHEN outcome = 'aborted' THEN 1 ELSE 0 END) AS aborted,
                 SUM(CASE WHEN retry_seq > 1 THEN 1 ELSE 0 END) AS retries,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 ? AS updated_at
             FROM {TABLE}
             WHERE finalized = 1 AND endpoint != 'config_write'
@@ -346,6 +397,9 @@ class SqliteAuditStore(AuditStore):
                 failure = failure + excluded.failure,
                 aborted = aborted + excluded.aborted,
                 retries = retries + excluded.retries,
+                input_tokens = input_tokens + excluded.input_tokens,
+                cached_tokens = cached_tokens + excluded.cached_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
                 updated_at = excluded.updated_at
             """,
             (_now_iso(),),
@@ -432,7 +486,8 @@ class SqliteAuditStore(AuditStore):
                 f"""
                 INSERT INTO {USAGE_DIMENSION_TABLE} (
                     day, endpoint, api_user, dimensions, requests, attempts,
-                    success, failure, aborted, retries, updated_at
+                    success, failure, aborted, retries,
+                    input_tokens, cached_tokens, output_tokens, updated_at
                 )
                 SELECT
                     substr(ts, 1, 10) AS day,
@@ -445,6 +500,9 @@ class SqliteAuditStore(AuditStore):
                     SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failure,
                     SUM(CASE WHEN outcome = 'aborted' THEN 1 ELSE 0 END) AS aborted,
                     SUM(CASE WHEN retry_seq > 1 THEN 1 ELSE 0 END) AS retries,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     ? AS updated_at
                 FROM {TABLE}
                 WHERE finalized = 1 AND aggregated = 0 AND endpoint != 'config_write'
@@ -457,6 +515,9 @@ class SqliteAuditStore(AuditStore):
                     failure = failure + excluded.failure,
                     aborted = aborted + excluded.aborted,
                     retries = retries + excluded.retries,
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    cached_tokens = cached_tokens + excluded.cached_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
                     updated_at = excluded.updated_at
                 """,
                 (_now_iso(),),

@@ -329,7 +329,10 @@ class UsageQueryService:
                    COALESCE(SUM(success), 0) AS success,
                    COALESCE(SUM(failure), 0) AS failure,
                    COALESCE(SUM(aborted), 0) AS aborted,
-                   COALESCE(SUM(retries), 0) AS retries
+                   COALESCE(SUM(retries), 0) AS retries,
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                   COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens
             FROM {USAGE_DIMENSION_TABLE}
             WHERE {' AND '.join(where)}
             GROUP BY {group_clause}
@@ -575,7 +578,7 @@ def _parse_dimension_group(raw: str) -> List[str]:
     if not names:
         raise ValueError("group_by 至少要有一个分组键")
     for name in names:
-        if name in ("day", "user", "endpoint"):
+        if name in ("day", "month", "user", "endpoint"):
             continue
         _require_dimension_name(name)
     return names
@@ -602,6 +605,8 @@ def _dimension_group_expr(name: str) -> str:
     """维度日汇总表的分组表达式：day/user/endpoint 走固定列，其余走 dimensions"""
     if name == "day":
         return "day"
+    if name == "month":
+        return "substr(day, 1, 7)"
     if name == "user":
         return "COALESCE(NULLIF(api_user, ''), 'admin')"
     if name == "endpoint":

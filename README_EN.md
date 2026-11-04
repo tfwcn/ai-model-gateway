@@ -15,7 +15,30 @@
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
-**[Quick Start](#-quick-start)** · **[API Reference](#-api-reference)** · **[Configuration Guide](docs/CONFIGURATION_GUIDE.md)** · **[Monitoring](docs/MONITORING.md)** · **[Observability & Admin](#-observability--administration)** · **[Contributing](#-contributing)**
+**[Quick Start](#-quick-start)** · **[Admin UI](#-admin-ui)** · **[API Reference](#-api-reference)** · **[Configuration Guide](docs/CONFIGURATION_GUIDE.md)** · **[Monitoring](docs/MONITORING.md)** · **[Observability & Administration](#-observability--administration)** · **[Contributing](#-contributing)**
+
+---
+
+## 🖥️ Admin UI
+
+Once the service is running, open the admin UI first: platform weights, model timeouts, the blacklist and user keys can all be edited in the browser — **no hand-written `models.yaml` required**.
+
+```text
+http://localhost:8000/admin/ui/     # open it, then enter GATEWAY_API_KEY to connect
+```
+
+Five tabs: usage & performance, audit details, user keys, model config, backups & rollback. Pure static pages (no build step,
+no external dependencies). The key lives only in browser `sessionStorage`, and **key values are never sent to the browser**:
+the config view only shows which environment variable a key references and whether it is set.
+
+| What you want to do | Where to click in the admin UI |
+| --- | --- |
+| Change platform weight, model timeout, blacklist | Edit directly on the *model config* tab; every save is backed up first and can be rolled back |
+| Apply the change | Click reload after saving — it applies in-process. Adding/removing a platform still needs your own restart |
+| Issue a key per user | The *user keys* tab generates one from a label; traffic is accounted per user |
+| See who used how much, and where it is slow | *Usage & performance* aggregates by user / model / time |
+
+> Prefer the terminal? `manage.py` offers the same capabilities — see [🖥️ Admin UI](docs/ADMIN_UI.md) and [⌨️ CLI Tool](docs/CONFIG_CLI.md).
 
 ---
 
@@ -95,6 +118,9 @@ cp .env.example .env
 cp models.example.yaml models.yaml
 nano .env  # Fill in your API keys (optionally set GATEWAY_API_KEY)
 ```
+
+> Don't want to write config by hand? Start with the default `models.yaml`, then add platforms and tune weights
+> and timeouts in the [🖥️ Admin UI](#-admin-ui).
 
 ### 3️⃣ Start
 
@@ -244,6 +270,7 @@ NVIDIA_API_KEY=your-nvidia-api-key
 OPENAI_API_KEY=your-openai-api-key
 GATEWAY_API_KEY=your-gateway-api-key   # admin console key; empty disables admin endpoints
 # API_KEYS_DB_PATH=data/api_keys.db    # user-level keys (add/remove in the UI)
+# API_KEYS_ENCRYPTION_KEY=your-random-encryption-secret  # enables key retrieval
 REDIS_URL=redis://localhost:6379       # Optional Redis
 
 # Skip plugin scraper, use cached models directly (optional)
@@ -311,16 +338,8 @@ still being forwarded is recorded as `stream_open` and stays out of the denomina
 Retention is split: **audit details are kept for 30 days** by default (for drill-down and troubleshooting), while
 **all-time daily usage is kept forever** (`usage_daily`, aggregated by day + user with input / cached / output tokens).
 Clearing details therefore never deletes historical usage. The daily endpoint is `POST /admin/usage/daily`.
-
-### Admin UI
-
-```text
-http://localhost:8000/admin/ui/     # open it, then enter GATEWAY_API_KEY to connect
-```
-
-Five tabs: usage & performance, audit details, user keys, model config, backups & rollback. Pure static pages (no build step,
-no external dependencies). The key lives only in browser `sessionStorage`, and **key values are never sent to the
-browser**: the config view only shows which environment variable a key references and whether it is set.
+The admin UI entry point, its five tabs and key handling are described above in [🖥️ Admin UI](#-admin-ui);
+`/admin/*` and `/metrics` both require `GATEWAY_API_KEY`.
 
 ### Command line
 

@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 class PassthroughManager:
     """透传路由注册表与 aiohttp 会话"""
 
-    def __init__(self, audit_manager: Any):
+    def __init__(self, audit_manager: Any, user_resolver: Any = None):
         self.audit_manager = audit_manager
+        # 可选：把管理密钥 + X-Gateway-User 解析成审计用户名（与 /v1 共用同一套规则）
+        self.user_resolver = user_resolver
         self.routes: tuple = ()
         self.session: Optional[aiohttp.ClientSession] = None
 
@@ -52,7 +54,10 @@ class PassthroughManager:
                 continue
             session = await self.get_session()
             caller = getattr(request.state, "caller", None)
-            api_user = getattr(caller, "name", "") or "admin"
+            if self.user_resolver is not None:
+                api_user = await self.user_resolver(request)
+            else:
+                api_user = getattr(caller, "name", "") or "admin"
             forwarder = PassthroughForwarder(session, route, self.audit_manager)
             return await forwarder.forward(request, remainder, api_user)
         return None

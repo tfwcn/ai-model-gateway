@@ -370,6 +370,9 @@ class TestJson:
                 "platform": "passthrough", "model": "model-a", "model_id": "model-a",
                 "selector": "example-service", "size": "1024x1024",
             },
+            input_tokens=100,
+            cached_tokens=10,
+            output_tokens=20,
             ts="2026-01-01T10:00:00.000+00:00",
         )
         attempt.mark_success()
@@ -385,3 +388,5 @@ class TestJson:
         payload = json.loads(out)
         assert payload["group_by"] == ["model", "size"]
         assert payload["items"][0]["values"] == {"model": "model-a", "size": "1024x1024"}
+        assert payload["items"][0]["input_tokens"] == 100
+        assert payload["items"][0]["output_tokens"] == 20

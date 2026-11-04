@@ -169,6 +169,9 @@ class UsageCommands:
             ("success", "成功"),
             ("failure", "失败"),
             ("aborted", "中断"),
+            ("input_tokens", "输入tokens"),
+            ("cached_tokens", "缓存tokens"),
+            ("output_tokens", "输出tokens"),
             ("success_rate", "成功率"),
         ])
         return EXIT_OK

@@ -182,7 +182,7 @@ class TestSchemaMigration:
         upgraded.init_schema()
 
         columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(audit_attempts)")}
-        assert version == 5
+        assert version == 6
         assert "done_sent" not in columns
         upgraded.close()
 
@@ -195,6 +195,44 @@ class TestSchemaMigration:
         rows = store.query("SELECT attempt_key FROM audit_attempts")
         assert rows == []
         store.close()
+
+    @pytest.mark.unit
+    def test_版本5维度表自动补token列并回填(self, tmp_path):
+        path = str(tmp_path / "audit.db")
+        legacy = SqliteAuditStore(path)
+        legacy.init_schema()
+        attempt = AuditAttempt(
+            attempt_key="req1-1",
+            gateway_request_id="req1",
+            endpoint="chat_completions",
+            stream=False,
+            dimensions={"platform": "example-platform", "model": "example-platform|model-a"},
+            input_tokens=100,
+            cached_tokens=10,
+            output_tokens=20,
+            ts="2026-01-01T10:00:00.000+00:00",
+        )
+        attempt.mark_success()
+        legacy.insert_many([attempt.to_row()])
+        legacy.aggregate_usage()
+
+        # 退回到版本 5：维度表还没有 token 列
+        legacy._conn.execute("ALTER TABLE usage_dimension_daily DROP COLUMN input_tokens")
+        legacy._conn.execute("ALTER TABLE usage_dimension_daily DROP COLUMN cached_tokens")
+        legacy._conn.execute("ALTER TABLE usage_dimension_daily DROP COLUMN output_tokens")
+        legacy._conn.execute("PRAGMA user_version = 5")
+        legacy._conn.commit()
+        legacy.close()
+
+        upgraded = SqliteAuditStore(path)
+        upgraded.init_schema()
+
+        columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(usage_dimension_daily)")}
+        assert {"input_tokens", "cached_tokens", "output_tokens"} <= columns
+        row = upgraded.query("SELECT input_tokens, cached_tokens, output_tokens FROM usage_dimension_daily")[0]
+        assert row == {"input_tokens": 100, "cached_tokens": 10, "output_tokens": 20}
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        upgraded.close()
 
 
 class TestWrites:

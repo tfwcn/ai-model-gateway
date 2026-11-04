@@ -31,6 +31,9 @@ def _attempt(key: str, ts: str, *, endpoint="passthrough:example-service", user=
             "selector": "example-service",
             "size": size,
         },
+        input_tokens=100,
+        cached_tokens=10,
+        output_tokens=20,
     )
     if outcome == "failure":
         attempt.mark_failure(http_status=429)
@@ -74,7 +77,8 @@ class TestDimensionsStorage:
         store.aggregate_usage()
 
         rows = store.query(
-            f"SELECT dimensions, requests, attempts, success, failure FROM {USAGE_DIMENSION_TABLE} ORDER BY dimensions"
+            f"SELECT dimensions, requests, attempts, success, failure, "
+            f"input_tokens, cached_tokens, output_tokens FROM {USAGE_DIMENSION_TABLE} ORDER BY dimensions"
         )
         assert len(rows) == 2
         by_size = {row["dimensions"]: row for row in rows}
@@ -82,6 +86,9 @@ class TestDimensionsStorage:
         assert any('"size":"512x512"' in key for key in by_size)
         assert sum(row["requests"] for row in rows) == 4
         assert sum(row["failure"] for row in rows) == 1
+        assert sum(row["input_tokens"] for row in rows) == 400
+        assert sum(row["cached_tokens"] for row in rows) == 40
+        assert sum(row["output_tokens"] for row in rows) == 80
 
     @pytest.mark.unit
     def test_清理明细不影响维度日汇总(self, store):
@@ -122,6 +129,17 @@ class TestDimensionQueries:
         assert result["count"] == 3
         combos = {(item["values"]["model"], item["values"]["size"]) for item in result["items"]}
         assert combos == {("model-a", "1024x1024"), ("model-a", "512x512"), ("model-b", "1024x1024")}
+
+    @pytest.mark.unit
+    def test_按月份汇总并返回tokens(self, queries):
+        result = queries.dimension_usage("month,user", since="2026-01-01")
+
+        by_user = {item["values"]["user"]: item for item in result["items"]}
+        assert set(by_user) == {"user-a", "user-b"}
+        assert all(item["values"]["month"] == "2026-01" for item in result["items"])
+        assert by_user["user-a"]["input_tokens"] == 200
+        assert by_user["user-a"]["output_tokens"] == 40
+        assert by_user["user-b"]["input_tokens"] == 200
 
     @pytest.mark.unit
     def test_按用户与日期过滤(self, queries):

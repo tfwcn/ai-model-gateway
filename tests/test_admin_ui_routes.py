@@ -297,7 +297,8 @@ class TestContract:
 
         doc = open(path, "r", encoding="utf-8").read()
         for endpoint in ("/admin/usage/summary", "/admin/usage/timeseries", "/admin/usage/models",
-                         "/admin/usage/daily", "/admin/audit", "/admin/audit/chain", "/admin/audit/stats", "/admin/users",
+                         "/admin/usage/daily", "/admin/audit", "/admin/audit/chain", "/admin/audit/stats",
+                         "/admin/users", "/admin/users/key",
                          "/admin/config/document", "/admin/config/plan", "/admin/config/apply",
                          "/admin/config/backups", "/admin/config/rollback", "/admin/config/reload",
                          "/admin/config/models"):

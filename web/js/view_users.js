@@ -3,7 +3,7 @@
  *
  * 数据来源：
  *   GET    /admin/users        用户清单（只有可读前缀，没有明文）
- *   POST   /admin/users        新增用户并生成密钥（明文只返回一次）
+ *   POST   /admin/users        新增用户并生成密钥（可加密落库）
  *   POST   /admin/users/{id}/delete   删除用户，密钥立即失效
  *
  * 管理台本身仍然使用 GATEWAY_API_KEY 连接；这里发出的用户密钥只能访问 /v1/*。
@@ -12,7 +12,7 @@
 import { button, control, el, empty, fmtTime, panel, table, textInput } from "./ui.js";
 
 const CREATE_NOTE =
-  "新增后会生成一把用户级密钥：明文只显示这一次，请立即保存。"
+  "新增后会生成一把用户级密钥，请立即保存；管理接口也可以按用户名取回。"
   + "用户密钥只能调用 /v1/* 数据接口，不能访问管理接口。";
 
 export async function renderUsers(root, ctx) {
@@ -47,7 +47,7 @@ export async function renderUsers(root, ctx) {
       nameInput.value = "";
       renderReveal(revealBox, result);
       await load();
-      ctx.notice("已生成新密钥：明文只显示这一次，请立即保存", "ok");
+      ctx.notice("已生成新密钥，请立即保存", "ok");
     } catch (error) {
       ctx.guard(error);
     } finally {
@@ -86,7 +86,7 @@ function renderReveal(box, result) {
   const input = el("input", { readonly: true, class: "key-reveal" });
   input.value = result.key;
 
-  box.replaceChildren(panel("新密钥（只显示这一次）", [
+  box.replaceChildren(panel("新密钥", [
     el("p", { class: "muted", text: `用户：${result.user.name}` }),
     input,
     el("p", { class: "muted", text: "请复制保存后再离开本页；关闭后无法再次查看明文。" }),

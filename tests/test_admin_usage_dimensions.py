@@ -30,6 +30,9 @@ def _attempt(key: str, user: str, model: str, size: str) -> AuditAttempt:
             "size": size,
         },
         ts="2026-01-01T10:00:00.000+00:00",
+        input_tokens=100,
+        cached_tokens=10,
+        output_tokens=20,
     )
     attempt.mark_success()
     return attempt
@@ -92,6 +95,23 @@ class TestDimensionEndpoints:
         assert payload["count"] == 1
         assert payload["items"][0]["values"]["model"] == "model-a"
         assert payload["items"][0]["requests"] == 2
+
+    @pytest.mark.unit
+    def test_按月与用户模型组合返回tokens(self, tmp_path, monkeypatch):
+        client = _client(tmp_path, monkeypatch)
+        headers = {"Authorization": f"Bearer {_KEY}"}
+
+        payload = client.post(
+            "/admin/usage/dimensions?group_by=month,user,model&since=2026-01-01",
+            headers=headers,
+        ).json()
+
+        assert payload["group_by"] == ["month", "user", "model"]
+        first = payload["items"][0]
+        assert first["values"]["month"] == "2026-01"
+        assert first["input_tokens"] > 0
+        assert first["cached_tokens"] > 0
+        assert first["output_tokens"] > 0
 
     @pytest.mark.unit
     def test_维度候选合并配置与历史(self, tmp_path, monkeypatch):

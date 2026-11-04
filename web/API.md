@@ -13,7 +13,27 @@
   `/v1/*` 保持原有 `{"detail": ...}` / OpenAI 兼容错误形状。
 - 时间参数统一支持三种写法：`2026-01-01T10:00:00+00:00`、`2026-01-01`、相对时间 `7d` / `24h` / `30m`。
 - 密钥永不下发：配置视图只给出它引用的环境变量名与「是否已设置」。
+- 用户级密钥在 SQLite 里加密保存，支持按用户名取回；明文不再只能看一次。
 - 示例一律使用占位符：`example-platform` / `https://api.example.com/v1` / `${EXAMPLE_PLATFORM_API_KEY}` / `model-a`。
+
+## 数据面用户标识
+
+`/v1/chat/completions`、`/v1/responses` 与透传接口 `/proxy/*` 支持两种指定审计用户的方式：
+
+```http
+# 方式一：用户密钥
+Authorization: Bearer <用户密钥>
+
+# 方式二：管理密钥 + 用户名 header
+Authorization: Bearer <GATEWAY_API_KEY>
+X-Gateway-User: user-a
+```
+
+- 用户密钥：审计记该密钥绑定的用户名，`X-Gateway-User` 会被忽略；
+- 管理密钥 + `X-Gateway-User`：用户存在则直接记账；不存在则自动创建用户和密钥；
+- 自动创建失败时直接返回错误，不请求上游；
+- `admin` / `anonymous` 是保留名，不能作为用户名；
+- 未配置鉴权时忽略该 header，审计记 `admin`。
 
 ## 目录
 
@@ -31,6 +51,7 @@
 | `/admin/audit/stats` | POST | 审计自身健康状态 |
 | `/admin/users/list` | POST | 用户级密钥清单（只含前缀） |
 | `/admin/users` | POST | 新增用户并生成一次性密钥 |
+| `/admin/users/key` | POST | 按用户名取回密钥明文 |
 | `/admin/users/{user_id}/delete` | POST | 删除用户，密钥立即失效 |
 | `/admin/config/document` | POST | 脱敏的配置视图 |
 | `/admin/config/raw` | POST | 原始 YAML 文本（只读预览） |
@@ -140,19 +161,20 @@
 
 ## POST /admin/usage/dimensions
 
-永久维度日汇总。查询参数：`group_by`（逗号分隔，支持 `day` / `user` / `endpoint` 与任意维度名，
-例如 `model`、`model,size`、`day,user,model,size`）、`since`、`until`、`user`、`endpoint`、`limit`（1~1000）。
+永久维度日汇总。查询参数：`group_by`（逗号分隔，支持 `day` / `month` / `user` / `endpoint` 与任意维度名，
+例如 `model`、`model,size`、`month,user,model`）、`since`、`until`、`user`、`endpoint`、`limit`（1~1000）。
 
 ```json
 {
-  "group_by": ["model", "size"],
-  "range": { "since": "2026-01-01T00:00:00+00:00", "until": "2026-01-02T00:00:00+00:00" },
+  "group_by": ["month", "user", "model"],
+  "range": { "since": "2026-01-01T00:00:00+00:00", "until": "2026-02-01T00:00:00+00:00" },
   "count": 2,
   "items": [
     {
-      "bucket": "model-a | 1024x1024",
-      "values": { "model": "model-a", "size": "1024x1024" },
+      "bucket": "2026-01 | user-a | model-a",
+      "values": { "month": "2026-01", "user": "user-a", "model": "model-a" },
       "requests": 12, "attempts": 12, "success": 12, "failure": 0, "aborted": 0, "retries": 0,
+      "input_tokens": 12000, "cached_tokens": 3000, "output_tokens": 8000,
       "success_rate": 1.0
     }
   ]
@@ -160,6 +182,7 @@
 ```
 
 数据来自 `usage_dimension_daily`，只累加、不清理；明细保留期清理后历史仍可查。
+`input_tokens` / `cached_tokens` / `output_tokens` 来自审计行，上游没有返回 usage 时为空值按 0 累计。
 
 ## POST /admin/usage/dimension-keys
 
@@ -275,8 +298,24 @@
 }
 ```
 
-`key` 是明文，**只在本次响应里出现一次**；数据库只保存 SHA-256 摘要，页面必须提示用户立即保存。
-用户名重复返回 `409 {"error": {"code": "user_exists"}}`；名称为空或超长返回 `400/422`。
+`key` 是明文；数据库保存 SHA-256 摘要和 Fernet 密文，之后仍可通过 `/admin/users/key` 取回。
+用户名重复返回 `409 {"error": {"code": "user_exists"}}`；名称为空、超长或使用保留名返回 `400/422`。
+
+## POST /admin/users/key
+
+请求体：`{ "name": "user-a" }`。返回该用户的密钥明文：
+
+```json
+{
+  "user": { "id": 1, "name": "user-a", "key_prefix": "gw_ab12cd", "created_at": "..." },
+  "key": "gw_ab12cd..."
+}
+```
+
+- 只接受管理密钥；
+- 用户不存在返回 `404 user_not_found`；
+- 旧版本创建、没有密文的用户返回 `409 key_unavailable`；
+- 密文解密失败返回 `500 key_decrypt_failed`。
 
 ## POST /admin/users/{user_id}/delete
 
@@ -566,9 +605,9 @@ Prometheus 文本格式。`audit.prometheus_enabled=false` 时返回 `404`。
 | 403 | `admin_disabled` / `forbidden` | 未配置管理密钥 / 用户级密钥访问管理接口 |
 | 404 | `not_found` / `user_not_found` / `metrics_disabled` / `file_not_found` | 资源不存在 |
 | 405 | `method_not_allowed` | 非转发接口用了 GET/DELETE，应改用 POST |
-| 409 | `version_conflict` / `user_exists` / `reload_unavailable` | 版本冲突、用户重名、热重载不可用 |
+| 409 | `version_conflict` / `user_exists` / `reload_unavailable` / `key_unavailable` | 版本冲突、用户重名、热重载不可用、旧密钥无法取回 |
 | 422 | `validation_error` | 请求体不符合 schema，`details.errors` 是字段级错误 |
-| 500 | `internal_error` / `write_failed` / `key_generation_failed` | 服务内部或写盘失败 |
-| 503 | `key_store_unavailable` | 用户密钥库未就绪 |
+| 500 | `internal_error` / `write_failed` / `key_generation_failed` / `key_decrypt_failed` | 服务内部、写盘或密钥解密失败 |
+| 503 | `key_store_unavailable` / `key_encryption_unavailable` | 用户密钥库或加密密钥未就绪 |
 
 `/v1/*` 转发协议接口**不使用**上面的形状，继续保持 OpenAI/上游兼容的错误体。

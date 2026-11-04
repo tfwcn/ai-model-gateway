@@ -109,12 +109,19 @@ spec:
 - **用户级密钥**：在管理台「用户密钥」页新增/删除，只访问 `/v1/*` 与 `/proxy/*`，用于按用户统计流量。
 
 ```env
-GATEWAY_API_KEY=sk-your-admin-key
+GATEWAY_API_KEY=your-admin-key
 # 用户密钥库路径（默认 data/api_keys.db）
 API_KEYS_DB_PATH=data/api_keys.db
+# 用户密钥加密密钥；支持按用户名取回明文，为空时回退使用 GATEWAY_API_KEY
+API_KEYS_ENCRYPTION_KEY=your-random-encryption-secret
 ```
 
-- 用户密钥明文只在创建时返回一次；SQLite 里只保存 SHA-256 摘要与可读前缀；
+- 用户密钥在 SQLite 里保存 SHA-256 摘要、可读前缀和 Fernet 密文；明文可通过管理接口取回；
+- 数据面支持两种用户标识：
+  - `Authorization: Bearer <用户密钥>`；
+  - `Authorization: Bearer <GATEWAY_API_KEY>` + `X-Gateway-User: user-a`。用户名不存在时自动创建用户和密钥；
+- 用户密钥调用时 `X-Gateway-User` 会被忽略，按密钥绑定的用户名记账；
+- 保留名 `admin` / `anonymous` 不能作为用户名；
 - 删除用户后密钥立即失效，审计历史保留；
 - `/health` 端点不受认证限制；
 - 两类密钥都为空时跳过认证（默认行为，仅建议内网使用）。
@@ -125,7 +132,7 @@ API_KEYS_DB_PATH=data/api_keys.db
 
 ```bash
 curl http://localhost:8100/v1/chat/completions \
-  -H "Authorization: Bearer sk-your-user-key" \
+  -H "Authorization: Bearer gw_your-user-key" \
   -H "Content-Type: application/json" \
   -d '{"model": "all", "messages": [{"role": "user", "content": "Hello"}]}'
 ```

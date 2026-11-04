@@ -23,6 +23,7 @@ DEFAULT_FORWARD_HEADERS = ("accept", "content-type", "user-agent", "accept-langu
 FORBIDDEN_FORWARD_HEADERS = {
     "authorization", "cookie", "host", "content-length", "connection",
     "transfer-encoding", "accept-encoding", "proxy-authorization",
+    "x-gateway-user",
 }
 
 # 维度名不能和审计核心列重名，避免同一个名字在查询时有两套含义

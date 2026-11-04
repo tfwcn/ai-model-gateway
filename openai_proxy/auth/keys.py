@@ -6,7 +6,7 @@
   数据面请求按 admin 身份记账，兼容原有单密钥部署。
 - 用户级密钥存放在 SQLite（见 UserKeyManager），进程内只保留「哈希 → 用户标签」的快照，
   请求热路径不碰数据库；新增/删除后由管理接口刷新快照。
-- 数据库里只存密钥的 SHA-256 与可读前缀，明文只在创建时返回一次。
+- 数据库里保存密钥的 SHA-256、可读前缀和加密密文；鉴权只查摘要。
 - 两者都不存在时保持原有的「不鉴权」行为；只配置用户密钥时管理接口仍然关闭。
 - 管理密钥用常量时间比较，避免通过响应时间侧信道试探。
 """
@@ -72,6 +72,10 @@ class ApiKeyRegistry:
     def user_names(self) -> tuple:
         """已配置的用户标签（只暴露标签，不暴露任何密钥）"""
         return tuple(sorted(set(self._users.values())))
+
+    def has_user_name(self, name: str) -> bool:
+        """用户名是否已在当前快照里（用于数据面自动创建前的快速判断）"""
+        return bool(name) and name in self._users.values()
 
     def set_user_hashes(self, users: Mapping[str, str]) -> None:
         """用最新快照替换用户密钥表（key_hash -> 用户标签）"""

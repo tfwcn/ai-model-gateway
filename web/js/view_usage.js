@@ -62,7 +62,7 @@ export async function renderUsage(root, ctx) {
   const rankingBox = el("div");
   const dimensionBox = el("div");
 
-  const dimGroup = textInput("model", "例如 model,size");
+  const dimGroup = textInput("model", "例如 month,user,model");
   const dimEndpoint = textInput("", "例如 passthrough:example-service");
   const dimUser = textInput("", "留空表示不限");
   const dimButton = button("查询维度", "primary");
@@ -219,6 +219,9 @@ function renderDimensions(box, payload) {
       { key: "success", label: "成功", num: true },
       { key: "failure", label: "失败", num: true },
       { key: "aborted", label: "中断", num: true },
+      { key: "input_tokens", label: "输入 tokens", num: true },
+      { key: "cached_tokens", label: "缓存 tokens", num: true },
+      { key: "output_tokens", label: "输出 tokens", num: true },
       { key: "success_rate", label: "成功率", num: true, render: (row) => fmtRate(row.success_rate) },
     ], items),
   );

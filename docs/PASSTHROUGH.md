@@ -129,17 +129,22 @@ dimensions = {"platform":"passthrough","model":"model-a","size":"1024x1024",...}
 后台刷盘时会把已收尾的审计行累加进 `usage_dimension_daily`：
 
 ```text
-(day, endpoint, api_user, dimensions) → requests / attempts / success / failure / aborted / retries
+(day, endpoint, api_user, dimensions)
+  → requests / attempts / success / failure / aborted / retries
+  → input_tokens / cached_tokens / output_tokens
 ```
 
 - 按完整维度组合存一行，查询时可按任意子集分组；
 - 只累加、不删除，审计明细保留期清理后历史仍在；
+- token 来自审计行；上游没有返回 usage 时按 0 累计；
+- `group_by` 支持 `day`、`month`、`user`、`endpoint` 与任意维度名；
 - 每个透传请求只有一条 attempt，所以按用户/维度求和不会重复计数请求。
 
 查询命令：
 
 ```bash
 python manage.py usage dimensions --group-by model,size --since 30d
+python manage.py usage dimensions --group-by month,user,model --since 90d
 python manage.py usage dimensions --group-by day,user,model --since 30d \
   --endpoint passthrough:example-service
 ```
@@ -148,7 +153,7 @@ HTTP：
 
 ```bash
 curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  "http://localhost:8000/admin/usage/dimensions?group_by=model,size&since=30d"
+  "http://localhost:8000/admin/usage/dimensions?group_by=month,user,model&since=90d"
 
 curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/usage/dimensions?group_by=day,user,model,size&user=user-a"
