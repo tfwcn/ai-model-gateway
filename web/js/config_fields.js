@@ -146,6 +146,7 @@ export function fieldDictionary(docs, sections) {
     { scope: "platform", title: "字段字典：平台级字段", meta: "写在平台条目那一层" },
     { scope: "model", title: "字段字典：模型级可覆盖字段", meta: "写在模型条目里，覆盖平台级取值" },
     { scope: "audit", title: "字段字典：audit 段字段", meta: "写在 models.yaml 的 audit 段" },
+    { scope: "passthrough", title: "字段字典：passthrough 段字段", meta: "写在透传路由里" },
   ];
 
   const blocks = groups.map((group) => {
@@ -516,7 +517,111 @@ function auditMeta(audit) {
   return `${enabled} · 保留 ${formatValue(audit.retention_days)} 天`;
 }
 
-// ---------- 新增/删除平台 ----------
+// ---------- 透传路由 ----------
+
+export function passthroughPanel(routes, editables, stage) {
+  const items = routes || [];
+  const blocks = items.map((route) => {
+    const apiKey = route.apiKey || {};
+    const rows = [
+      el("dl", { class: "kv" }, [
+        key("前缀"), val(route.prefix),
+        key("上游"), val(route.upstream),
+        key("密钥"), val(`${apiKey.env || "-"}（${apiKey.env_set ? "已设置" : "未设置"}，写法 ${apiKey.kind || "missing"}）`),
+        key("超时"), val(`${formatValue(route.timeout)}s，连接 ${formatValue(route.connect_timeout)}s`),
+        key("维度"), val((Object.keys(route.dimensions || {}) || []).join(", ") || "-"),
+      ]),
+      fieldEditor(editables.passthroughFields, editables.kinds, {
+        stage,
+        limits: editables.limits,
+        docs: (editables.docs || {}).passthrough,
+        buildOp: (field, value) => ({ op: "set_passthrough_field", name: route.name, field, value }),
+        buildUnset: (field) => ({ op: "unset_passthrough_field", name: route.name, field }),
+        currentFor: (field) => passthroughCurrentValue(route, field),
+        availableFor: (field) => (field === "forward_headers" ? passthroughHeaderOptions(route) : []),
+        pickNoteFor: (field) => (field === "forward_headers"
+          ? "自定义头名需要手改 models.yaml；Authorization/Cookie/Host 永远不会转发"
+          : ""),
+      }),
+      el("p", { class: "muted", text: "维度键名就是汇总时的分组名；model 维度会覆盖默认的路由名。" }),
+    ];
+    return collapsible(`透传：${route.name}`, rows, {
+      meta: `${route.prefix} → ${route.upstream} · ${Object.keys(route.dimensions || {}).length} 个维度`,
+      actions: [removePassthroughButton(route, stage)],
+      open: false,
+    });
+  });
+
+  blocks.push(addPassthroughPanel(stage));
+  return collapsible(`透传接口（${items.length}）`, blocks, {
+    meta: "对外前缀统一 /proxy/；请求体、查询串与指定请求头原样转发",
+    open: false,
+  });
+}
+
+function passthroughCurrentValue(route, field) {
+  if (field === "apiKey") {
+    const apiKey = route.apiKey || {};
+    return apiKey.kind === "env_placeholder" ? "${" + apiKey.env + "}" : "";
+  }
+  return route[field];
+}
+
+/** 允许额外转发的常见请求头候选；自定义头仍需手改 YAML */
+function passthroughHeaderOptions(route) {
+  const common = ["accept", "content-type", "user-agent", "accept-language", "x-request-id", "traceparent"];
+  const selected = route.forward_headers || [];
+  return [...new Set([...common, ...selected])].map((name) => ({ value: name, label: name }));
+}
+
+function removePassthroughButton(route, stage) {
+  const node = button("删除透传路由", "ghost");
+  node.addEventListener("click", () => {
+    if (window.confirm(`确认删除透传路由 ${route.name}？删除前会先备份当前配置。`)) {
+      stage({ op: "remove_passthrough", name: route.name });
+    }
+  });
+  return node;
+}
+
+export function addPassthroughPanel(stage) {
+  const name = textInput("", "路由名，例如 example-service");
+  const upstream = textInput("", "https://api.example.com/v1");
+  const apiKey = textInput("", "${EXAMPLE_PLATFORM_API_KEY}");
+  const prefix = textInput("", "留空默认 /proxy/<路由名>");
+  const dimensions = valueControl({ kind: "map_str", current: {} });
+  const hint = el("span", { class: "muted", text: "" });
+  const add = button("新增透传路由", "primary");
+
+  add.addEventListener("click", () => {
+    const routeName = name.value.trim();
+    const upstreamValue = upstream.value.trim();
+    if (!routeName || !upstreamValue) {
+      hint.textContent = "路由名与 upstream 不能空";
+      return;
+    }
+    const config = {
+      upstream: upstreamValue,
+      apiKey: apiKey.value.trim(),
+      dimensions: dimensions.read().value,
+    };
+    if (prefix.value.trim()) config.prefix = prefix.value.trim();
+    stage({ op: "add_passthrough", name: routeName, config });
+    hint.textContent = "已加入待提交清单";
+  });
+
+  return collapsible("新增透传路由", [
+    el("div", { class: "form-grid" }, [
+      control("路由名", name),
+      control("upstream", upstream),
+      control("密钥占位符", apiKey),
+      control("对外前缀", prefix),
+    ]),
+    fieldGroup("维度（键名 → body./query./header./path. 表达式）", dimensions.node),
+    el("div", { class: "control-row" }, [add, hint]),
+  ], { meta: "新增后热重载即可生效，不需要重启", open: false });
+}
+
 
 export function addPlatformPanel(stage) {
   const name = textInput("", "example-platform");

@@ -43,6 +43,9 @@ curl -H "Authorization: Bearer $GATEWAY_API_KEY" http://localhost:8000/metrics
 | `cache_hits_total` / `cache_misses_total` | Counter | 缓存命中/未命中 |
 | `active_connections` / `pending_requests` | Gauge | 活跃连接数 / 待处理请求数 |
 
+透传接口的指标使用 `platform=passthrough`；实际业务 `model` 来自透传路由的 `dimensions.model`
+（没有声明时是路由名），因此不会把分辨率等维度塞进 Prometheus 标签。
+
 标签默认不含 `model`：爬虫模式下模型数量很大，`model` 标签会把指标基数撑爆。要按模型看 Prometheus 数据，
 用环境变量 `METRICS_LABEL_MODEL=true` **并在启动前**设好（指标注册时就读它，`models.yaml` 里的
 `audit.metrics_label_model` 目前不改变标签）；打开后前四个计数与三个流式直方图会多出 `model` 标签。

@@ -2,7 +2,7 @@
 统一错误响应 - 只作用于非转发接口
 
 约定：
-- 转发协议接口（/v1/*）保持原有形状不动，避免影响 OpenAI 兼容客户端；
+- 转发协议接口（/v1/*、/proxy/*）保持原有形状不动，避免影响 OpenAI 兼容客户端与透传链路；
 - 其余接口（/admin/*、/metrics、/health 等）一律返回：
 
       {"error": {"code": "user_exists", "message": "...", "details": {...}?}}
@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # 转发协议前缀：这些接口的错误形状保持不变
-FORWARD_PREFIX = "/v1"
+FORWARD_PREFIXES = ("/v1", "/proxy")
 
 # 没有显式指定 code 时，按状态码给一个通用 code
 _DEFAULT_CODES: Dict[int, str] = {
@@ -68,7 +68,7 @@ class ApiError(HTTPException):
 
 def is_forward_path(path: str) -> bool:
     """是否属于转发协议接口（这些接口的错误形状保持原样）"""
-    return path == FORWARD_PREFIX or path.startswith(FORWARD_PREFIX + "/")
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in FORWARD_PREFIXES)
 
 
 def error_response(

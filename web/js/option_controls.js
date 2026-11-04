@@ -232,6 +232,53 @@ export function valueControl(spec) {
     };
   }
 
+  if (kind === "map_str") {
+    // 键值对：透传维度、附加请求头用它，避免让人手写 JSON
+    const source = current && typeof current === "object" && !Array.isArray(current) ? current : {};
+    const rows = el("div", { class: "map-rows" });
+    const entries = Object.entries(source).map(([key, value]) => ({ key, value: String(value ?? "") }));
+
+    function renderRows() {
+      rows.replaceChildren(...entries.map((entry) => {
+        const keyInput = textInput(entry.key, "键，例如 model");
+        const valueInput = textInput(entry.value, "值，例如 body.model");
+        keyInput.value = entry.key;
+        valueInput.value = entry.value;
+        keyInput.addEventListener("input", () => { entry.key = keyInput.value; });
+        valueInput.addEventListener("input", () => { entry.value = valueInput.value; });
+        const remove = button("×", "ghost");
+        remove.addEventListener("click", () => {
+          const index = entries.indexOf(entry);
+          if (index >= 0) entries.splice(index, 1);
+          renderRows();
+        });
+        return el("div", { class: "map-row" }, [keyInput, valueInput, remove]);
+      }));
+    }
+
+    const add = button("加一项", "ghost");
+    add.addEventListener("click", () => {
+      entries.push({ key: "", value: "" });
+      renderRows();
+    });
+    renderRows();
+
+    return {
+      node: el("div", { class: "map-editor" }, [
+        rows,
+        el("div", { class: "row-actions" }, [add]),
+      ]),
+      read: () => {
+        const result = {};
+        entries.forEach((entry) => {
+          const key = String(entry.key || "").trim();
+          if (key) result[key] = String(entry.value ?? "");
+        });
+        return { value: result };
+      },
+    };
+  }
+
   if (NUMERIC_KINDS.has(kind)) {
     const node = el("input", {
       type: "number",

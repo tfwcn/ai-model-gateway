@@ -93,6 +93,19 @@ class ConfigDocument:
         audit = self.raw.get("audit")
         return audit if isinstance(audit, dict) else {}
 
+    @property
+    def passthrough(self) -> Dict[str, Any]:
+        if not isinstance(self.raw, dict):
+            return {}
+        section = self.raw.get("passthrough")
+        return section if isinstance(section, dict) else {}
+
+    def passthrough_route(self, name: str) -> Optional[Any]:
+        """按名取透传路由配置，不存在时返回 None"""
+        if name in schema.RESERVED_TOP_KEYS:
+            return None
+        return self.passthrough.get(name)
+
     def platform(self, name: str) -> Optional[Any]:
         """按名取平台配置块，不存在时返回 None"""
         if not isinstance(self.raw, dict) or name in schema.RESERVED_TOP_KEYS:
@@ -130,7 +143,24 @@ class ConfigDocument:
 
     def env_status(self) -> List[Dict[str, Any]]:
         """配置引用的环境变量是否已设置（只报告存在性，不含值）"""
-        return schema.env_status(self.platforms)
+        items = schema.env_status(self.platforms)
+        for name, config in self.passthrough.items():
+            if not isinstance(config, dict):
+                continue
+            reference = _passthrough_key_ref(str(name), config.get("apiKey"))
+            for env_name, source in (
+                (reference["env"], "yaml_placeholder" if reference["kind"] == "env_placeholder" else "passthrough_convention"),
+                (reference["convention_env"], "passthrough_convention"),
+            ):
+                if not env_name or any(item["env"] == env_name for item in items):
+                    continue
+                items.append({
+                    "env": env_name,
+                    "platform": f"passthrough.{name}",
+                    "source": source,
+                    "set": bool(os.getenv(env_name)),
+                })
+        return items
 
     def view(self) -> Dict[str, Any]:
         """脱敏的结构化视图，供前端与 CLI 展示"""
@@ -141,6 +171,10 @@ class ConfigDocument:
             "bytes": len(self.text.encode("utf-8")),
             "modified_at": _mtime_iso(self.path),
             "audit": _plain(self.audit),
+            "passthrough": [
+                _passthrough_view(str(name), config)
+                for name, config in self.passthrough.items()
+            ],
             "aliases": [
                 {"name": alias_name, "selectors": [str(item) for item in (selectors or [])]}
                 for alias_name, selectors in self.aliases.items()
@@ -150,6 +184,7 @@ class ConfigDocument:
                 "platform_fields": sorted(field for field in schema.PLATFORM_FIELDS if field not in ("models", "plugin")),
                 "model_fields": sorted(schema.MODEL_FIELDS),
                 "audit_fields": sorted(schema.AUDIT_FIELDS),
+                "passthrough_fields": sorted(schema.PASSTHROUGH_FIELDS),
                 "ops": list(_ops_hint()),
             },
             "errors": errors,
@@ -238,6 +273,42 @@ def _api_key_ref(platform_name: str, value: Any) -> Dict[str, Any]:
     }
 
 
+def _passthrough_view(name: str, config: Any) -> Dict[str, Any]:
+    """单条透传路由的脱敏视图"""
+    if not isinstance(config, dict):
+        return {"name": name, "invalid": True}
+    return {
+        "name": name,
+        "enabled": bool(config.get("enabled", True)),
+        "prefix": str(config.get("prefix") or f"/proxy/{name}"),
+        "upstream": str(config.get("upstream") or ""),
+        "apiKey": _passthrough_key_ref(name, config.get("apiKey")),
+        "auth_header": str(config.get("auth_header") or "Authorization"),
+        "auth_prefix": str(config.get("auth_prefix") if config.get("auth_prefix") is not None else "Bearer "),
+        "timeout": config.get("timeout", 300),
+        "connect_timeout": config.get("connect_timeout"),
+        "body_limit": config.get("body_limit"),
+        "forward_headers": [str(item) for item in (config.get("forward_headers") or [])],
+        "extra_headers": _plain(config.get("extra_headers") or {}),
+        "dimensions": _plain(config.get("dimensions") or {}),
+    }
+
+
+def _passthrough_key_ref(name: str, value: Any) -> Dict[str, Any]:
+    """透传密钥引用：支持 ${VAR} 与按路由名约定的环境变量"""
+    text = str(value) if value is not None else ""
+    env_name = text[2:-1] if text.startswith("${") and text.endswith("}") else None
+    convention_env = f"PASSTHROUGH_{name.upper().replace('-', '_').replace('.', '_')}_API_KEY"
+    return {
+        "kind": "env_placeholder" if env_name else ("literal" if text else "missing"),
+        "env": env_name or convention_env,
+        "convention_env": convention_env,
+        "env_set": bool(os.getenv(env_name or convention_env)),
+        "convention_env_set": bool(os.getenv(convention_env)),
+        "preview": "****" if text and not env_name else "",
+    }
+
+
 def _ops_hint() -> Tuple[str, ...]:
     """可执行补丁操作列表（避免与 editor 循环导入，这里内联常量）"""
     return (
@@ -251,6 +322,10 @@ def _ops_hint() -> Tuple[str, ...]:
         "unset_model_field",
         "set_alias_selectors",
         "set_audit_field",
+        "add_passthrough",
+        "remove_passthrough",
+        "set_passthrough_field",
+        "unset_passthrough_field",
     )
 
 

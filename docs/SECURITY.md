@@ -106,7 +106,7 @@ spec:
 网关有两类密钥：
 
 - **管理密钥**：`GATEWAY_API_KEY`，管理台与 `/admin/*`、`/metrics` 使用；
-- **用户级密钥**：在管理台「用户密钥」页新增/删除，只访问 `/v1/*`，用于按用户统计流量。
+- **用户级密钥**：在管理台「用户密钥」页新增/删除，只访问 `/v1/*` 与 `/proxy/*`，用于按用户统计流量。
 
 ```env
 GATEWAY_API_KEY=sk-your-admin-key
@@ -118,6 +118,8 @@ API_KEYS_DB_PATH=data/api_keys.db
 - 删除用户后密钥立即失效，审计历史保留；
 - `/health` 端点不受认证限制；
 - 两类密钥都为空时跳过认证（默认行为，仅建议内网使用）。
+- 透传接口的客户端 `Authorization` 永不转发到上游；上游鉴权由每条 `passthrough` 路由的 `apiKey` 决定，
+  其余请求头只按白名单转发，`Cookie` / `Host` / `Content-Length` 等一律丢弃。
 
 **示例：**
 

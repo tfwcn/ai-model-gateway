@@ -10,7 +10,7 @@
  */
 
 import { button, el, empty, fmtTime, issues, openTitles, panel, restoreTitles, setCollapsed, textInput } from "./ui.js";
-import { addPlatformPanel, aliasPanel, auditPanel, fieldDictionary, platformPanel, removePlatformButton } from "./config_fields.js";
+import { addPlatformPanel, aliasPanel, auditPanel, fieldDictionary, passthroughPanel, platformPanel, removePlatformButton } from "./config_fields.js";
 import { diffLegend, diffSections, stagedGrid } from "./diff_view.js";
 
 // 改动刚加入清单时不要立刻打接口：连着点几条时合成一次预演
@@ -80,7 +80,8 @@ export async function renderConfig(root, ctx) {
       platformFields: editable.platform_fields,
       modelFields: editable.model_fields,
       auditFields: editable.audit_fields,
-      kinds: { ...schema.platform_fields, ...schema.model_fields, ...schema.audit_fields },
+      passthroughFields: editable.passthrough_fields || [],
+      kinds: { ...schema.platform_fields, ...schema.model_fields, ...schema.audit_fields, ...(schema.passthrough_fields || {}) },
       limits: schema.limits,
       // 只有有限几种取值的字段：界面给下拉，不让人在输入框里猜写法
       enums: schema.enums || {},
@@ -142,6 +143,7 @@ export async function renderConfig(root, ctx) {
       ...fieldDictionary(fields.docs, state.schema.sections),
       aliasPanel(state.document, stage, state.runtime),
       auditPanel(state.document.audit, fields, stage),
+      passthroughPanel(state.document.passthrough || [], fields, stage),
       addPlatformPanel(stage),
       el("p", { class: "muted", text: `支持的补丁操作：${state.document.editable.ops.join(" / ")}` }),
       el("p", { class: "muted", text: "注释保留规则：只改取值不会动注释；删除条目或整列表覆盖会丢掉附着在那些行上的注释（预演结果里会逐条列出）。" }),

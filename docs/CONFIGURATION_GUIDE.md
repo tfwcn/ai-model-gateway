@@ -17,6 +17,7 @@
 - [OpenClaw 集成配置](#openclaw-集成配置)
 - [高级配置选项](#高级配置选项)
   - [审计与用量统计（顶层 `audit:` 段）](#审计与用量统计顶层-audit-段)
+  - [透传接口（顶层 `passthrough:` 段）](#透传接口顶层-passthrough-段)
   - [管理接口与管理台](#管理接口与管理台)
 
 ---
@@ -263,6 +264,30 @@ audit:
 `AUDIT_PROMETHEUS`、`METRICS_LABEL_MODEL`。
 
 完整说明（统计口径、字段清单、查询方式）见 [审计与用量统计](./AUDIT.md)。
+
+### 透传接口（顶层 `passthrough:` 段）
+
+把任意第三方接口按前缀原样转发，同时复用网关的用户鉴权与审计：
+
+```yaml
+passthrough:
+  example-service:
+    prefix: "/proxy/example-service"      # 必须以 /proxy/ 开头
+    upstream: "https://api.example.com/v1" # 剩余路径与查询串拼在它后面
+    apiKey: "${EXAMPLE_PLATFORM_API_KEY}"  # 客户端密钥不会转发到上游
+    timeout: 300
+    dimensions:                            # 键名就是汇总时的分组名
+      model: "body.model"
+      size: "body.size"
+```
+
+客户端请求 `/proxy/example-service/assets/render?size=1024`
+会转发到 `https://api.example.com/v1/assets/render?size=1024`。
+
+维度支持 `body.` / `query.` / `header.` / `path.` 四种来源，会进入审计的 `dimensions` 与永久日汇总表。
+`platform` / `model` / `model_id` / `selector` 是标准维度键，配置同名维度即可覆盖默认值。
+
+完整说明见 [透传接口与维度用量](./PASSTHROUGH.md)。
 
 ### 管理接口与管理台
 

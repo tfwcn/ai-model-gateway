@@ -51,6 +51,7 @@ def schema_payload() -> Dict[str, Any]:
         "platform_fields": {field: kind for field, kind in schema.PLATFORM_FIELDS.items()},
         "model_fields": {field: kind for field, kind in schema.MODEL_FIELDS.items()},
         "audit_fields": {field: kind for field, kind in schema.AUDIT_FIELDS.items()},
+        "passthrough_fields": {field: kind for field, kind in schema.PASSTHROUGH_FIELDS.items()},
         "limits": {field: {"min": low, "max": high} for field, (low, high) in schema._LIMITS.items()},
         # 取值只有有限几种的字段：界面渲染成下拉，而不是让人在输入框里猜写法
         "enums": field_docs.enum_fields(),
@@ -59,6 +60,7 @@ def schema_payload() -> Dict[str, Any]:
             "platform": field_docs.docs_for(list(schema.PLATFORM_FIELDS), "platform"),
             "model": field_docs.docs_for(list(schema.MODEL_FIELDS), "model"),
             "audit": field_docs.docs_for(list(schema.AUDIT_FIELDS), "audit"),
+            "passthrough": field_docs.docs_for(list(schema.PASSTHROUGH_FIELDS), "passthrough"),
         },
         "sections": config_guide.guide_sections(),
     }

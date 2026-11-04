@@ -24,18 +24,31 @@ class PruneRequest(BaseModel):
     before: str = Field(..., description="ISO 时间、日期或 30d")
 
 
-def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
+def build_audit_router(
+    audit_provider: Callable[[], AuditManager],
+    dimension_provider: Optional[Callable[[], list]] = None,
+) -> APIRouter:
     """
     构建审计路由
 
     Args:
         audit_provider: 返回当前 AuditManager 的函数（服务启动后才打开库，因此用 provider 而不是实例）
+        dimension_provider: 返回当前透传路由维度配置的函数，供用量页做候选
     """
     router = APIRouter()
 
     def _queries() -> UsageQueryService:
         manager = audit_provider()
         return manager.query_service
+
+    def _routes() -> list:
+        if dimension_provider is None:
+            return []
+        try:
+            return dimension_provider() or []
+        except Exception as exc:  # noqa: BLE001 - 候选拿不到不影响查询
+            logger.debug(f"读取透传维度配置失败: {exc}")
+            return []
 
     @router.post("/admin/usage/summary")
     async def usage_summary(
@@ -87,6 +100,34 @@ def build_audit_router(audit_provider: Callable[[], AuditManager]) -> APIRouter:
     ) -> Dict[str, Any]:
         """模型对比榜：慢模型、不稳定模型、用量大户"""
         return await _run(_queries().model_ranking, sort, since, until, limit, user)
+
+    @router.post("/admin/usage/dimensions")
+    async def usage_dimensions(
+        group_by: str = Query("model", description="逗号分隔：model / model,size / day,user,model,size"),
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
+        endpoint: Optional[str] = Query(None, description="只看某个入口，例如 passthrough:example-service"),
+        limit: int = Query(200, ge=1, le=1000),
+    ) -> Dict[str, Any]:
+        """永久维度日汇总：按任意维度组合看调用量"""
+        return await _run(_queries().dimension_usage, group_by, since, until, user, endpoint, limit)
+
+    @router.post("/admin/usage/dimension-keys")
+    async def usage_dimension_keys() -> Dict[str, Any]:
+        """维度候选项：已配置的透传路由 + 历史表里出现过的维度名"""
+        stored = await asyncio.to_thread(_queries().dimension_keys)
+        routes = _routes()
+        configured = []
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            configured.extend(route.get("dimensions") or [])
+        return {
+            "routes": routes,
+            "stored": stored,
+            "keys": sorted({str(key) for key in configured + stored if str(key).strip()}),
+        }
 
     @router.post("/admin/audit")
     async def audit_list(

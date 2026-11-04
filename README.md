@@ -59,6 +59,7 @@
 | **错误分类系统**         | 7 种错误类型（超时/连接/认证/限流/服务器/格式/模型），精细控制重试和禁用策略 |
 | **SKIP_PLUGIN_SCRAPER**  | 跳过插件爬虫直接使用缓存，适合离线环境或加速启动                             |
 | **用量与性能审计**   | 一次上游尝试一行：成功率、P95 耗时、首块耗时、tokens/s、故障转移链、错误分类 |
+| **任意接口透传**     | `/proxy/<route>/**` 原样转发到上游，复用用户鉴权与审计；参数可声明为汇总维度 |
 | **管理台 & 命令行**  | `/admin/ui/` 网页与 `manage.py` 都能看审计、改模型配置（保留 YAML 注释）     |
 | **Docker 一键部署**      | 内置 Redis、Playwright，开箱即用的容器化部署方案                             |
 
@@ -107,11 +108,12 @@ nano .env  # 填入你的 API 密钥（可选设置 GATEWAY_API_KEY 开启认证
 python run.py
 ```
 
-或使用启动脚本（自动管理 Redis 和虚拟环境，默认端口 8100）：
+或使用启动脚本（自动加载 `.env`、管理 Redis 和虚拟环境）：
 
 ```bash
-bash start.sh          # 默认端口 8100
-bash start.sh --port 8000  # 指定端口
+bash start.sh          # 读取 .env；PORT 未设置时默认 8000
+bash start.sh --port 8000  # 命令行参数优先于 .env
+ENV_FILE=/etc/gateway.env bash start.sh  # 指定别的环境变量文件
 ```
 
 也可通过环境变量指定端口：
@@ -158,8 +160,9 @@ curl http://localhost:8000/v1/responses \
 | `/health`              | GET/POST | 基本健康检查（免认证）                 |
 | `/health/detailed`     | GET  | 详细健康检查                              |
 | `/metrics`             | POST/GET | Prometheus 监控指标（需管理密钥；GET 供抓取） |
-| `/admin/usage/*`       | POST | 用量与性能聚合（需管理密钥）                  |
+| `/admin/usage/*`       | POST | 用量与性能聚合（含永久维度日汇总，需管理密钥） |
 | `/admin/audit*`        | POST | 审计明细与故障转移链（需管理密钥）            |
+| `/proxy/<route>/**`    | 任意 | 透传第三方接口（需网关密钥；上游鉴权由配置决定） |
 | `/admin/config/*`      | POST | 配置读取、预演、写盘、回滚（需管理密钥）      |
 | `/admin/users*`        | POST | 用户密钥新增、查询、删除（需管理密钥）        |
 | `/admin/ui/`           | GET  | 管理台前端（静态壳免密钥，数据接口仍需密钥）  |
@@ -483,6 +486,7 @@ python manage.py config rollback models.yaml.20260101T000000Z.bak
 ### 高级功能
 
 - [🧾 审计与用量统计](docs/AUDIT.md)
+- [🔀 透传接口与维度用量](docs/PASSTHROUGH.md)
 - [🖥️ 管理台前端](docs/ADMIN_UI.md)
 - [⌨️ 命令行管理工具](docs/CONFIG_CLI.md)
 - [📡 管理接口契约](web/API.md)

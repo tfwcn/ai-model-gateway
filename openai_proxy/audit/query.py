@@ -12,7 +12,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openai_proxy.audit.record import FINAL_OUTCOMES
-from openai_proxy.audit.store import TABLE, USAGE_TABLE, AuditStore
+from openai_proxy.audit.store import TABLE, USAGE_DIMENSION_TABLE, USAGE_TABLE, AuditStore
+
+# 维度名白名单：只允许字母、数字、下划线、连字符
+_DIMENSION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # group_by 取值 → SQL 分组表达式（白名单，杜绝注入）
 _GROUP_EXPRS: Dict[str, str] = {
@@ -277,6 +280,106 @@ class UsageQueryService:
             "items": items,
         }
 
+    # ---------- 维度汇总 ----------
+
+    def dimension_usage(
+        self,
+        group_by: str = "model",
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        user: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        查询永久维度日汇总表（usage_dimension_daily）
+
+        group_by 是逗号分隔的分组键，支持 day / user / endpoint 与任意维度名，
+        例如 `model`、`model,size`、`day,user,model,size`。
+        """
+        names = _parse_dimension_group(group_by)
+        exprs = [_dimension_group_expr(name) for name in names]
+        aliases = [f"g{index}" for index in range(len(exprs))]
+        select_group = ", ".join(f"{expr} AS {alias}" for expr, alias in zip(exprs, aliases))
+        group_clause = ", ".join(aliases)
+        bucket_expr = _bucket_from_exprs(exprs)
+
+        where: List[str] = ["1 = 1"]
+        params: List[Any] = []
+        since_iso = parse_time(since)
+        if since_iso:
+            where.append("day >= ?")
+            params.append(since_iso[:10])
+        until_iso = parse_time(until)
+        if until_iso:
+            where.append("day < ?")
+            params.append(until_iso[:10])
+        if user:
+            where.append("api_user = ?")
+            params.append(user)
+        if endpoint:
+            where.append("endpoint = ?")
+            params.append(endpoint)
+
+        rows = self.store.query(
+            f"""
+            SELECT {select_group}, {bucket_expr} AS bucket,
+                   COALESCE(SUM(requests), 0) AS requests,
+                   COALESCE(SUM(attempts), 0) AS attempts,
+                   COALESCE(SUM(success), 0) AS success,
+                   COALESCE(SUM(failure), 0) AS failure,
+                   COALESCE(SUM(aborted), 0) AS aborted,
+                   COALESCE(SUM(retries), 0) AS retries
+            FROM {USAGE_DIMENSION_TABLE}
+            WHERE {' AND '.join(where)}
+            GROUP BY {group_clause}
+            ORDER BY requests DESC, bucket ASC
+            LIMIT ?
+            """,
+            params + [max(1, min(int(limit), 1000))],
+        )
+
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["values"] = {name: item.pop(alias) for name, alias in zip(names, aliases)}
+            finalized = int(item.get("success") or 0) + int(item.get("failure") or 0) + int(item.get("aborted") or 0)
+            item["success_rate"] = (
+                round(int(item.get("success") or 0) / finalized, 4) if finalized else None
+            )
+            items.append(item)
+        return {
+            "group_by": names,
+            "range": {"since": parse_time(since), "until": parse_time(until) or _now_iso()},
+            "count": len(items),
+            "items": items,
+        }
+
+    def dimension_keys(self) -> List[str]:
+        """维度日汇总表里出现过的全部维度名（按名称排序）"""
+        try:
+            rows = self.store.query(
+                f"""
+                SELECT DISTINCT key
+                FROM {USAGE_DIMENSION_TABLE}, json_each({USAGE_DIMENSION_TABLE}.dimensions)
+                WHERE key IS NOT NULL AND key != ''
+                ORDER BY key ASC
+                """
+            )
+            return [str(row["key"]) for row in rows]
+        except Exception:  # noqa: BLE001 - 极老 SQLite 没有 JSON1 时降级
+            keys = set()
+            for row in self.store.query(f"SELECT dimensions FROM {USAGE_DIMENSION_TABLE}"):
+                try:
+                    import json
+
+                    payload = json.loads(row.get("dimensions") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(payload, dict):
+                    keys.update(str(key) for key in payload if str(key).strip())
+            return sorted(keys)
+
     # ---------- 明细 ----------
 
     def list_attempts(
@@ -333,9 +436,12 @@ class UsageQueryService:
 
     def _group_expr(self, group_by: str) -> str:
         expr = _GROUP_EXPRS.get(group_by)
-        if expr is None:
-            raise ValueError(f"group_by 只支持: {', '.join(sorted(_GROUP_EXPRS))}")
-        return expr
+        if expr is not None:
+            return expr
+        if group_by.startswith("dim:"):
+            names = _parse_dimension_names(group_by[4:])
+            return _dimension_bucket_expr(names)
+        raise ValueError(f"group_by 只支持: {', '.join(sorted(_GROUP_EXPRS))} 或 dim:<维度名>")
 
     @staticmethod
     def _filters(
@@ -448,3 +554,63 @@ def _sorted(items: List[Dict[str, Any]], sort: str) -> List[Dict[str, Any]]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+# ---------- 维度查询工具 ----------
+
+
+def _parse_dimension_names(raw: str) -> List[str]:
+    """解析 `model,size` 这类维度名列表，逐个校验白名单"""
+    names = [item.strip() for item in str(raw).split(",") if item.strip()]
+    if not names:
+        raise ValueError("dim: 后面至少要有一个维度名，例如 dim:model,size")
+    for name in names:
+        _require_dimension_name(name)
+    return names
+
+
+def _parse_dimension_group(raw: str) -> List[str]:
+    """维度汇总的分组键：允许 day/user/endpoint 与任意维度名"""
+    names = [item.strip() for item in str(raw).split(",") if item.strip()]
+    if not names:
+        raise ValueError("group_by 至少要有一个分组键")
+    for name in names:
+        if name in ("day", "user", "endpoint"):
+            continue
+        _require_dimension_name(name)
+    return names
+
+
+def _require_dimension_name(name: str) -> None:
+    """维度名只允许安全字符，避免拼进 JSON 路径时被注入"""
+    if not _DIMENSION_NAME_RE.match(name):
+        raise ValueError(f"维度名不合法: {name}（只允许字母、数字、下划线、连字符）")
+
+
+def _json_dimension(name: str) -> str:
+    """从 dimensions JSON 里取一个维度值的 SQL 表达式"""
+    return f"COALESCE(json_extract(COALESCE(dimensions, '{{}}'), '$.\"{name}\"'), '')"
+
+
+def _dimension_bucket_expr(names: Sequence[str]) -> str:
+    """审计明细按多个维度拼成一个可读 bucket"""
+    exprs = [_json_dimension(name) for name in names]
+    return " || ' | ' || ".join(exprs)
+
+
+def _dimension_group_expr(name: str) -> str:
+    """维度日汇总表的分组表达式：day/user/endpoint 走固定列，其余走 dimensions"""
+    if name == "day":
+        return "day"
+    if name == "user":
+        return "COALESCE(NULLIF(api_user, ''), 'admin')"
+    if name == "endpoint":
+        return "endpoint"
+    return _json_dimension(name)
+
+
+def _bucket_from_exprs(exprs: Sequence[str]) -> str:
+    """把多个分组表达式直接拼成 bucket（SQLite 不允许同一层 SELECT 引用别名）"""
+    if len(exprs) == 1:
+        return exprs[0]
+    return " || ' | ' || ".join(exprs)

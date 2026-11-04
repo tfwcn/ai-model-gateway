@@ -182,7 +182,7 @@ class TestSchemaMigration:
         upgraded.init_schema()
 
         columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(audit_attempts)")}
-        assert version == 4
+        assert version == 5
         assert "done_sent" not in columns
         upgraded.close()
 

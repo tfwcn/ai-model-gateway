@@ -29,6 +29,7 @@ _DOC_SCOPES = (
     ("platform", "平台级字段"),
     ("model", "模型级可覆盖字段（写在模型条目里，覆盖平台级取值）"),
     ("audit", "audit 段字段（这一段每个都要重启）"),
+    ("passthrough", "passthrough 段字段（透传路由）"),
 )
 
 
@@ -45,18 +46,19 @@ class ConfigCommands:
         view = self.service.view()
         platforms = [item for item in view["platforms"] if not args.platform or item["name"] == args.platform]
 
-        if not platforms:
+        if args.platform and not platforms:
             self.console.line(f"配置里没有平台 {args.platform}", to_err=True)
             return EXIT_ERROR
 
         if self.console.as_json:
-            self.console.emit({"version": view["version"], "platforms": platforms, "aliases": view["aliases"], "audit": view["audit"]})
+            self.console.emit({"version": view["version"], "platforms": platforms, "aliases": view["aliases"], "audit": view["audit"], "passthrough": view.get("passthrough") or []})
             return EXIT_OK
 
         self.console.line(f"配置文件: {view['path']}  版本: {view['version'][:12]}  大小: {view['bytes']} 字节")
         self._platform_table(platforms)
         self._alias_table(view["aliases"])
         self._audit_line(view["audit"])
+        self._passthrough_line(view.get("passthrough") or [])
         self._env_line(view["platforms"])
         return EXIT_OK
 
@@ -374,6 +376,19 @@ class ConfigCommands:
     def _audit_line(self, audit: Dict[str, Any]) -> None:
         self.console.line("")
         self.console.line(f"审计段: {_brief(audit) if audit else '（未配置，使用环境变量默认值）'}")
+
+    def _passthrough_line(self, routes: List[Dict[str, Any]]) -> None:
+        self.console.line("")
+        if not routes:
+            self.console.line("透传接口: （未配置）")
+            return
+        self.console.line(f"透传接口（{len(routes)} 条）:")
+        for route in routes:
+            dimensions = ", ".join(route.get("dimensions") or []) or "无"
+            self.console.line(
+                f"  {route['name']}: {route['prefix']} -> {route['upstream']}"
+                f"（维度: {dimensions}；密钥: {_api_key_line(route['apiKey'])}）"
+            )
 
     def _env_line(self, platforms: List[Dict[str, Any]]) -> None:
         missing = []

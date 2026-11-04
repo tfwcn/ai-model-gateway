@@ -227,6 +227,6 @@ def _default_note(ops: List[Dict[str, Any]]) -> str:
     if not ops:
         return "无操作"
     return ", ".join(
-        f"{op.get('op')}:{op.get('platform') or op.get('alias') or op.get('model') or op.get('field') or ''}"
+        f"{op.get('op')}:{op.get('platform') or op.get('alias') or op.get('name') or op.get('model') or op.get('field') or ''}"
         for op in ops
     )

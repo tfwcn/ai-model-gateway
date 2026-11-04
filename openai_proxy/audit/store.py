@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 TABLE = "audit_attempts"
 # 全量日汇总：审计明细按保留期清理，这张表永久保留，用于「用量不丢历史」
 USAGE_TABLE = "usage_daily"
+# 维度日汇总：按「完整维度组合」累加，同样永久保留
+USAGE_DIMENSION_TABLE = "usage_dimension_daily"
+
+# 结构版本：版本 5 起标准维度改为 dimensions + 生成列
+SCHEMA_VERSION = 5
 
 # 主键 + 常用过滤维度的索引：按时间、按模型、按结局、按请求链
 _INDEX_DDL = (
@@ -43,10 +48,6 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     request_id          TEXT,
     endpoint            TEXT NOT NULL,
     stream              INTEGER NOT NULL DEFAULT 0,
-    selector            TEXT,
-    platform            TEXT,
-    model_name          TEXT,
-    model_id            TEXT,
     attempt_seq         INTEGER,
     retry_seq           INTEGER,
     ts                  TEXT NOT NULL,
@@ -70,7 +71,13 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     keepalive_count     INTEGER,
     msg_count           INTEGER,
     done_sent           INTEGER NOT NULL DEFAULT 0,
-    aggregated          INTEGER NOT NULL DEFAULT 0
+    dimensions          TEXT NOT NULL DEFAULT '{{}}',
+    aggregated          INTEGER NOT NULL DEFAULT 0,
+    -- 以下四列是 dimensions 的标准键投影，只读；写入只写 dimensions 一份
+    platform            TEXT GENERATED ALWAYS AS (json_extract(dimensions, '$.platform')) VIRTUAL,
+    model_name          TEXT GENERATED ALWAYS AS (json_extract(dimensions, '$.model')) VIRTUAL,
+    model_id            TEXT GENERATED ALWAYS AS (json_extract(dimensions, '$.model_id')) VIRTUAL,
+    selector            TEXT GENERATED ALWAYS AS (json_extract(dimensions, '$.selector')) VIRTUAL
 )
 """
 
@@ -90,6 +97,24 @@ CREATE TABLE IF NOT EXISTS {USAGE_TABLE} (
     output_tokens   INTEGER NOT NULL DEFAULT 0,
     updated_at      TEXT NOT NULL,
     PRIMARY KEY (day, api_user)
+)
+"""
+
+# 维度日汇总：一天 + 一个入口 + 一个用户 + 一组完整维度 = 一行
+_USAGE_DIMENSION_DDL = f"""
+CREATE TABLE IF NOT EXISTS {USAGE_DIMENSION_TABLE} (
+    day             TEXT NOT NULL,
+    endpoint        TEXT NOT NULL,
+    api_user        TEXT NOT NULL,
+    dimensions      TEXT NOT NULL,
+    requests        INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    success         INTEGER NOT NULL DEFAULT 0,
+    failure         INTEGER NOT NULL DEFAULT 0,
+    aborted         INTEGER NOT NULL DEFAULT 0,
+    retries         INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (day, endpoint, api_user, dimensions)
 )
 """
 
@@ -210,10 +235,11 @@ class SqliteAuditStore(AuditStore):
         self._conn.execute("PRAGMA busy_timeout=5000")
 
     def init_schema(self) -> None:
-        """建表建索引，并按版本补齐老库缺少的列（幂等）"""
+        """建表建索引，并按版本迁移老库结构（幂等）"""
         with self._lock, self._conn:
             self._conn.execute(_CREATE_DDL)
             self._conn.execute(_USAGE_DDL)
+            self._conn.execute(_USAGE_DIMENSION_DDL)
             self._migrate_schema()
             for ddl in _INDEX_DDL:
                 self._conn.execute(ddl)
@@ -222,8 +248,9 @@ class SqliteAuditStore(AuditStore):
         """
         按 `PRAGMA user_version` 依次执行结构迁移
 
-        只做两件事：加缺少的列、给历史行一个说得通的取值。不搬数据、不重建表、不改已有列。
-        新库的建表语句已经带上新列，所以加列前先查一遍，避免重复执行。
+        版本 1~4 只补列与回填；版本 5 把标准维度收拢到 dimensions 一份真相：
+        老库会重建 audit_attempts，把 platform/model_name/model_id/selector 写进 dimensions，
+        再用虚拟生成列保持原有查询与界面字段不变。
         """
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0] or 0)
         existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({TABLE})")}
@@ -248,6 +275,82 @@ class SqliteAuditStore(AuditStore):
                 f"（新增列 {', '.join(added) or '无'}，回填 {touched} 行历史取值）"
             )
             version = target
+
+        if version < SCHEMA_VERSION:
+            self._migrate_to_dimensions()
+            version = SCHEMA_VERSION
+
+    def _migrate_to_dimensions(self) -> None:
+        """把老结构收拢为 dimensions + 生成列，并回填维度日汇总"""
+        columns = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({TABLE})")}
+        generated = {
+            row["name"] for row in self._conn.execute(f"PRAGMA table_xinfo({TABLE})")
+            if int(row["hidden"] or 0) > 0
+        }
+        if "dimensions" not in columns or "platform" not in generated:
+            legacy = f"{TABLE}_legacy"
+            self._conn.execute(f"ALTER TABLE {TABLE} RENAME TO {legacy}")
+            self._conn.execute(_CREATE_DDL)
+            core_columns = [column for column in COLUMNS if column != "dimensions"]
+            column_list = ", ".join(core_columns + ["dimensions"])
+            select_list = ", ".join(
+                f"COALESCE({column}, '')" if column in ("api_user", "request_id") else column
+                for column in core_columns
+            )
+            self._conn.execute(
+                f"""
+                INSERT INTO {TABLE} ({column_list})
+                SELECT {select_list},
+                       json_object(
+                           'model', COALESCE(model_name, ''),
+                           'model_id', COALESCE(model_id, ''),
+                           'platform', COALESCE(platform, ''),
+                           'selector', COALESCE(selector, '')
+                       )
+                FROM {legacy}
+                """
+            )
+            self._conn.execute(f"DROP TABLE {legacy}")
+            logger.info("审计库结构升级: 标准维度已收拢到 dimensions（老行已回填）")
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self._backfill_dimension_usage()
+
+    def _backfill_dimension_usage(self) -> None:
+        """维度日汇总表首次创建时，用全部已收尾明细回填一次（不碰 usage_daily）"""
+        self._conn.execute(
+            f"""
+            INSERT INTO {USAGE_DIMENSION_TABLE} (
+                day, endpoint, api_user, dimensions, requests, attempts,
+                success, failure, aborted, retries, updated_at
+            )
+            SELECT
+                substr(ts, 1, 10) AS day,
+                endpoint,
+                COALESCE(NULLIF(api_user, ''), 'admin') AS api_user,
+                dimensions,
+                COUNT(DISTINCT gateway_request_id) AS requests,
+                COUNT(*) AS attempts,
+                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success,
+                SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failure,
+                SUM(CASE WHEN outcome = 'aborted' THEN 1 ELSE 0 END) AS aborted,
+                SUM(CASE WHEN retry_seq > 1 THEN 1 ELSE 0 END) AS retries,
+                ? AS updated_at
+            FROM {TABLE}
+            WHERE finalized = 1 AND endpoint != 'config_write'
+              AND dimensions IS NOT NULL AND dimensions != '' AND dimensions != '{{}}'
+            GROUP BY day, endpoint, api_user, dimensions
+            ON CONFLICT(day, endpoint, api_user, dimensions) DO UPDATE SET
+                requests = requests + excluded.requests,
+                attempts = attempts + excluded.attempts,
+                success = success + excluded.success,
+                failure = failure + excluded.failure,
+                aborted = aborted + excluded.aborted,
+                retries = retries + excluded.retries,
+                updated_at = excluded.updated_at
+            """,
+            (_now_iso(),),
+        )
+        logger.info("审计维度日汇总已回填")
 
     def insert_many(self, rows: Iterable[Dict[str, Any]]) -> int:
         """批量写入：INSERT OR REPLACE，允许 finalize 前后的重复提交覆盖同一行"""
@@ -324,6 +427,40 @@ class SqliteAuditStore(AuditStore):
                 """,
                 (_now_iso(),),
             )
+            # 维度日汇总与 usage_daily 同一事务：按完整维度组合累加
+            self._conn.execute(
+                f"""
+                INSERT INTO {USAGE_DIMENSION_TABLE} (
+                    day, endpoint, api_user, dimensions, requests, attempts,
+                    success, failure, aborted, retries, updated_at
+                )
+                SELECT
+                    substr(ts, 1, 10) AS day,
+                    endpoint,
+                    COALESCE(NULLIF(api_user, ''), 'admin') AS api_user,
+                    dimensions,
+                    COUNT(DISTINCT gateway_request_id) AS requests,
+                    COUNT(*) AS attempts,
+                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success,
+                    SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failure,
+                    SUM(CASE WHEN outcome = 'aborted' THEN 1 ELSE 0 END) AS aborted,
+                    SUM(CASE WHEN retry_seq > 1 THEN 1 ELSE 0 END) AS retries,
+                    ? AS updated_at
+                FROM {TABLE}
+                WHERE finalized = 1 AND aggregated = 0 AND endpoint != 'config_write'
+                  AND dimensions IS NOT NULL AND dimensions != '' AND dimensions != '{{}}'
+                GROUP BY day, endpoint, api_user, dimensions
+                ON CONFLICT(day, endpoint, api_user, dimensions) DO UPDATE SET
+                    requests = requests + excluded.requests,
+                    attempts = attempts + excluded.attempts,
+                    success = success + excluded.success,
+                    failure = failure + excluded.failure,
+                    aborted = aborted + excluded.aborted,
+                    retries = retries + excluded.retries,
+                    updated_at = excluded.updated_at
+                """,
+                (_now_iso(),),
+            )
             cursor = self._conn.execute(
                 f"UPDATE {TABLE} SET aggregated = 1 WHERE finalized = 1 AND aggregated = 0"
             )
@@ -348,9 +485,13 @@ class SqliteAuditStore(AuditStore):
             row = self._conn.execute(
                 f"SELECT COUNT(*) AS total, MIN(ts) AS oldest, MAX(ts) AS newest FROM {TABLE}"
             ).fetchone()
+            dimension_row = self._conn.execute(
+                f"SELECT COUNT(*) AS total FROM {USAGE_DIMENSION_TABLE}"
+            ).fetchone()
         size_bytes = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
         return {
             "rows": int(row["total"] or 0),
+            "dimension_rows": int(dimension_row["total"] or 0) if dimension_row else 0,
             "oldest": row["oldest"],
             "newest": row["newest"],
             "db_path": self.db_path,
@@ -393,7 +534,14 @@ class NullAuditStore(AuditStore):
         return 0
 
     def stats(self) -> Dict[str, Any]:
-        return {"rows": 0, "oldest": None, "newest": None, "db_path": None, "db_bytes": 0}
+        return {
+            "rows": 0,
+            "dimension_rows": 0,
+            "oldest": None,
+            "newest": None,
+            "db_path": None,
+            "db_bytes": 0,
+        }
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
         return []

@@ -56,7 +56,7 @@ export function fmtTime(value) {
  */
 export function userLabel(value) {
   const name = String(value || "").trim();
-  if (!name || name === "anonymous" || name === "admin") return "admin（管理密钥）";
+  if (!name || name === "anonymous" || name === "admin") return "admin";
   return name;
 }
 

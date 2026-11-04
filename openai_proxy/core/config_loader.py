@@ -20,6 +20,8 @@ class ConfigLoader:
         self.all_aliases: Dict[str, List[str]] = {}
         # 顶层 audit: 段（审计与用量统计配置），由服务层读取
         self.audit_config: Dict[str, Any] = {}
+        # 顶层 passthrough: 段（第三方接口透传配置），由服务层读取
+        self.passthrough_config: Dict[str, Any] = {}
 
     async def load_config(self) -> Dict[str, List[ModelConfig]]:
         """加载模型配置"""
@@ -52,6 +54,10 @@ class ConfigLoader:
                 # 顶层审计段：不属于平台配置，先取出交给服务层
                 raw_audit = config_data.pop('audit', {}) or {}
                 self.audit_config = raw_audit if isinstance(raw_audit, dict) else {}
+
+                # 顶层透传段：同样不是平台配置
+                raw_passthrough = config_data.pop('passthrough', {}) or {}
+                self.passthrough_config = raw_passthrough if isinstance(raw_passthrough, dict) else {}
                 if isinstance(raw_aliases, dict):
                     self.all_aliases = {
                         k: v if isinstance(v, list) else []

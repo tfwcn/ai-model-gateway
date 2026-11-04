@@ -213,7 +213,86 @@ AUDIT_DOCS: Dict[str, FieldDoc] = {
 }
 
 # 平台级与模型级共用同一份语义；audit 段单独一份（enabled 在两边含义完全不同）
-_SCOPES = {"platform": FIELD_DOCS, "model": FIELD_DOCS, "audit": AUDIT_DOCS}
+_SCOPES = {"platform": FIELD_DOCS, "model": FIELD_DOCS, "audit": AUDIT_DOCS, "passthrough": {}}
+
+
+PASSTHROUGH_DOCS: Dict[str, FieldDoc] = {
+    "enabled": FieldDoc(
+        "是否启用透传",
+        "关掉后这个前缀不再转发，请求会落到 404。",
+        "true/false", "true", "enabled: false", RELOAD,
+    ),
+    "prefix": FieldDoc(
+        "对外前缀",
+        "客户端访问这个前缀下的路径，剩余部分原样拼到 upstream 后面。",
+        "以 /proxy/ 开头的路径", "不写默认 /proxy/<路由名>",
+        "prefix: \"/proxy/example-service\"", RELOAD,
+        "必须 /proxy/ 开头，且不能与其它透传路由重复；这样可以避开 /v1、/admin 等内置接口。",
+    ),
+    "upstream": FieldDoc(
+        "上游基地址",
+        "透传请求的目标基地址；剩余路径与查询串会拼在它后面。",
+        "http(s) URL", "必填；缺失时该路由被跳过",
+        "upstream: \"https://api.example.com/v1\"", RELOAD,
+        "不会跟随上游重定向；上游返回的 3xx 会原样交给客户端。",
+    ),
+    "apiKey": FieldDoc(
+        "上游密钥",
+        "替换客户端 Authorization 的密钥来源；客户端密钥永远不会被转发到上游。",
+        "字符串或 ${ENV_VAR} 占位符", "不写则不带上游鉴权（并给 warning）",
+        "apiKey: \"${EXAMPLE_PLATFORM_API_KEY}\"", RELOAD,
+        "也支持按路由名约定的环境变量 PASSTHROUGH_<路由名>_API_KEY；管理台只显示环境变量名与是否已设置。",
+    ),
+    "auth_header": FieldDoc(
+        "鉴权头名称",
+        "把配置的上游密钥写进哪个请求头；同一个头里的客户端取值会被替换掉。",
+        "HTTP 头名称", "Authorization", "auth_header: \"x-api-key\"", RELOAD,
+    ),
+    "auth_prefix": FieldDoc(
+        "鉴权头前缀",
+        "密钥值前面的前缀，例如 Bearer 加一个空格。",
+        "字符串（可为空）", "Bearer ", "auth_prefix: \"\"", RELOAD,
+        "用 x-api-key 这类头时通常设成空串。",
+    ),
+    "timeout": FieldDoc(
+        "总超时",
+        "等待上游响应与读取响应体的时间预算；SSE 按相邻两次读数据的间隔计算。",
+        "秒（可小数）", "300 秒", "timeout: 600", RELOAD,
+        "超时返回 504 并记一条失败审计。",
+    ),
+    "connect_timeout": FieldDoc(
+        "连接超时",
+        "只覆盖建立连接（DNS + TCP + TLS）这一段。",
+        "秒（可小数）", "10 秒", "connect_timeout: 5", RELOAD,
+    ),
+    "body_limit": FieldDoc(
+        "请求体上限",
+        "允许缓存的请求体最大字节数，超过直接 413。",
+        "字节（整数）", "16MB", "body_limit: 33554432", RELOAD,
+        "有 body 维度时请求体一定会被缓存；没有 body 维度时也走同一上限，避免大文件撑爆内存。",
+    ),
+    "forward_headers": FieldDoc(
+        "转发请求头白名单",
+        "除了默认的 accept/content-type/user-agent 等，额外放行哪些客户端请求头。",
+        "字符串列表", "只放行默认白名单", "forward_headers: [\"x-request-id\"]", RELOAD,
+        "Authorization、Cookie、Host 等头永远不会转发；上游鉴权统一由 apiKey 决定。",
+    ),
+    "extra_headers": FieldDoc(
+        "附加请求头",
+        "每次转发都固定加到上游请求上的头。",
+        "键值对", "空", "extra_headers:\n  X-API-Version: \"2026-01-01\"", RELOAD,
+    ),
+    "dimensions": FieldDoc(
+        "汇总维度",
+        "从请求里提取参数，写进审计的 dimensions，并进入永久维度日汇总。",
+        "键值对：维度名 -> body./query./header./path. 表达式",
+        "空（只记录标准维度）",
+        "dimensions:\n  model: \"body.model\"\n  size: \"body.size\"", RELOAD,
+        "键名就是查询时的分组名；标准键 platform/model/model_id/selector 可覆盖默认值。",
+    ),
+}
+
+_SCOPES["passthrough"] = PASSTHROUGH_DOCS
 
 
 def doc_for(field: str, scope: str = "platform") -> Dict[str, Any]:
@@ -243,7 +322,7 @@ def docs_for(fields: List[str], scope: str = "platform") -> Dict[str, Dict[str, 
 
 def documented_fields() -> List[str]:
     """所有已写字典的字段名（测试用它对照白名单）"""
-    return sorted(set(FIELD_DOCS) | set(AUDIT_DOCS))
+    return sorted(set(FIELD_DOCS) | set(AUDIT_DOCS) | set(PASSTHROUGH_DOCS))
 
 
 def enum_fields() -> Dict[str, Dict[str, Any]]:
@@ -262,4 +341,7 @@ def enum_fields() -> Dict[str, Dict[str, Any]]:
 
 def missing_documentation(fields: List[str]) -> List[str]:
     """哪些字段还没有说明（测试用它保证界面不会出现「能改但没解释」的字段）"""
-    return [field for field in fields if field not in FIELD_DOCS and field not in AUDIT_DOCS]
+    return [
+        field for field in fields
+        if field not in FIELD_DOCS and field not in AUDIT_DOCS and field not in PASSTHROUGH_DOCS
+    ]

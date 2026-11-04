@@ -15,6 +15,7 @@ done_sent 是区分「真中途断开」与「发完后被关」的依据：
 按 SSE 协议读流的客户端拿到 [DONE]/finish_reason 就关连接去执行工具，此时上游可能还没结束
 chunked body；这种情况内容其实已经发完，不能算客户端中断。
 """
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,14 +29,23 @@ OUTCOME_ABORTED = "aborted"
 # 已收尾的结局：成功率等统计只信任这些行
 FINAL_OUTCOMES = (OUTCOME_SUCCESS, OUTCOME_FAILURE, OUTCOME_ABORTED)
 
+# 标准维度键：聊天链路与透传链路共用同一套语义
+# 存储上只有 dimensions 一份真相，platform/model/... 是 SQLite 生成列
+DIM_PLATFORM = "platform"
+DIM_MODEL = "model"
+DIM_MODEL_ID = "model_id"
+DIM_SELECTOR = "selector"
+STANDARD_DIMENSIONS = (DIM_PLATFORM, DIM_MODEL, DIM_MODEL_ID, DIM_SELECTOR)
+
 # 落库列顺序，与 SqliteAuditStore 的建表语句一一对应
+# 标准维度不再单独写入，统一由 dimensions 派生
 COLUMNS = (
     "attempt_key", "gateway_request_id", "api_user", "request_id", "endpoint", "stream",
-    "selector", "platform", "model_name", "model_id", "attempt_seq", "retry_seq",
-    "ts", "outcome", "finalized", "http_status", "error_category", "error_code",
-    "disabled_model", "duration_ms", "probe_ms", "ttft_ms", "has_usage", "upstream_id",
-    "input_tokens", "cached_tokens", "output_tokens", "output_chars", "throughput",
-    "tool_call_converted", "keepalive_count", "msg_count", "done_sent",
+    "attempt_seq", "retry_seq", "ts", "outcome", "finalized", "http_status",
+    "error_category", "error_code", "disabled_model", "duration_ms", "probe_ms",
+    "ttft_ms", "has_usage", "upstream_id", "input_tokens", "cached_tokens",
+    "output_tokens", "output_chars", "throughput", "tool_call_converted",
+    "keepalive_count", "msg_count", "done_sent", "dimensions",
 )
 
 
@@ -97,8 +107,37 @@ class AuditAttempt:
     msg_count: Optional[int] = None
     # 网关是否已把终止标记 [DONE] 转发给客户端：aborted 只有配着 0 才是「内容没发完」
     done_sent: bool = False
+    # 业务维度快照：唯一可扩展的分组概念，标准键见 STANDARD_DIMENSIONS
+    dimensions: Dict[str, str] = field(default_factory=dict)
     # 计时起点（不落库）：由 begin 时刻写入
     started_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        """把构造时传入的标准字段合并进 dimensions（保持旧调用方式可用）"""
+        normalized = _normalize_dimensions(self.dimensions)
+        for key, value in (
+            (DIM_PLATFORM, self.platform),
+            (DIM_MODEL, self.model_name),
+            (DIM_MODEL_ID, self.model_id),
+            (DIM_SELECTOR, self.selector),
+        ):
+            if value and not normalized.get(key):
+                normalized[key] = str(value)
+        self.dimensions = normalized
+
+        # 反向同步：调用方只传 dimensions 时，标准字段也要能看到（指标与旧代码依赖它们）
+        if not self.platform:
+            self.platform = normalized.get(DIM_PLATFORM, "")
+        if not self.model_name:
+            self.model_name = normalized.get(DIM_MODEL, "")
+        if not self.model_id:
+            self.model_id = normalized.get(DIM_MODEL_ID, "")
+        if not self.selector:
+            self.selector = normalized.get(DIM_SELECTOR, "")
+
+    def dimension(self, name: str) -> str:
+        """取一个维度值；不存在时返回空串"""
+        return self.dimensions.get(name, "")
 
     # ---------- 结论 ----------
 
@@ -185,14 +224,33 @@ class AuditAttempt:
     # ---------- 落库 ----------
 
     def to_row(self) -> Dict[str, Any]:
-        """转换为落库字典（bool 转 0/1，SQLite 不认 bool）"""
+        """转换为落库字典（bool 转 0/1；dimensions 序列化为规范 JSON）"""
         row: Dict[str, Any] = {}
+        dimensions = self._storage_dimensions()
         for column in COLUMNS:
-            value = getattr(self, column, None)
+            if column == "dimensions":
+                value = json.dumps(
+                    dimensions, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            else:
+                value = getattr(self, column, None)
             if isinstance(value, bool):
                 value = 1 if value else 0
             row[column] = value
         return row
+
+    def _storage_dimensions(self) -> Dict[str, str]:
+        """落库前再合并一次标准字段，避免调用方后改字段导致不一致"""
+        dimensions = dict(self.dimensions)
+        for key, value in (
+            (DIM_PLATFORM, self.platform),
+            (DIM_MODEL, self.model_name),
+            (DIM_MODEL_ID, self.model_id),
+            (DIM_SELECTOR, self.selector),
+        ):
+            if value and not dimensions.get(key):
+                dimensions[key] = str(value)
+        return _normalize_dimensions(dimensions)
 
     # ---------- 错误字段提取（鸭子类型，不依赖 error_classifier） ----------
 
@@ -243,3 +301,37 @@ def _int_or_none(value: Any) -> Optional[int]:
     if isinstance(value, (int, float)):
         return int(value)
     return None
+
+
+# 单个维度值的最大长度：防止异常请求把维度基数与存储撑爆
+MAX_DIMENSION_VALUE = 200
+
+
+def _normalize_dimensions(values: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """维度统一成 `字符串键 -> 截断后的字符串值`，空值保留为空串"""
+    if not isinstance(values, dict):
+        return {}
+    normalized: Dict[str, str] = {}
+    for key, value in values.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        text = _dimension_text(value)
+        normalized[name] = text[:MAX_DIMENSION_VALUE]
+    return normalized
+
+
+def _dimension_text(value: Any) -> str:
+    """维度值转字符串：标量直出，列表/对象存紧凑 JSON，None 记空串"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)

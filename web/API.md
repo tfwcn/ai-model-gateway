@@ -23,6 +23,8 @@
 | `/admin/usage/daily` | POST | 全量日用量（日期 × 用户，永久保留） |
 | `/admin/usage/timeseries` | POST | 按小时/天分桶的曲线 |
 | `/admin/usage/models` | POST | 模型横向对比榜 |
+| `/admin/usage/dimensions` | POST | 永久维度日汇总（按任意维度组合） |
+| `/admin/usage/dimension-keys` | POST | 维度候选（配置 + 历史） |
 | `/admin/audit` | POST | 审计明细下钻 |
 | `/admin/audit/prune` | POST | 删除指定时间之前的审计记录（body: `{"before": "..."}`） |
 | `/admin/audit/chain/{gateway_request_id}` | POST | 一次请求的完整故障转移链 |
@@ -56,6 +58,8 @@
   用户级密钥只以 SHA-256 摘要存放在独立的 `data/api_keys.db`（`API_KEYS_DB_PATH`），审计库里没有密钥。
 - **两套保留策略**：`audit_attempts` 明细默认保留 30 天（`AUDIT_RETENTION_DAYS`），用于下钻与排障；
   `usage_daily` 日汇总只累加、不清理，用于永久保留输入/输出/缓存 tokens 等用量。
+- **维度日汇总**：`usage_dimension_daily` 按 `(day, endpoint, api_user, dimensions)` 累加，
+  同样只增不删；`dimensions` 是完整维度组合的规范 JSON，查询时可按任意子集分组。
 
 ---
 
@@ -134,6 +138,45 @@
 查询参数：`sort`、`since`、`until`、`limit`（1~500）、`user`。返回 `{ "sort": "...", "range": {...}, "items": [...] }`，
 `items` 的字段与 `summary.items` 相同。
 
+## POST /admin/usage/dimensions
+
+永久维度日汇总。查询参数：`group_by`（逗号分隔，支持 `day` / `user` / `endpoint` 与任意维度名，
+例如 `model`、`model,size`、`day,user,model,size`）、`since`、`until`、`user`、`endpoint`、`limit`（1~1000）。
+
+```json
+{
+  "group_by": ["model", "size"],
+  "range": { "since": "2026-01-01T00:00:00+00:00", "until": "2026-01-02T00:00:00+00:00" },
+  "count": 2,
+  "items": [
+    {
+      "bucket": "model-a | 1024x1024",
+      "values": { "model": "model-a", "size": "1024x1024" },
+      "requests": 12, "attempts": 12, "success": 12, "failure": 0, "aborted": 0, "retries": 0,
+      "success_rate": 1.0
+    }
+  ]
+}
+```
+
+数据来自 `usage_dimension_daily`，只累加、不清理；明细保留期清理后历史仍可查。
+
+## POST /admin/usage/dimension-keys
+
+维度候选：已配置的透传路由 + 历史表里出现过的维度名。
+
+```json
+{
+  "routes": [
+    { "route": "example-service", "prefix": "/proxy/example-service",
+      "endpoint": "passthrough:example-service", "enabled": true,
+      "dimensions": ["model", "size"] }
+  ],
+  "stored": ["model", "size", "platform", "selector"],
+  "keys": ["model", "platform", "selector", "size"]
+}
+```
+
 ## POST /admin/audit
 
 查询参数：`since`、`until`、`platform`、`model`、`outcome`、`endpoint`、`user`、`gateway_request_id`、
@@ -155,11 +198,16 @@
       "duration_ms": 1000.0, "probe_ms": 30.0, "ttft_ms": 120.0,
       "has_usage": 0, "upstream_id": null, "throughput": null,
       "input_tokens": null, "cached_tokens": null, "output_tokens": null, "output_chars": null,
-      "tool_call_converted": 0, "keepalive_count": 0, "msg_count": 1, "done_sent": 0
+      "tool_call_converted": 0, "keepalive_count": 0, "msg_count": 1, "done_sent": 0,
+      "dimensions": "{\"platform\":\"example-platform\",\"model\":\"example-platform|model-a\",\"model_id\":\"model-a\",\"selector\":\"all\"}",
+      "platform": "example-platform", "model_name": "example-platform|model-a", "model_id": "model-a", "selector": "all"
     }
   ]
 }
 ```
+
+`dimensions` 是唯一的写入源；`platform` / `model_name` / `model_id` / `selector` 是 SQLite 生成列，
+由 `dimensions` 自动派生，保持旧字段可读。
 
 `items` 是数据库原始行（布尔列以 `0/1` 出现），列顺序与落库列一致。
 老库缺 `done_sent` / `api_user` 时启动会自动补列：`done_sent` 会给历史上记成 `success` 的流式行回填成 `1`，
@@ -195,7 +243,7 @@
     "last_flush_at": "2026-01-01T10:00:05.000+00:00",
     "batch_size": 200, "flush_interval": 5.0, "queue_size": 10000, "utc_now": "..."
   },
-  "store": { "rows": 128, "oldest": "...", "newest": "...", "db_path": "data/audit.db", "db_bytes": 65536 }
+  "store": { "rows": 128, "dimension_rows": 24, "oldest": "...", "newest": "...", "db_path": "data/audit.db", "db_bytes": 65536 }
 }
 ```
 
@@ -246,6 +294,19 @@
   "bytes": 920,
   "modified_at": "2026-01-01T10:00:00+00:00",
   "audit": { "enabled": true, "retention_days": 30 },
+  "passthrough": [
+    {
+      "name": "example-service", "enabled": true, "prefix": "/proxy/example-service",
+      "upstream": "https://api.example.com/v1",
+      "apiKey": { "kind": "env_placeholder", "env": "EXAMPLE_PLATFORM_API_KEY",
+        "convention_env": "PASSTHROUGH_IMAGE_GENERATION_API_KEY", "env_set": true, "preview": "" },
+      "auth_header": "Authorization", "auth_prefix": "Bearer ",
+      "timeout": 300, "connect_timeout": 10, "body_limit": 16777216,
+      "forward_headers": ["x-request-id"],
+      "extra_headers": { "X-API-Version": "2026-01-01" },
+      "dimensions": { "model": "body.model", "size": "body.size" }
+    }
+  ],
   "aliases": [ { "name": "alias-a", "selectors": ["example-platform|model-a"] } ],
   "platforms": [
     {
@@ -268,7 +329,8 @@
     "platform_fields": ["apiKey", "baseUrl", "blacklist", "connect_timeout", "enable_tool_call_conversion", "enabled", "first_chunk_timeout", "quota_period", "retry_count", "stream_probe_timeout", "timeout", "weight"],
     "model_fields": ["connect_timeout", "enable_tool_call_conversion", "enabled", "first_chunk_timeout", "quota_period", "retry_count", "stream_probe_timeout", "timeout", "weight"],
     "audit_fields": ["batch_size", "db_path", "enabled", "flush_interval", "include_request_meta", "metrics_label_model", "prometheus_enabled", "queue_size", "record_failed_only", "retention_days"],
-    "ops": ["set_platform_field", "unset_platform_field", "add_platform", "remove_platform", "add_model", "remove_model", "set_model_field", "unset_model_field", "set_alias_selectors", "set_audit_field"]
+    "passthrough_fields": ["apiKey", "auth_header", "auth_prefix", "body_limit", "connect_timeout", "dimensions", "enabled", "extra_headers", "forward_headers", "prefix", "timeout", "upstream"],
+    "ops": ["set_platform_field", "unset_platform_field", "add_platform", "remove_platform", "add_model", "remove_model", "set_model_field", "unset_model_field", "set_alias_selectors", "set_audit_field", "add_passthrough", "remove_passthrough", "set_passthrough_field", "unset_passthrough_field"]
   },
   "errors": [], "warnings": []
 }
@@ -282,7 +344,7 @@
 
 ## POST /admin/config/schema
 
-`{ "ops": [...], "platform_fields": {字段: 类型}, "model_fields": {...}, "audit_fields": {...}, "limits": {字段: {"min": 1, "max": 3600}}, "enums": {字段: {"values": [...], "allow_none": true}}, "docs": {...}, "sections": [...] }`。
+`{ "ops": [...], "platform_fields": {字段: 类型}, "model_fields": {...}, "audit_fields": {...}, "passthrough_fields": {...}, "limits": {字段: {"min": 1, "max": 3600}}, "enums": {字段: {"values": [...], "allow_none": true}}, "docs": {...}, "sections": [...] }`。
 前端据此决定控件形状（下拉 / 带边界的 number 输入框 / 标签勾选 / 手填输入框）、取值范围提示，以及每个字段的说明（这一页本身就是文档）。
 
 `docs` 按作用域给出，覆盖对应白名单里的**每一个**字段：
@@ -302,7 +364,8 @@
       }
     },
     "model": { "...": "与 platform 共用语义（写在模型条目里覆盖平台级取值）" },
-    "audit": { "enabled": { "label": "审计总开关", "effect": "重启" } }
+    "audit": { "enabled": { "label": "审计总开关", "effect": "重启" } },
+    "passthrough": { "dimensions": { "label": "汇总维度", "effect": "热重载" } }
   }
 }
 ```
@@ -400,11 +463,16 @@
 | `unset_model_field` | `platform`, `model`, `field` | 回落到平台取值 |
 | `set_alias_selectors` | `alias`, `selectors` | 整列表覆盖；别名不存在时会把它建出来。指向不存在的平台只报 warning（爬虫平台的模型是运行时灌入的，所以不校验模型段） |
 | `set_audit_field` | `field`, `value` | 写顶层 `audit:` 段 |
+| `add_passthrough` | `name`, `config` | 新增透传路由 |
+| `remove_passthrough` | `name` | 删除透传路由 |
+| `set_passthrough_field` | `name`, `field`, `value` | 改透传字段（`dimensions` / `extra_headers` 用对象值） |
+| `unset_passthrough_field` | `name`, `field` | 删除透传字段，回落到默认值 |
 
-管理台覆盖全部 10 个操作：`set_platform_field` / `unset_platform_field`（「删除该字段（回落）」按钮）、
+管理台覆盖全部 14 个操作：`set_platform_field` / `unset_platform_field`（「删除该字段（回落）」按钮）、
 `add_model`（「新增模型条目」：只有模型名要打字，覆盖用字段下拉逐项「加一项覆盖」）、
 `remove_model`、`set_model_field` / `unset_model_field`、`set_alias_selectors`、`set_audit_field`、
-`add_platform`、`remove_platform`。CLI 与界面走的是同一套补丁操作，效果等价。
+`add_platform`、`remove_platform`、`add_passthrough` / `remove_passthrough`、
+`set_passthrough_field` / `unset_passthrough_field`。CLI 与界面走的是同一套补丁操作，效果等价。
 
 注释保留代价（`warnings` 会逐条列出）：只改取值不动注释；条目写法变化（字符串 ↔ 对象）会摘掉该条目附带的注释；
 删除条目会摘掉它的注释并修正其余条目的注释下标；整列表覆盖（别名）会丢掉附着在这些行上的注释。

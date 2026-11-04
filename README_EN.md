@@ -58,6 +58,7 @@ Are you facing these issues?
 | **Error Classification**       | 7 error types (timeout/connection/auth/rate-limit/server/format/model)           |
 | **SKIP_PLUGIN_SCRAPER**        | Skip plugin scraper and use cached models, ideal for offline environments        |
 | **Usage & Performance Audit**  | One row per upstream attempt: success rate, P95, TTFT, tokens/s, failover chain  |
+| **Generic Passthrough**        | `/proxy/<route>/**` forwards any HTTP API as-is; user keys and audit are reused   |
 | **Admin UI & CLI**             | `/admin/ui/` web page and `manage.py` both read audits and edit model config     |
 | **Docker One-click Deploy**    | Built-in Redis, Playwright, ready-to-run containerized deployment                |
 
@@ -103,11 +104,12 @@ Run directly (default port 8000):
 python run.py
 ```
 
-Or use the startup script (auto-manages Redis and virtual env, default port 8100):
+Or use the startup script (loads `.env`, auto-manages Redis and virtual env):
 
 ```bash
-bash start.sh               # default port 8100
-bash start.sh --port 8000   # specify port
+bash start.sh               # loads .env; default port 8000 when PORT is unset
+bash start.sh --port 8000   # CLI args override .env
+ENV_FILE=/etc/gateway.env bash start.sh  # use a custom env file
 ```
 
 You can also set the port via environment variable:
@@ -156,6 +158,7 @@ curl http://localhost:8000/v1/responses \
 | `/metrics`             | POST/GET | Prometheus metrics (admin key; GET for scraping)    |
 | `/admin/usage/*`       | POST   | Usage & performance aggregates (admin key required)   |
 | `/admin/audit*`        | POST   | Audit details and failover chains (admin key required)|
+| `/proxy/<route>/**`    | ANY    | Generic HTTP passthrough (gateway key required)       |
 | `/admin/config/*`      | POST   | Config read, dry-run plan, apply, rollback            |
 | `/admin/users*`        | POST   | Create/list/delete user keys (admin key required)     |
 | `/admin/ui/`           | GET    | Admin UI shell (no key needed; its data calls do)     |
@@ -353,6 +356,7 @@ See [🧾 Audit & Usage Stats](docs/AUDIT.md), [🖥️ Admin UI](docs/ADMIN_UI.
 - [🚨 Security](docs/SECURITY.md)
 - [📋 Roadmap](docs/ROADMAP.md)
 - [🧾 Audit & Usage Stats](docs/AUDIT.md)
+- [🔀 Passthrough & Dimension Usage](docs/PASSTHROUGH.md)
 - [🖥️ Admin UI](docs/ADMIN_UI.md)
 - [⌨️ CLI Tool](docs/CONFIG_CLI.md)
 - [📡 Admin API Contract](web/API.md)

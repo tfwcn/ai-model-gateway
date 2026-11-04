@@ -16,6 +16,7 @@
 
 - [记录粒度](#记录粒度)
 - [全量日用量](#全量日用量)
+- [维度日汇总](#维度日汇总)
 - [结局与统计口径](#结局与统计口径)
 - [记录哪些字段](#记录哪些字段)
 - [配置项](#配置项)
@@ -55,6 +56,25 @@ usage_daily(day, api_user) = 每天的请求数、尝试数、成功/失败/中�
 - `aggregated` 标记保证每条明细只汇总一次；
 - `config_write` 的配置变更审计不计入用量。
 
+## 维度日汇总
+
+同一个事务里还会把明细累加进 `usage_dimension_daily`：
+
+```text
+usage_dimension_daily(day, endpoint, api_user, dimensions)
+  = requests / attempts / success / failure / aborted / retries
+```
+
+- `dimensions` 是完整维度组合的规范 JSON，例如
+  `{"platform":"passthrough","model":"model-a","size":"1024x1024"}`；
+- 按任意子集分组时对 `requests` 求和即可；每个透传请求只有一条 attempt，不会重复计数；
+- 只累加、不删除，明细清理后历史仍在；
+- `usage_daily` 仍然是“每个用户准确请求总数”的口径：聊天请求可能故障转移产生多条不同模型的 attempt，
+  直接对维度表求和会重复计算请求数。
+
+聊天链路与透传链路共用同一套维度：标准键是 `platform` / `model` / `model_id` / `selector`，
+透传还可以带 `size`、`quality` 等任意键。查询方式见 [PASSTHROUGH.md](PASSTHROUGH.md)。
+
 ## 结局与统计口径
 
 | `outcome` | `finalized` | 含义 |
@@ -72,6 +92,9 @@ usage_daily(day, api_user) = 每天的请求数、尝试数、成功/失败/中�
   然后正常收尾并释放上游连接，不再死等上游结束响应体。
 - 老库升级按 `PRAGMA user_version` 幂等执行：`done_sent` 用 `ALTER TABLE` 追加，并把历史上记成 `success` 的流式行回填成「已发完」
   （旧实现只有把流读到底才记 success）；已经记成 `aborted` 的行保持原样，**旧结局一条都不重算**。
+- 版本 5 起标准字段收拢到 `dimensions`：老库会重建 `audit_attempts`，把
+  `platform/model_name/model_id/selector` 写进 `dimensions`，再生成虚拟列保持原有查询字段可读；
+  新建的 `usage_dimension_daily` 会用已收尾明细回填一次。
 
 **成功率只统计 `finalized=1` 的行**：
 
@@ -91,8 +114,9 @@ failover_count = 同一请求里 attempt_seq > 1 的尝试数
 | 分组 | 字段 |
 | --- | --- |
 | 身份 | `attempt_key`、`gateway_request_id`、`api_user`（用户标签）、`request_id`、`upstream_id` |
-| 入口 | `endpoint`（`chat_completions` / `responses` / `config_write`）、`stream`、`selector` |
-| 目标 | `platform`、`model_name`、`model_id`、`attempt_seq`、`retry_seq`、`disabled_model` |
+| 入口 | `endpoint`（`chat_completions` / `responses` / `config_write` / `passthrough:<路由名>`）、`stream` |
+| 维度 | `dimensions`（JSON，唯一写入源）；标准键 `platform` / `model` / `model_id` / `selector` 由生成列派生 |
+| 目标 | `attempt_seq`、`retry_seq`、`disabled_model` |
 | 时间 | `ts`（UTC 毫秒 ISO，分桶依据） |
 | 结局 | `outcome`、`finalized`、`http_status`、`error_category`、`error_code`、`done_sent`（[DONE] 是否已转发） |
 | 性能 | `duration_ms`、`probe_ms`、`ttft_ms`、`throughput`（tokens/s） |
@@ -100,6 +124,7 @@ failover_count = 同一请求里 attempt_seq > 1 的尝试数
 | 其它 | `tool_call_converted`、`keepalive_count`（补发的心跳条数）、`msg_count`、`aggregated`（是否已进入日汇总） |
 
 **只记录消息条数，绝不记录消息内容、密钥或请求体。**
+`dimensions` 只保存配置声明的业务参数，单值截断 200 字符。
 
 `api_user` 来自用户级密钥：管理密钥、未启用鉴权与历史行都记 `admin`，用户密钥记创建时填写的标签。
 用户密钥本身只以 SHA-256 摘要存放在 `data/api_keys.db`（可由 `API_KEYS_DB_PATH` 调整），与审计库分开。
@@ -169,6 +194,12 @@ python manage.py usage models --sort tokens
 # 按天看趋势
 python manage.py usage timeseries --bucket day --since 30d
 
+# 透传维度：按模型 × 分辨率看永久调用量
+python manage.py usage dimensions --group-by model,size --since 30d
+
+# 审计明细范围内按维度聚合
+python manage.py usage summary --group-by dim:model,size --since 7d
+
 # 明细下钻，只看失败
 python manage.py usage attempts --outcome failure --limit 20
 
@@ -197,6 +228,9 @@ curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
 
 curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit/chain/1a2b3c4d"
+
+curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/admin/usage/dimensions?group_by=model,size&since=30d"
 
 curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   "http://localhost:8000/admin/audit/stats"
@@ -236,6 +270,7 @@ AUDIT_DB_PATH=/tmp/audit-copy.db python manage.py usage summary --group-by day -
 
 ## 相关文档
 
+- [透传接口与维度用量](PASSTHROUGH.md)
 - [管理台前端](ADMIN_UI.md)
 - [命令行管理工具](CONFIG_CLI.md)
 - [监控与运维](MONITORING.md)

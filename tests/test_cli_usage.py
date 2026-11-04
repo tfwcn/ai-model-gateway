@@ -355,3 +355,33 @@ class TestJson:
 
         assert code == 0  # stats 本身不失败，只是把原因放进结果里
         assert "审计库不存在" in json.loads(out)["store"]["error"]
+
+    @pytest.mark.unit
+    def test_维度汇总命令行输出组合(self, capsys, config_file, tmp_path, monkeypatch):
+        path = str(tmp_path / "dimensions.db")
+        store = SqliteAuditStore(path)
+        store.init_schema()
+        attempt = AuditAttempt(
+            attempt_key="r1-1",
+            gateway_request_id="r1",
+            endpoint="passthrough:example-service",
+            stream=False,
+            dimensions={
+                "platform": "passthrough", "model": "model-a", "model_id": "model-a",
+                "selector": "example-service", "size": "1024x1024",
+            },
+            ts="2026-01-01T10:00:00.000+00:00",
+        )
+        attempt.mark_success()
+        store.insert_many([attempt.to_row()])
+        store.aggregate_usage()
+        store.close()
+        monkeypatch.setenv("AUDIT_DB_PATH", path)
+
+        code, out, _ = run_cli(capsys, "--config", config_file, "usage", "dimensions",
+                               "--group-by", "model,size", "--json")
+
+        assert code == 0
+        payload = json.loads(out)
+        assert payload["group_by"] == ["model", "size"]
+        assert payload["items"][0]["values"] == {"model": "model-a", "size": "1024x1024"}

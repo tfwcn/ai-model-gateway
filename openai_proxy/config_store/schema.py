@@ -22,7 +22,7 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _MODEL_NAME_RE = re.compile(r"^[^\s|]+$")
 
 # 顶层保留键：不是平台
-RESERVED_TOP_KEYS = ("all_aliases", "audit")
+RESERVED_TOP_KEYS = ("all_aliases", "audit", "passthrough")
 
 # 字段名 → 取值类型（平台级与模型级共用同一套类型定义）
 _FIELD_KINDS: Dict[str, str] = {
@@ -64,6 +64,22 @@ AUDIT_FIELDS: Dict[str, str] = {
     "metrics_label_model": "bool",
 }
 
+# passthrough 段可编辑字段 → 字段类型
+PASSTHROUGH_FIELDS: Dict[str, str] = {
+    "enabled": "bool",
+    "prefix": "str",
+    "upstream": "url",
+    "apiKey": "secret",
+    "auth_header": "str",
+    "auth_prefix": "optional_str",
+    "timeout": "seconds",
+    "connect_timeout": "optional_seconds",
+    "body_limit": "int",
+    "forward_headers": "list_str",
+    "extra_headers": "map_str",
+    "dimensions": "map_str",
+}
+
 # 数值字段的边界：越界一律拒绝，避免把转发调到不可用的状态
 _LIMITS: Dict[str, Tuple[float, float]] = {
     "timeout": (1, 3600),
@@ -77,6 +93,7 @@ _LIMITS: Dict[str, Tuple[float, float]] = {
     "retention_days": (1, 3650),
     "queue_size": (100, 1_000_000),
     "batch_size": (1, 10_000),
+    "body_limit": (1, 268_435_456),
 }
 
 # 为什么这个字段的边界是这样：越界报错时一并说出来，免得用户试半天
@@ -136,6 +153,8 @@ def check_value(kind: str, field: str, value: Any, path: str) -> List[Issue]:
         return _check_list_str(value, path, field)
     if kind == "model_list":
         return _check_model_list(value, path)
+    if kind == "map_str":
+        return _check_map_str(value, path, field)
     if kind == "plugin":
         return _check_plugin(value, path)
     return [_error(path, f"{field} 字段类型不受支持")]
@@ -256,6 +275,103 @@ def check_audit(section: Any, path: str = "audit") -> List[Issue]:
     return issues
 
 
+# 透传维度名与表达式：与 openai_proxy.passthrough.config 的规则保持一致
+_PASSTHROUGH_DIMENSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_PASSTHROUGH_EXPRESSION_RE = re.compile(r"^(body|query|header|path)\..+$")
+_PASSTHROUGH_RESERVED_DIMENSIONS = {
+    "attempt_key", "gateway_request_id", "api_user", "request_id", "endpoint",
+    "stream", "attempt_seq", "retry_seq", "ts", "outcome", "finalized",
+    "http_status", "error_category", "error_code", "disabled_model",
+    "duration_ms", "probe_ms", "ttft_ms", "has_usage", "upstream_id",
+    "input_tokens", "cached_tokens", "output_tokens", "output_chars",
+    "throughput", "tool_call_converted", "keepalive_count", "msg_count",
+    "done_sent", "aggregated",
+}
+
+
+def check_passthrough(section: Any, path: str = "passthrough") -> List[Issue]:
+    """校验顶层 passthrough: 段"""
+    if not isinstance(section, dict):
+        return [_error(path, "passthrough 必须是对象")]
+
+    issues: List[Issue] = []
+    prefixes: Dict[str, str] = {}
+    for name, config in section.items():
+        route_path = f"{path}.{name}"
+        if not valid_name(str(name)):
+            issues.append(_error(route_path, f"透传路由名不合法: {name}"))
+            continue
+        if not isinstance(config, dict):
+            issues.append(_error(route_path, "透传路由配置必须是对象"))
+            continue
+        issues.extend(_check_passthrough_route(str(name), config, route_path))
+
+        prefix = str(config.get("prefix") or f"/proxy/{name}").rstrip("/")
+        if prefix in prefixes:
+            issues.append(_error(f"{route_path}.prefix", f"前缀与 {prefixes[prefix]} 重复: {prefix}"))
+        else:
+            prefixes[prefix] = str(name)
+    return issues
+
+
+def _check_passthrough_route(name: str, config: Dict[str, Any], path: str) -> List[Issue]:
+    """校验单条透传路由"""
+    issues: List[Issue] = []
+    for key, value in config.items():
+        if key not in PASSTHROUGH_FIELDS:
+            issues.append(_warning(f"{path}.{key}", f"未知的透传字段: {key}"))
+            continue
+        issues.extend(check_value(PASSTHROUGH_FIELDS[key], key, value, f"{path}.{key}"))
+
+    upstream = config.get("upstream")
+    if not isinstance(upstream, str) or not upstream.strip():
+        issues.append(_error(f"{path}.upstream", "缺少 upstream，透传路由不会生效"))
+
+    prefix = config.get("prefix")
+    if prefix is not None:
+        if not isinstance(prefix, str) or not prefix.startswith("/proxy/"):
+            issues.append(_error(f"{path}.prefix", "prefix 必须以 /proxy/ 开头"))
+
+    if not config.get("apiKey"):
+        issues.append(_warning(f"{path}.apiKey", "没有配置 apiKey：上游请求不会带网关配置的鉴权"))
+
+    forbidden_headers = {"authorization", "cookie", "host", "content-length", "connection",
+                         "transfer-encoding", "accept-encoding", "proxy-authorization"}
+    for index, header in enumerate(config.get("forward_headers") or []):
+        if isinstance(header, str) and header.strip().lower() in forbidden_headers:
+            issues.append(_error(
+                f"{path}.forward_headers[{index}]",
+                f"请求头 {header} 永远不允许透传到上游（属于网关凭据或由 aiohttp 重新生成）",
+            ))
+
+    for header in (config.get("extra_headers") or {}):
+        if isinstance(header, str) and header.strip().lower() in forbidden_headers:
+            issues.append(_error(
+                f"{path}.extra_headers.{header}",
+                f"请求头 {header} 不能由透传配置固定写入（由运行时重新生成）",
+            ))
+
+    dimensions = config.get("dimensions")
+    if dimensions is not None:
+        if not isinstance(dimensions, dict):
+            issues.append(_error(f"{path}.dimensions", "dimensions 必须是对象"))
+        else:
+            if len(dimensions) > 32:
+                issues.append(_error(f"{path}.dimensions", "dimensions 最多 32 个"))
+            for dimension, expression in dimensions.items():
+                key = str(dimension)
+                if not _PASSTHROUGH_DIMENSION_RE.match(key):
+                    issues.append(_error(f"{path}.dimensions.{key}", f"维度名不合法: {key}"))
+                elif key in _PASSTHROUGH_RESERVED_DIMENSIONS:
+                    issues.append(_error(f"{path}.dimensions.{key}", f"维度名 {key} 与审计核心字段重名"))
+                if not isinstance(expression, str) or not _PASSTHROUGH_EXPRESSION_RE.match(expression.strip()):
+                    issues.append(_error(
+                        f"{path}.dimensions.{key}",
+                        "维度表达式必须是 body./query./header./path. 开头",
+                    ))
+    return issues
+
+
 def check_document(config: Any) -> List[Issue]:
     """整份配置文件的校验：顶层保留段 + 每个平台"""
     if not isinstance(config, dict):
@@ -279,6 +395,10 @@ def check_document(config: Any) -> List[Issue]:
     audit = config.get("audit")
     if audit is not None:
         issues.extend(check_audit(audit))
+
+    passthrough = config.get("passthrough")
+    if passthrough is not None:
+        issues.extend(check_passthrough(passthrough))
 
     for platform_name, platform_config in config.items():
         if platform_name in RESERVED_TOP_KEYS:
@@ -380,6 +500,19 @@ def _check_list_str(value: Any, path: str, field: str) -> List[Issue]:
         for index, item in enumerate(value)
         if not isinstance(item, str) or not item.strip()
     ]
+
+
+def _check_map_str(value: Any, path: str, field: str) -> List[Issue]:
+    """键值对字段：键和值都必须是字符串（维度表达式由 check_passthrough 单独校验）"""
+    if not isinstance(value, dict):
+        return [_error(path, f"{field} 必须是对象")]
+    issues: List[Issue] = []
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            issues.append(_error(f"{path}", "键必须是非空字符串"))
+        if not isinstance(item, str):
+            issues.append(_error(f"{path}.{key}", "取值必须是字符串"))
+    return issues
 
 
 def _check_model_list(value: Any, path: str) -> List[Issue]:

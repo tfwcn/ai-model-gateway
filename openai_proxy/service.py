@@ -28,6 +28,7 @@ from openai_proxy.auth import ADMIN_NAME, UserKeyManager
 from openai_proxy.auth.routes import build_user_router
 from openai_proxy.config_store.routes import build_config_router
 from openai_proxy.config_store.service import ConfigCommandService
+from openai_proxy.passthrough import PassthroughManager
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,8 @@ class OpenAIProxyService:
 
         # 审计与用量统计：库与后台刷盘任务在 initialize() 里打开
         self.audit = AuditManager(metrics=load_metrics_collector())
+        # 透传路由：配置在 initialize()/reload 时灌入，请求热路径只读当前元组
+        self.passthrough = PassthroughManager(self.audit)
         # 用户级密钥：库在 initialize() 里打开，create_app() 时绑定到中间件与路由
         self.user_keys: Optional[UserKeyManager] = None
         # 插件结构快照：reload 时据此判断「进程内无法生效，需要重启」
@@ -272,6 +275,8 @@ class OpenAIProxyService:
 
         # 第六步：打开审计（配置来自 models.yaml 顶层 audit: 段）
         self.audit.apply_yaml(self.config_loader.audit_config)
+        # 第七步：加载透传路由（配置来自顶层 passthrough: 段）
+        self.passthrough.configure(self.config_loader.passthrough_config)
         await self.audit.start()
 
     async def _start_plugin_schedulers_for_platforms(self, platforms: Dict[str, Any]):
@@ -347,6 +352,8 @@ class OpenAIProxyService:
         # 关闭用户级密钥库
         if self.user_keys is not None:
             await self.user_keys.close()
+        # 关闭透传共享会话
+        await self.passthrough.close()
         # 排空审计缓冲并关闭库
         await self.audit.close()
 
@@ -373,6 +380,8 @@ class OpenAIProxyService:
             # 复用同一个故障转移管理器（保住 aiohttp 会话），只替换模型表
             self.failover_manager.models = self.models
             self.failover_manager.all_aliases = self.config_loader.all_aliases
+            # 透传路由整体替换；进行中的请求各自持有旧配置
+            self.passthrough.configure(self.config_loader.passthrough_config)
 
             await self.model_list_cache.clear()
 
@@ -490,7 +499,7 @@ class OpenAIProxyService:
             return await call_next(request)
 
         # 审计与用量接口
-        app.include_router(build_audit_router(lambda: self.audit))
+        app.include_router(build_audit_router(lambda: self.audit, lambda: self.passthrough.describe()))
 
         # 用户级密钥管理（新增/删除；只接受管理密钥）
         app.include_router(build_user_router(lambda: self.user_keys))
@@ -778,5 +787,17 @@ class OpenAIProxyService:
         async def health_check():
             """健康检查端点"""
             return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+        # 透传兜底路由：只接管 /proxy/ 命名空间，内置路由先匹配
+        @app.api_route(
+            "/proxy/{full_path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        )
+        async def passthrough_dispatch(request: Request, full_path: str):
+            """未命中内置路由时尝试透传；没有配置对应前缀则 404"""
+            response = await self.passthrough.handle(request)
+            if response is None:
+                raise HTTPException(status_code=404, detail="Not Found")
+            return response
 
         return app

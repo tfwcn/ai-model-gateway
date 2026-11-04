@@ -12,6 +12,10 @@
     unset_model_field    删除模型级覆盖字段（回落到平台级取值）
     set_alias_selectors  覆盖别名指向的 selector 列表
     set_audit_field      改审计段字段
+    add_passthrough      新增透传路由
+    remove_passthrough   删除透传路由
+    set_passthrough_field 改透传字段
+    unset_passthrough_field 删除透传字段
 
 约束：
 - 只在内存副本上操作，写盘交给 ConfigWriter
@@ -39,6 +43,10 @@ OPS = (
     "unset_model_field",
     "set_alias_selectors",
     "set_audit_field",
+    "add_passthrough",
+    "remove_passthrough",
+    "set_passthrough_field",
+    "unset_passthrough_field",
 )
 
 # 不允许通过界面增删的结构字段（增删走各自的专用操作）
@@ -81,6 +89,11 @@ class PatchResult:
     @property
     def errors(self) -> List[Dict[str, str]]:
         return [issue.to_dict() for issue in self.issues if issue.level == "error"]
+
+    @property
+    def valid(self) -> bool:
+        """没有 error 才允许写盘"""
+        return not self.errors
 
     @property
     def warnings(self) -> List[Dict[str, str]]:
@@ -214,6 +227,10 @@ def _apply_one(document: ConfigDocument, op: Dict[str, Any], index: int) -> List
         "unset_model_field": _unset_model_field,
         "set_alias_selectors": _set_alias_selectors,
         "set_audit_field": _set_audit_field,
+        "add_passthrough": _add_passthrough,
+        "remove_passthrough": _remove_passthrough,
+        "set_passthrough_field": _set_passthrough_field,
+        "unset_passthrough_field": _unset_passthrough_field,
     }
     return handlers[name](document, op)
 
@@ -423,6 +440,74 @@ def _set_audit_field(document: ConfigDocument, op: Dict[str, Any]) -> List[Dict[
     return [_change(op, f"audit.{field}", before, value)]
 
 
+# ---------- passthrough 段 ----------
+
+
+def _add_passthrough(document: ConfigDocument, op: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """新增一条透传路由"""
+    name = _require(op, "name")
+    config = op.get("config")
+    if not isinstance(config, dict):
+        raise PatchError("新增透传路由必须提供 config 对象", path=f"passthrough.{name}")
+    if not schema.valid_name(name):
+        raise PatchError(f"透传路由名不合法: {name}", path=f"passthrough.{name}")
+    if document.passthrough_route(name) is not None:
+        raise PatchError(f"透传路由 {name} 已存在", path=f"passthrough.{name}")
+
+    _validate_passthrough_config(name, config)
+    section = _require_passthrough_section(document)
+    section[name] = normalize_value(config)
+    return [_change(op, f"passthrough.{name}", None, config)]
+
+
+def _remove_passthrough(document: ConfigDocument, op: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """删除一条透传路由"""
+    name = _require(op, "name")
+    config = document.passthrough_route(name)
+    if config is None:
+        raise PatchError(f"透传路由不存在: {name}", path=f"passthrough.{name}")
+
+    before = {key: value for key, value in config.items()} if isinstance(config, dict) else config
+    del document.passthrough[name]
+    return [_change(op, f"passthrough.{name}", before, None)]
+
+
+def _set_passthrough_field(document: ConfigDocument, op: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """修改透传路由的一个字段"""
+    name, field = _require(op, "name", "field")
+    route = _require_passthrough(document, name)
+    if field not in schema.PASSTHROUGH_FIELDS:
+        raise PatchError(
+            f"不支持的透传字段: {field}（可用: {', '.join(sorted(schema.PASSTHROUGH_FIELDS))}）",
+            path=f"passthrough.{name}.{field}",
+        )
+
+    value = op.get("value")
+    _validate_field(schema.PASSTHROUGH_FIELDS, field, value, f"passthrough.{name}.{field}")
+
+    before = route.get(field)
+    route[field] = normalize_value(value)
+    _validate_passthrough_config(name, route)
+    return [_change(op, f"passthrough.{name}.{field}", before, value)]
+
+
+def _unset_passthrough_field(document: ConfigDocument, op: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """删除透传路由的一个字段（回落到默认值）"""
+    name, field = _require(op, "name", "field")
+    route = _require_passthrough(document, name)
+    if field not in schema.PASSTHROUGH_FIELDS:
+        raise PatchError(
+            f"不支持的透传字段: {field}（可用: {', '.join(sorted(schema.PASSTHROUGH_FIELDS))}）",
+            path=f"passthrough.{name}.{field}",
+        )
+    if field not in route:
+        raise PatchError(f"透传路由 {name} 没有字段 {field}", path=f"passthrough.{name}.{field}")
+
+    before = route.get(field)
+    del route[field]
+    return [_change(op, f"passthrough.{name}.{field}", before, None)]
+
+
 # ---------- 校验与工具 ----------
 
 
@@ -559,6 +644,35 @@ def _new_audit(document: ConfigDocument) -> Any:
     audit = CommentedMap()
     document.raw["audit"] = audit
     return audit
+
+
+def _require_passthrough_section(document: ConfigDocument) -> Any:
+    """取顶层 passthrough 段，不存在时建一个块式映射"""
+    if not isinstance(document.raw, dict):
+        document.raw = CommentedMap()
+    section = document.raw.get("passthrough")
+    if section is None or not isinstance(section, dict):
+        section = CommentedMap()
+        document.raw["passthrough"] = section
+    return section
+
+
+def _require_passthrough(document: ConfigDocument, name: str) -> Any:
+    """取一条透传路由，不存在时给出明确错误"""
+    route = document.passthrough_route(name)
+    if route is None:
+        raise PatchError(f"透传路由不存在: {name}", path=f"passthrough.{name}")
+    if not isinstance(route, dict):
+        raise PatchError(f"透传路由 {name} 的配置不是对象", path=f"passthrough.{name}")
+    return route
+
+
+def _validate_passthrough_config(name: str, config: Dict[str, Any]) -> None:
+    """复用整份文档的校验规则，只报第一条错误"""
+    issues = schema.check_passthrough({name: config})
+    errors = [issue for issue in issues if issue.level == "error"]
+    if errors:
+        raise PatchError(errors[0].message, path=errors[0].path)
 
 
 def quoted(value: Any) -> Any:

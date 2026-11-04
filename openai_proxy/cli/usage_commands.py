@@ -146,6 +146,33 @@ class UsageCommands:
         ])
         return EXIT_OK
 
+    def usage_dimensions(self, args) -> int:
+        """永久维度日汇总：按任意维度组合看调用量"""
+        result = self._call(lambda queries: queries.dimension_usage(
+            args.group_by, args.since, args.until, args.user, args.endpoint, args.limit
+        ))
+        if result is None:
+            return EXIT_ERROR
+        if self.console.as_json:
+            self.console.emit(result)
+            return EXIT_OK
+
+        columns = [(name, name) for name in result["group_by"]]
+        self.console.line(f"维度汇总（按 {args.group_by}，共 {result['count']} 组）")
+        rows = [
+            {**item, **(item.get("values") or {})}
+            for item in result["items"]
+        ]
+        self.console.table(_display_rows(rows), columns + [
+            ("requests", "请求"),
+            ("attempts", "尝试"),
+            ("success", "成功"),
+            ("failure", "失败"),
+            ("aborted", "中断"),
+            ("success_rate", "成功率"),
+        ])
+        return EXIT_OK
+
     def usage_attempts(self, args) -> int:
         result = self._call(lambda queries: queries.list_attempts(
             args.since, args.until, args.platform, args.model, args.outcome, args.endpoint,

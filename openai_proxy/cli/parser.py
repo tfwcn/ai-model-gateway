@@ -88,7 +88,7 @@ def _add_config_group(parser: argparse.ArgumentParser) -> None:
     show.add_argument("platform")
 
     fields = _action(actions, "fields", "打印字段字典与结构说明（与管理台「模型配置」页同一份文档）", "config_fields")
-    fields.add_argument("--scope", choices=("platform", "model", "audit"), help="只看某一组字段")
+    fields.add_argument("--scope", choices=("platform", "model", "audit", "passthrough"), help="只看某一组字段")
 
     _action(actions, "validate", "校验当前配置文件", "config_validate")
     _action(actions, "backups", "列出可回滚的备份", "config_backups")
@@ -190,10 +190,15 @@ def _add_usage_group(groups) -> None:
     actions = parser.add_subparsers(dest="action", metavar="<动作>")
 
     summary = _action(actions, "summary", "按维度聚合用量与性能", "usage_summary")
-    summary.add_argument("--group-by", choices=GROUP_CHOICES, default="model")
+    summary.add_argument("--group-by", default="model", help="model / platform / user / endpoint / day / hour / dim:model,size")
     _add_filters(summary)
     summary.add_argument("--sort", choices=SORT_CHOICES, default="requests")
     summary.add_argument("--limit", type=int, default=20)
+
+    dimensions = _action(actions, "dimensions", "永久维度日汇总（按任意维度组合）", "usage_dimensions")
+    dimensions.add_argument("--group-by", default="model", help="逗号分隔：model / model,size / day,user,model,size")
+    _add_filters(dimensions)
+    dimensions.add_argument("--limit", type=int, default=200)
 
     ranking = _action(actions, "models", "模型对比榜：慢模型、不稳定模型、用量大户", "usage_models")
     ranking.add_argument("--sort", choices=SORT_CHOICES, default="requests")

@@ -7,11 +7,13 @@ from typing import Any, Dict, List
 
 SECTIONS: List[Dict[str, str]] = [
     {
-        "title": "models.yaml 里只有三类东西",
+        "title": "models.yaml 里只有四类东西",
         "body": "\n".join([
             "1. 平台段：顶层每个键就是一个平台（平台名允许数字开头），值里写 baseUrl、apiKey、models、超时与权重等。",
             "2. all_aliases：模型组昵称 → 它指向哪些模型。不是平台。",
             "3. audit：审计与用量统计的设置。不是平台。",
+            "4. passthrough：第三方接口透传。每个键是一条路由，对外前缀必须 /proxy/ 开头，"
+            "剩余路径与查询串原样转发到 upstream。维度写在 dimensions 里，键名就是汇总时的分组名。",
             "既没有 models 也没有 plugin 的平台会在启动时被跳过（预演会警告）。",
         ]),
     },
@@ -39,7 +41,7 @@ SECTIONS: List[Dict[str, str]] = [
     {
         "title": "改动什么时候真正生效",
         "body": "\n".join([
-            "热重载做的事：重读 models.yaml、重建平台与模型表、替换别名表、清空 /v1/models 缓存；"
+            "热重载做的事：重读 models.yaml、重建平台与模型表、替换别名表、替换透传路由表、清空 /v1/models 缓存；"
             "连接池、正在进行的流、模型被拉黑的内存状态都保留。",
             "必须重启才干净：新增/删除平台、任何 plugin 结构（插件实例按模块名复用，改 args 不会喂给已存在的实例）、"
             "以及 audit 段的每一个字段（audit 只在启动时应用一次）。",

@@ -18,11 +18,16 @@ def _all_docs() -> Dict[str, field_docs.FieldDoc]:
     merged: Dict[str, field_docs.FieldDoc] = dict(field_docs.FIELD_DOCS)
     for field, doc in field_docs.AUDIT_DOCS.items():
         merged[field if field not in merged else f"audit.{field}"] = doc
+    for field, doc in field_docs.PASSTHROUGH_DOCS.items():
+        merged[field if field not in merged else f"passthrough.{field}"] = doc
     return merged
 
 
 def _editable_fields() -> List[str]:
-    return sorted(set(schema.PLATFORM_FIELDS) | set(schema.MODEL_FIELDS) | set(schema.AUDIT_FIELDS))
+    return sorted(
+        set(schema.PLATFORM_FIELDS) | set(schema.MODEL_FIELDS)
+        | set(schema.AUDIT_FIELDS) | set(schema.PASSTHROUGH_FIELDS)
+    )
 
 
 class TestCoverage:
@@ -190,7 +195,7 @@ class Test取值选项:
     @pytest.mark.unit
     def test_标了可以不配置的字段真的接受空值(self):
         """界面上的「不配置」选项要么走删除操作，要么写 null：后端必须收得下"""
-        kinds = {**schema.PLATFORM_FIELDS, **schema.MODEL_FIELDS, **schema.AUDIT_FIELDS}
+        kinds = {**schema.PLATFORM_FIELDS, **schema.MODEL_FIELDS, **schema.AUDIT_FIELDS, **schema.PASSTHROUGH_FIELDS}
         for field, entry in field_docs.enum_fields().items():
             if not entry["allow_none"]:
                 continue
@@ -201,7 +206,11 @@ class Test取值选项:
     def test_说明里的取值选项对界面与命令行是同一份(self):
         """dict 出去的取值必须是 JSON 原生类型：tuple 与 list 会让两边对不上"""
         for field in field_docs.documented_fields():
-            entry = field_docs.doc_for(field, "audit" if field in field_docs.AUDIT_DOCS else "platform")
+            scope = "audit" if field in field_docs.AUDIT_DOCS else (
+                "passthrough" if field in field_docs.PASSTHROUGH_DOCS and field not in field_docs.FIELD_DOCS
+                else "platform"
+            )
+            entry = field_docs.doc_for(field, scope)
             assert isinstance(entry["values"], list), f"{field} 的取值选项不是 list，JSON 两边会不一致"
 
 

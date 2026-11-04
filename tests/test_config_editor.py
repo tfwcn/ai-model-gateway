@@ -95,7 +95,7 @@ class TestBasics:
 
     @pytest.mark.unit
     def test_十种操作都被支持(self):
-        assert len(OPS) == 10
+        assert len(OPS) == 14
 
     @pytest.mark.unit
     def test_源文档不会被补丁改动(self, document):

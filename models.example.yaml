@@ -5,6 +5,27 @@
 #     - "modelscope"
 #     - "openrouter"
 
+# 透传接口示例：把 /proxy/example-service/** 原样转发到上游
+# 客户端请求 /proxy/example-service/assets/render 会转发到
+# https://api.example.com/v1/assets/render
+# passthrough:
+#   example-service:
+#     enabled: true
+#     prefix: "/proxy/example-service"
+#     upstream: "https://api.example.com/v1"
+#     apiKey: "${EXAMPLE_PLATFORM_API_KEY}"
+#     timeout: 300
+#     connect_timeout: 10
+#     forward_headers:
+#       - "x-request-id"
+#     extra_headers:
+#       X-API-Version: "2026-01-01"
+#     # 键名就是汇总时的分组名；model 会覆盖默认的“路由名”
+#     dimensions:
+#       model: "body.model"
+#       size: "body.size"
+#       quality: "body.quality"
+
 # ModelScope 免费模型配置示例
 # 使用网页爬虫从 modelscope.cn 获取热门免费模型列表
 modelscope:

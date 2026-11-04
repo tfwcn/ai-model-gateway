@@ -60,6 +60,19 @@ export async function renderUsage(root, ctx) {
   const slowCanvas = el("canvas", { class: "chart" });
   const aggregateBox = el("div");
   const rankingBox = el("div");
+  const dimensionBox = el("div");
+
+  const dimGroup = textInput("model", "例如 model,size");
+  const dimEndpoint = textInput("", "例如 passthrough:example-service");
+  const dimUser = textInput("", "留空表示不限");
+  const dimButton = button("查询维度", "primary");
+  const dimensionFilter = panel("透传维度筛选", [
+    el("div", { class: "filters" }, [
+      control("维度组合", dimGroup),
+      control("入口", dimEndpoint),
+      control("用户标签", dimUser),
+    ]),
+  ], dimButton);
 
   const filterPanel = panel("筛选", [el("div", { class: "filters" }, filters.map((item) => control(item.label, item.node)))], loadButton);
 
@@ -69,10 +82,12 @@ export async function renderUsage(root, ctx) {
     panel("每日用量（全量，按天 / 用户，不随审计清理）", [dailyBox]),
     panel("趋势（请求数 / P95 耗时）", [chartCanvas]),
     panel("模型榜（按所选维度排序）", [slowCanvas, rankingBox]),
+    panel("透传维度汇总（永久日汇总）", [dimensionFilter, dimensionBox]),
     panel("聚合明细（审计明细范围内）", [aggregateBox]),
   );
 
   loadButton.addEventListener("click", () => load(readControls(filters)));
+  dimButton.addEventListener("click", () => loadDimensions());
 
   async function load(params) {
     Object.assign(state, params);
@@ -105,7 +120,27 @@ export async function renderUsage(root, ctx) {
     }
   }
 
+  async function loadDimensions() {
+    dimButton.disabled = true;
+    try {
+      const payload = await ctx.api.postQuery("/admin/usage/dimensions", {
+        group_by: dimGroup.value.trim() || "model",
+        since: state.since,
+        endpoint: dimEndpoint.value.trim(),
+        user: dimUser.value.trim(),
+        limit: 500,
+      });
+      renderDimensions(dimensionBox, payload);
+      ctx.notice(`维度汇总：${payload.count} 组（${payload.group_by.join(" × ")}）`, "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      dimButton.disabled = false;
+    }
+  }
+
   await load({ since: state.since, groupBy: state.groupBy, sort: state.sort, bucket: state.bucket });
+  await loadDimensions();
 }
 
 // ---------- 呈现 ----------
@@ -165,6 +200,27 @@ function renderDaily(box, daily) {
       { key: "success", label: "成功", num: true },
       { key: "failure", label: "失败", num: true },
     ], rows),
+  );
+}
+
+function renderDimensions(box, payload) {
+  const items = payload.items || [];
+  if (!items.length) {
+    box.replaceChildren(empty("这个范围内还没有维度汇总：产生透传调用后会自动累计，且不随审计明细清理"));
+    return;
+  }
+  const dims = payload.group_by || [];
+  box.replaceChildren(
+    el("p", { class: "muted", text: `按 ${dims.join(" × ")} 汇总；数值来自永久日汇总表` }),
+    table([
+      ...dims.map((name) => ({ key: name, label: name, render: (row) => (row.values || {})[name] })),
+      { key: "requests", label: "请求", num: true },
+      { key: "attempts", label: "尝试", num: true },
+      { key: "success", label: "成功", num: true },
+      { key: "failure", label: "失败", num: true },
+      { key: "aborted", label: "中断", num: true },
+      { key: "success_rate", label: "成功率", num: true, render: (row) => fmtRate(row.success_rate) },
+    ], items),
   );
 }
 

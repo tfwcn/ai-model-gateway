@@ -246,6 +246,12 @@ input.wide { min-width: 200px; flex: 1 1 200px; }
 /* 一次填一个的列表输入框（新增平台的模型条目）：和勾选式选项一样是「输入框一行 + 标签一行」 */
 .chips-input { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 
+/* 键值对编辑器（透传维度、附加请求头）：一行一对，窄屏自动换行 */
+.map-editor { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.map-rows { display: flex; flex-direction: column; gap: 4px; }
+.map-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.map-row input { flex: 1 1 160px; min-width: 120px; }
+
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 .card .value { font-size: 22px; font-weight: 700; }
