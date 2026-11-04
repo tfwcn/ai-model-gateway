@@ -10,7 +10,7 @@
  * 成功率只统计已收尾的尝试（finalized=1），未收尾的 stream_open 不算分母。
  */
 
-import { button, cards, control, el, empty, fmtMs, fmtNumber, fmtRate, panel, readControls, select, table, textInput, userLabel } from "./ui.js";
+import { button, cards, control, el, empty, fieldGroup, fmtMs, fmtNumber, fmtRate, panel, select, table, textInput, userLabel } from "./ui.js";
 import { barChart, lineChart } from "./charts.js";
 
 const SINCE_OPTIONS = [
@@ -41,19 +41,57 @@ const SORT_OPTIONS = [
   { value: "tokens", label: "输出 tokens" },
 ];
 
-export async function renderUsage(root, ctx) {
-  const state = { since: "", groupBy: "day", sort: "requests", bucket: "day" };
+// 常用维度组合：直接写成页面上的按钮，省得用户记不住键名和组合方式
+const DIMENSION_PRESETS = [
+  { value: "user,model", label: "用户 × 模型（user,model）" },
+  { value: "month,user,model", label: "月 × 用户 × 模型（month,user,model）" },
+  { value: "day,user,model", label: "日 × 用户 × 模型（day,user,model）" },
+  { value: "model", label: "模型（model）" },
+  { value: "user", label: "用户（user）" },
+  { value: "endpoint,model", label: "入口 × 模型（endpoint,model）" },
+];
 
-  const filters = [
-    { name: "since", label: "时间范围", node: select(SINCE_OPTIONS, state.since) },
-    { name: "groupBy", label: "聚合维度", node: select(GROUP_OPTIONS, state.groupBy) },
-    { name: "sort", label: "排序", node: select(SORT_OPTIONS, state.sort) },
-    { name: "bucket", label: "曲线粒度", node: select([{ value: "day", label: "按天" }, { value: "hour", label: "按小时" }], state.bucket) },
-    { name: "platform", label: "平台", node: textInput("", "留空表示不限") },
-    { name: "model", label: "模型名", node: textInput("", "留空表示不限") },
-    { name: "user", label: "用户标签", node: textInput("", "留空表示不限") },
-  ];
-  const loadButton = button("查询", "primary");
+// dimension-keys 只返回 JSON 维度；user/endpoint/day/month 是固定分组键，页面一起列出来
+const DIMENSION_GROUP_KEYS = ["user", "endpoint", "day", "month"];
+
+// 维度表的固定指标列：维度列由用户填写的组合决定，这里把固定列先说清楚
+const DIMENSION_METRIC_HINT =
+  "结果固定包含：请求、尝试、成功、失败、中断、输入 tokens、缓存 tokens、输出 tokens、成功率。";
+
+// 用量页内的分页签：默认看概览，其余表格与图表各占一页，避免一屏堆太多内容
+const USAGE_TABS = [
+  { key: "overview", label: "概览" },
+  { key: "daily", label: "每日用量" },
+  { key: "models", label: "模型榜" },
+  { key: "dimensions", label: "维度汇总" },
+  { key: "aggregate", label: "聚合明细" },
+];
+
+export async function renderUsage(root, ctx) {
+  // 全局筛选：所有页签共用
+  const sinceNode = select(SINCE_OPTIONS, "");
+  const userNode = textInput("", "留空表示不限");
+
+  // 概览：平台 / 模型 / 曲线粒度
+  const overviewPlatform = textInput("", "留空表示不限");
+  const overviewModel = textInput("", "留空表示不限");
+  const overviewBucket = select([{ value: "day", label: "按天" }, { value: "hour", label: "按小时" }], "day");
+  const overviewButton = button("查询概览", "primary");
+
+  const dailyButton = button("刷新", "primary");
+
+  // 模型榜：排序
+  const modelsSort = select(SORT_OPTIONS, "requests");
+  const modelsButton = button("查询模型榜", "primary");
+
+  // 聚合明细：平台 / 模型 / 聚合维度 / 排序
+  const aggregatePlatform = textInput("", "留空表示不限");
+  const aggregateModel = textInput("", "留空表示不限");
+  const aggregateGroupBy = select(GROUP_OPTIONS, "day");
+  const aggregateSort = select(SORT_OPTIONS, "requests");
+  const aggregateButton = button("查询聚合", "primary");
+
+  const loadButton = button("查询全部", "primary");
   const kpiBox = el("div");
   const dailyBox = el("div");
   const chartCanvas = el("canvas", { class: "chart" });
@@ -62,76 +100,237 @@ export async function renderUsage(root, ctx) {
   const rankingBox = el("div");
   const dimensionBox = el("div");
 
-  const dimGroup = textInput("model", "例如 month,user,model");
+  const dimGroup = textInput("model", "例如 user,model 或 month,user,model");
   const dimEndpoint = textInput("", "例如 passthrough:example-service");
-  const dimUser = textInput("", "留空表示不限");
   const dimButton = button("查询维度", "primary");
-  const dimensionFilter = panel("透传维度筛选", [
+  const dimKeysBox = el("div", { class: "option-chips" }, [
+    el("span", { class: "muted", text: "读取可用维度中…" }),
+  ]);
+  const dimPresetRow = el("div", { class: "control-row" }, [
+    el("span", { class: "field-label", text: "常用组合" }),
+    ...DIMENSION_PRESETS.map((preset) => el("button", {
+      class: "ghost",
+      type: "button",
+      text: preset.label,
+      title: `填入 ${preset.value}`,
+      onclick: () => {
+        dimGroup.value = preset.value;
+        dimGroup.focus();
+      },
+    })),
+  ]);
+  const dimensionControls = [
+    dimPresetRow,
     el("div", { class: "filters" }, [
       control("维度组合", dimGroup),
       control("入口", dimEndpoint),
-      control("用户标签", dimUser),
     ]),
-  ], dimButton);
+    fieldGroup("可用维度 / 分组键", dimKeysBox),
+    el("p", { class: "muted", text: "维度名用英文逗号分隔；user=用户，endpoint=入口，day/month=时间，其余是透传路由声明的维度。时间范围和用户标签取上方「全局筛选」；点「查询维度」只刷新本页签。" }),
+    el("p", { class: "muted", text: DIMENSION_METRIC_HINT }),
+  ];
 
-  const filterPanel = panel("筛选", [el("div", { class: "filters" }, filters.map((item) => control(item.label, item.node)))], loadButton);
+  const globalPanel = panel("全局筛选", [
+    el("div", { class: "filters" }, [
+      control("时间范围", sinceNode),
+      control("用户标签", userNode),
+    ]),
+    el("p", { class: "muted", text: "这两个条件对所有页签生效；改完点「查询全部」刷新所有页签，或在各页签内单独查询。" }),
+  ], loadButton);
 
-  root.append(
-    filterPanel,
-    kpiBox,
-    panel("每日用量（全量，按天 / 用户，不随审计清理）", [dailyBox]),
-    panel("趋势（请求数 / P95 耗时）", [chartCanvas]),
-    panel("模型榜（按所选维度排序）", [slowCanvas, rankingBox]),
-    panel("透传维度汇总（永久日汇总）", [dimensionFilter, dimensionBox]),
-    panel("聚合明细（审计明细范围内）", [aggregateBox]),
-  );
+  // 最近一次查询结果：切回图表页签时要用它重画，避免隐藏状态下量不到宽度
+  const latest = { series: null, ranking: null };
 
-  loadButton.addEventListener("click", () => load(readControls(filters)));
+  // 每个页签一个内容容器，筛选条件也放在各自页签里
+  const paneNodes = {
+    overview: el("div", {}, [
+      panel("概览筛选", [
+        el("div", { class: "filters" }, [
+          control("平台", overviewPlatform),
+          control("模型名", overviewModel),
+          control("曲线粒度", overviewBucket),
+        ]),
+        el("p", { class: "muted", text: "平台 / 模型影响趋势和成功率卡片；输入 / 缓存 / 输出 tokens 卡片来自日汇总，只按全局时间和用户统计。" }),
+      ], overviewButton),
+      kpiBox,
+      panel("趋势（请求数 / P95 耗时）", [chartCanvas]),
+    ]),
+    daily: el("div", {}, [
+      panel("每日用量（全量，按天 / 用户，不随审计清理）", [
+        el("p", { class: "muted", text: "使用上方全局筛选（时间范围、用户标签）。" }),
+        dailyBox,
+      ], dailyButton),
+    ]),
+    models: el("div", {}, [
+      panel("模型榜（按所选排序）", [
+        el("div", { class: "filters" }, [control("排序", modelsSort)]),
+        slowCanvas,
+        rankingBox,
+      ], modelsButton),
+    ]),
+    dimensions: el("div", {}, [
+      panel("透传维度汇总（永久日汇总）", [...dimensionControls, dimensionBox], dimButton),
+    ]),
+    aggregate: el("div", {}, [
+      panel("聚合明细（审计明细范围内）", [
+        el("div", { class: "filters" }, [
+          control("平台", aggregatePlatform),
+          control("模型名", aggregateModel),
+          control("聚合维度", aggregateGroupBy),
+          control("排序", aggregateSort),
+        ]),
+        aggregateBox,
+      ], aggregateButton),
+    ]),
+  };
+  const tabButtons = USAGE_TABS.map((item) => el("button", {
+    class: "tab",
+    type: "button",
+    dataset: { tab: item.key },
+    text: item.label,
+    onclick: () => selectTab(item.key),
+  }));
+  const tabBar = el("div", { class: "tabs view-tabs" }, tabButtons);
+
+  root.append(globalPanel, tabBar, ...Object.values(paneNodes));
+  selectTab("overview");
+
+  function selectTab(name) {
+    Object.entries(paneNodes).forEach(([key, pane]) => {
+      pane.hidden = key !== name;
+    });
+    tabButtons.forEach((node) => {
+      node.setAttribute("aria-selected", String(node.dataset.tab === name));
+    });
+    // 图表在隐藏容器里量不到宽度，切回可见状态后再画一次
+    window.requestAnimationFrame(drawVisibleCharts);
+  }
+
+  function drawVisibleCharts() {
+    if (!paneNodes.overview.hidden && latest.series) drawTrend(chartCanvas, latest.series);
+    if (!paneNodes.models.hidden && latest.ranking) drawRankingChart(slowCanvas, latest.ranking);
+  }
+
+  loadButton.addEventListener("click", () => loadAll());
+  overviewButton.addEventListener("click", () => loadOverview());
+  dailyButton.addEventListener("click", () => loadDaily());
+  modelsButton.addEventListener("click", () => loadModels());
+  aggregateButton.addEventListener("click", () => loadAggregate());
   dimButton.addEventListener("click", () => loadDimensions());
 
-  async function load(params) {
-    Object.assign(state, params);
-    const query = {
-      since: params.since,
-      platform: params.platform,
-      model: params.model,
-      user: params.user,
-    };
+  async function loadAll(quiet = false) {
     loadButton.disabled = true;
     try {
-      const [totals, daily, series, grouped, ranking] = await Promise.all([
-        ctx.api.postQuery("/admin/usage/summary", { ...query, group_by: "outcome", limit: 20 }),
-        ctx.api.postQuery("/admin/usage/daily", { since: params.since, user: params.user, limit: 2000 }),
-        ctx.api.postQuery("/admin/usage/timeseries", { ...query, bucket: params.bucket || state.bucket }),
-        ctx.api.postQuery("/admin/usage/summary", { ...query, group_by: params.groupBy || state.groupBy, limit: 60, sort: params.sort || state.sort }),
-        ctx.api.postQuery("/admin/usage/models", { ...query, sort: params.sort || state.sort, limit: 10 }),
+      await Promise.all([
+        loadOverview(true),
+        loadDaily(true),
+        loadModels(true),
+        loadAggregate(true),
+        loadDimensions(true),
       ]);
-
-      renderCards(kpiBox, totals, daily.totals);
-      renderDaily(dailyBox, daily);
-      drawCharts(chartCanvas, slowCanvas, series, ranking);
-      renderAggregate(aggregateBox, grouped);
-      renderRanking(rankingBox, ranking);
-      ctx.notice(`已载入 ${daily.range.since || "全部历史"} 至 ${daily.range.until} 的全量用量（${daily.count} 行日汇总）`, "ok");
-    } catch (error) {
-      ctx.guard(error);
+      if (!quiet) ctx.notice("已刷新所有页签", "ok");
     } finally {
       loadButton.disabled = false;
     }
   }
 
-  async function loadDimensions() {
+  async function loadOverview(quiet = false) {
+    const since = sinceNode.value;
+    const user = userNode.value.trim();
+    const platform = overviewPlatform.value.trim();
+    const model = overviewModel.value.trim();
+    overviewButton.disabled = true;
+    try {
+      const [totals, daily, series] = await Promise.all([
+        ctx.api.postQuery("/admin/usage/summary", { since, platform, model, user, group_by: "outcome", limit: 20 }),
+        ctx.api.postQuery("/admin/usage/daily", { since, user, limit: 2000 }),
+        ctx.api.postQuery("/admin/usage/timeseries", { since, platform, model, user, bucket: overviewBucket.value }),
+      ]);
+      renderCards(kpiBox, totals, daily.totals);
+      latest.series = series;
+      drawVisibleCharts();
+      if (!quiet) ctx.notice("概览已刷新", "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      overviewButton.disabled = false;
+    }
+  }
+
+  async function loadDaily(quiet = false) {
+    dailyButton.disabled = true;
+    try {
+      const daily = await ctx.api.postQuery("/admin/usage/daily", {
+        since: sinceNode.value,
+        user: userNode.value.trim(),
+        limit: 2000,
+      });
+      renderDaily(dailyBox, daily);
+      if (!quiet) ctx.notice(`每日用量已刷新（${daily.count} 行日汇总）`, "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      dailyButton.disabled = false;
+    }
+  }
+
+  async function loadModels(quiet = false) {
+    modelsButton.disabled = true;
+    try {
+      const ranking = await ctx.api.postQuery("/admin/usage/models", {
+        since: sinceNode.value,
+        user: userNode.value.trim(),
+        sort: modelsSort.value,
+        limit: 10,
+      });
+      latest.ranking = ranking;
+      drawVisibleCharts();
+      renderRanking(rankingBox, ranking);
+      if (!quiet) ctx.notice("模型榜已刷新", "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      modelsButton.disabled = false;
+    }
+  }
+
+  async function loadAggregate(quiet = false) {
+    const since = sinceNode.value;
+    const user = userNode.value.trim();
+    const platform = aggregatePlatform.value.trim();
+    const model = aggregateModel.value.trim();
+    aggregateButton.disabled = true;
+    try {
+      const grouped = await ctx.api.postQuery("/admin/usage/summary", {
+        since,
+        platform,
+        model,
+        user,
+        group_by: aggregateGroupBy.value,
+        limit: 60,
+        sort: aggregateSort.value,
+      });
+      renderAggregate(aggregateBox, grouped);
+      if (!quiet) ctx.notice("聚合明细已刷新", "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      aggregateButton.disabled = false;
+    }
+  }
+
+  async function loadDimensions(quiet = false) {
     dimButton.disabled = true;
     try {
       const payload = await ctx.api.postQuery("/admin/usage/dimensions", {
         group_by: dimGroup.value.trim() || "model",
-        since: state.since,
+        since: sinceNode.value,
         endpoint: dimEndpoint.value.trim(),
-        user: dimUser.value.trim(),
+        user: userNode.value.trim(),
         limit: 500,
       });
       renderDimensions(dimensionBox, payload);
-      ctx.notice(`维度汇总：${payload.count} 组（${payload.group_by.join(" × ")}）`, "ok");
+      if (!quiet) ctx.notice(`维度汇总：${payload.count} 组（${payload.group_by.join(" × ")}）`, "ok");
     } catch (error) {
       ctx.guard(error);
     } finally {
@@ -139,8 +338,20 @@ export async function renderUsage(root, ctx) {
     }
   }
 
-  await load({ since: state.since, groupBy: state.groupBy, sort: state.sort, bucket: state.bucket });
-  await loadDimensions();
+  async function loadDimensionKeys() {
+    try {
+      const payload = await ctx.api.postQuery("/admin/usage/dimension-keys");
+      renderDimensionKeys(dimKeysBox, payload.keys || [], (name) => {
+        dimGroup.value = appendDimension(dimGroup.value, name);
+        dimGroup.focus();
+      });
+    } catch {
+      // 候选读不到不影响手填维度名，不弹全局错误
+      dimKeysBox.replaceChildren(el("span", { class: "muted", text: "可用维度读取失败，可直接手填维度名" }));
+    }
+  }
+
+  await Promise.all([loadAll(true), loadDimensionKeys()]);
 }
 
 // ---------- 呈现 ----------
@@ -164,18 +375,20 @@ function renderCards(box, totals, dailyTotals = {}) {
   ]));
 }
 
-function drawCharts(mainCanvas, rankingCanvas, series, ranking) {
+function drawTrend(canvas, series) {
   const points = series.points || [];
   const labels = points.map((point) => point.bucket.slice(-5));
 
-  lineChart(mainCanvas, labels, [
+  lineChart(canvas, labels, [
     { label: "请求数", values: points.map((point) => point.requests) },
     { label: "P95 耗时(ms)", values: points.map((point) => point.p95_duration_ms) },
     { label: "首块耗时(ms)", values: points.map((point) => point.avg_ttft_ms) },
   ]);
+}
 
+function drawRankingChart(canvas, ranking) {
   const rows = (ranking.items || []).slice(0, 10);
-  barChart(rankingCanvas, rows.map((item) => shortBucket(item.bucket)), rows.map((item) => item.p95_duration_ms || 0));
+  barChart(canvas, rows.map((item) => shortBucket(item.bucket)), rows.map((item) => item.p95_duration_ms || 0));
 }
 
 function renderDaily(box, daily) {
@@ -225,6 +438,32 @@ function renderDimensions(box, payload) {
       { key: "success_rate", label: "成功率", num: true, render: (row) => fmtRate(row.success_rate) },
     ], items),
   );
+}
+
+/** 可用维度候选：点一下追加到组合输入框，避免用户猜键名 */
+function renderDimensionKeys(box, keys, onPick) {
+  const stored = [...new Set((keys || []).map((key) => String(key).trim()).filter(Boolean))];
+  const names = [...DIMENSION_GROUP_KEYS, ...stored.filter((name) => !DIMENSION_GROUP_KEYS.includes(name))];
+  box.replaceChildren(
+    el("span", { class: "muted", text: "点一下追加：" }),
+    ...names.map((name) => el("button", {
+      class: "ghost",
+      type: "button",
+      text: name,
+      title: `追加到维度组合：${name}`,
+      onclick: () => onPick(name),
+    })),
+  );
+}
+
+/** 把维度名追加进逗号分隔的组合里，已存在时保持原样 */
+function appendDimension(current, name) {
+  const names = String(current || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!names.includes(name)) names.push(name);
+  return names.join(",");
 }
 
 function renderAggregate(box, grouped) {
