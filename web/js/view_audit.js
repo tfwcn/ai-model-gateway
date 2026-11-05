@@ -155,6 +155,7 @@ function renderChain(box, chain) {
       dt("耗时"), dd(fmtMs(attempt.duration_ms)),
       dt("首块"), dd(fmtMs(attempt.ttft_ms)),
       dt("探测"), dd(fmtMs(attempt.probe_ms)),
+      dt("上游 ID"), dd(attempt.upstream_id || "-"),
       dt("状态码"), dd(attempt.http_status ?? "-"),
       dt("错误"), dd(`${attempt.error_category || "-"} / ${attempt.error_code || "-"}`),
       dt("禁用模型"), dd(attempt.disabled_model ? "是" : "否"),

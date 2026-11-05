@@ -223,7 +223,8 @@ class UsageCommands:
             self.console.line(
                 f"  #{attempt.get('attempt_seq')} {attempt.get('model_name')} "
                 f"{attempt.get('outcome')} 耗时 {attempt.get('duration_ms')}ms "
-                f"首块 {attempt.get('ttft_ms')}ms {attempt.get('error_code') or ''}".rstrip()
+                f"首块 {attempt.get('ttft_ms')}ms 上游id {attempt.get('upstream_id') or '-'} "
+                f"{attempt.get('error_code') or ''}".rstrip()
             )
             self.console.line(
                 f"     错误分类: {attempt.get('error_category') or '-'} / {attempt.get('error_code') or '-'} "

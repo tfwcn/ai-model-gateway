@@ -70,6 +70,7 @@ def _attempt(key: str, ts: str, model: str, outcome: str) -> AuditAttempt:
         # 这里的行都是流式：能记成 success 就意味着 [DONE] 已经转发出去
         attempt.done_sent = True
         attempt.mark_success({
+            "id": f"upstream-{key}",
             "usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300},
             "choices": [{"message": {"content": "ok"}}],
         })
@@ -246,6 +247,9 @@ class TestDetails:
         assert "共 2 次尝试" in out
         assert "#1 example-platform|model-a failure" in out
         assert "#2 example-platform|model-b success" in out
+        # 链里要能看出每次尝试对应哪个上游响应
+        assert "上游id upstream-r2-2" in out
+        assert "上游id -" in out
 
     @pytest.mark.unit
     def test_chain对不存在的请求给出明确答复(self, capsys, cli_args):
