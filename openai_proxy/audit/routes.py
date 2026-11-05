@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional
 from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
 
+from openai_proxy.audit.csv_export import DimensionCsvExporter
 from openai_proxy.audit.manager import AuditManager
 from openai_proxy.audit.query import UsageQueryService, parse_time
 from openai_proxy.core.api_errors import ApiError
@@ -112,6 +113,25 @@ def build_audit_router(
     ) -> Dict[str, Any]:
         """永久维度日汇总：按任意维度组合看调用量"""
         return await _run(_queries().dimension_usage, group_by, since, until, user, endpoint, limit)
+
+    @router.post("/admin/usage/dimensions/export")
+    async def usage_dimensions_export(
+        group_by: str = Query("model", description="逗号分隔：model / model,size / day,user,model,size"),
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        user: Optional[str] = Query(None, description="只看某个用户标签"),
+        endpoint: Optional[str] = Query(None, description="只看某个入口，例如 passthrough:example-service"),
+    ) -> Response:
+        """永久维度日汇总导出 CSV（全部匹配行，不受页面分页限制）"""
+        result = await _run(
+            _queries().dimension_usage, group_by, since, until, user, endpoint, None
+        )
+        content = DimensionCsvExporter(result["group_by"], result["items"]).render()
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="dimensions.csv"'},
+        )
 
     @router.post("/admin/usage/dimension-keys")
     async def usage_dimension_keys() -> Dict[str, Any]:

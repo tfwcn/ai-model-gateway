@@ -184,6 +184,14 @@ X-Gateway-User: user-a
 数据来自 `usage_dimension_daily`，只累加、不清理；明细保留期清理后历史仍可查。
 `input_tokens` / `cached_tokens` / `output_tokens` 来自审计行，上游没有返回 usage 时为空值按 0 累计。
 
+## POST /admin/usage/dimensions/export
+
+把同一组筛选条件下的维度日汇总导出为 CSV。查询参数与 `/admin/usage/dimensions` 相同
+（`group_by`、`since`、`until`、`user`、`endpoint`），但没有 `limit`：导出全部匹配分组。
+
+响应头为 `Content-Type: text/csv; charset=utf-8`，文件带 UTF-8 BOM，可直接用 Excel 打开。
+列顺序是「所选维度列 + 请求 / 尝试 / 成功 / 失败 / 中断 / 输入tokens / 缓存tokens / 输出tokens / 成功率」。
+
 ## POST /admin/usage/dimension-keys
 
 维度候选：已配置的透传路由 + 历史表里出现过的维度名。

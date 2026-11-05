@@ -2,6 +2,9 @@
 
 复用现有审计库构造方式，不启动 lifespan。
 """
+import csv
+import io
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -112,6 +115,35 @@ class TestDimensionEndpoints:
         assert first["input_tokens"] > 0
         assert first["cached_tokens"] > 0
         assert first["output_tokens"] > 0
+
+    @pytest.mark.unit
+    def test_导出csv包含维度列与固定指标(self, tmp_path, monkeypatch):
+        client = _client(tmp_path, monkeypatch)
+        headers = {"Authorization": f"Bearer {_KEY}"}
+
+        response = client.post(
+            "/admin/usage/dimensions/export?group_by=model,size&since=2026-01-01",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/csv")
+        assert "attachment" in response.headers["content-disposition"]
+
+        # BOM 让 Excel 正确识别 UTF-8；解析时用 utf-8-sig 去掉
+        text = response.content.decode("utf-8-sig")
+        rows = list(csv.reader(io.StringIO(text)))
+        assert rows[0] == [
+            "model", "size", "请求", "尝试", "成功", "失败", "中断",
+            "输入tokens", "缓存tokens", "输出tokens", "成功率",
+        ]
+        assert len(rows) == 4
+        assert {tuple(row[:2]) for row in rows[1:]} == {
+            ("model-a", "1024x1024"),
+            ("model-a", "512x512"),
+            ("model-b", "1024x1024"),
+        }
+        assert {row[-1] for row in rows[1:]} == {"100.0%"}
 
     @pytest.mark.unit
     def test_维度候选合并配置与历史(self, tmp_path, monkeypatch):

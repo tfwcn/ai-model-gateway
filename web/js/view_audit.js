@@ -9,13 +9,7 @@
  */
 
 import { button, control, el, empty, fmtMs, fmtNumber, fmtTime, panel, readControls, select, table, textInput, userLabel } from "./ui.js";
-
-const SINCE_OPTIONS = [
-  { value: "24h", label: "最近 24 小时" },
-  { value: "7d", label: "最近 7 天" },
-  { value: "30d", label: "最近 30 天（默认保留期）" },
-  { value: "", label: "全部（已保留的明细）" },
-];
+import { DateRange } from "./date_range.js";
 
 const OUTCOME_OPTIONS = [
   { value: "", label: "全部结局" },
@@ -26,7 +20,6 @@ const OUTCOME_OPTIONS = [
 ];
 
 const LABELS = {
-  since: "时间范围",
   outcome: "结局",
   platform: "平台",
   model: "模型名",
@@ -41,8 +34,9 @@ const OUTCOME_NOTE =
   + "stream_open 是未收尾的流，不计入成功率。";
 
 export async function renderAudit(root, ctx) {
+  // 明细接口有保留期，默认只看最近 30 天；清空日期即可查全部已保留记录
+  const range = new DateRange({ days: 30 });
   const filters = [
-    { name: "since", node: select(SINCE_OPTIONS, "30d") },
     { name: "outcome", node: select(OUTCOME_OPTIONS, "") },
     { name: "platform", node: textInput("", "留空表示不限") },
     { name: "model", node: textInput("", "留空表示不限") },
@@ -61,7 +55,11 @@ export async function renderAudit(root, ctx) {
 
   root.append(
     panel("筛选", [
-      el("div", { class: "filters" }, filters.map((item) => control(LABELS[item.name], item.node))),
+      el("div", { class: "filters" }, [
+        ...range.controls(),
+        ...filters.map((item) => control(LABELS[item.name], item.node)),
+      ]),
+      el("p", { class: "muted", text: "日期留空表示不限，结束日期当天包含在内。" }),
       el("p", { class: "muted", text: OUTCOME_NOTE }),
       el("p", { class: "muted", text: "明细默认保留 30 天（AUDIT_RETENTION_DAYS），更早记录会自动清理；全量用量在「用量与性能」的日汇总里永久保留。" }),
     ], loadButton),
@@ -75,7 +73,7 @@ export async function renderAudit(root, ctx) {
   next.addEventListener("click", () => { page.offset += page.limit; load(); });
 
   async function load() {
-    const params = readControls(filters);
+    const params = { ...readControls(filters), ...range.params() };
     loadButton.disabled = true;
     try {
       const [result, health] = await Promise.all([

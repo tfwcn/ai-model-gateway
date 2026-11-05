@@ -289,13 +289,14 @@ class UsageQueryService:
         until: Optional[str] = None,
         user: Optional[str] = None,
         endpoint: Optional[str] = None,
-        limit: int = 200,
+        limit: Optional[int] = 200,
     ) -> Dict[str, Any]:
         """
         查询永久维度日汇总表（usage_dimension_daily）
 
         group_by 是逗号分隔的分组键，支持 day / user / endpoint 与任意维度名，
         例如 `model`、`model,size`、`day,user,model,size`。
+        limit=None 表示导出场景不截断，返回全部匹配分组。
         """
         names = _parse_dimension_group(group_by)
         exprs = [_dimension_group_expr(name) for name in names]
@@ -321,6 +322,12 @@ class UsageQueryService:
             where.append("endpoint = ?")
             params.append(endpoint)
 
+        # 导出时 limit=None：不拼 LIMIT，保证 CSV 不因页面分页而缺行
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            params = params + [max(1, min(int(limit), 1000))]
+
         rows = self.store.query(
             f"""
             SELECT {select_group}, {bucket_expr} AS bucket,
@@ -337,9 +344,9 @@ class UsageQueryService:
             WHERE {' AND '.join(where)}
             GROUP BY {group_clause}
             ORDER BY requests DESC, bucket ASC
-            LIMIT ?
+            {limit_clause}
             """,
-            params + [max(1, min(int(limit), 1000))],
+            params,
         )
 
         items = []

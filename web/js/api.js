@@ -107,6 +107,42 @@ export class Api {
     return this.request("POST", path, params, undefined);
   }
 
+  /**
+   * 下载接口返回的文件（CSV 导出等）
+   *
+   * 查询参数同样走 URL；后端如果不是 2xx，仍按 ApiError 抛出。
+   * Returns:
+   *   { blob, filename }
+   */
+  async download(path, params, fallbackName = "export.csv") {
+    const url = new URL(this.base + path, window.location.origin);
+    Object.entries(params || {}).forEach(([name, value]) => {
+      if (value !== null && value !== undefined && value !== "") {
+        url.searchParams.set(name, String(value));
+      }
+    });
+
+    const headers = {};
+    if (this.key) headers.Authorization = `Bearer ${this.key}`;
+
+    let response;
+    try {
+      response = await fetch(url.pathname + url.search, { method: "POST", headers });
+    } catch (exc) {
+      throw new ApiError(0, `无法连接网关：${exc.message}`);
+    }
+
+    if (!response.ok) {
+      const payload = await parseBody(response);
+      throw new ApiError(response.status, messageFor(response, payload), payload);
+    }
+
+    return {
+      blob: await response.blob(),
+      filename: filenameFrom(response.headers.get("Content-Disposition")) || fallbackName,
+    };
+  }
+
   del(path, params) {
     return this.request("DELETE", path, params, undefined);
   }
@@ -156,6 +192,21 @@ async function parseBody(response) {
     return JSON.parse(text);
   } catch (exc) {
     return { raw: text };
+  }
+}
+
+/** 从 Content-Disposition 里取文件名；取不到时交给调用方回落默认名 */
+function filenameFrom(header) {
+  if (!header) return "";
+  const encoded = header.match(/filename\*=UTF-8''([^;]+)/i);
+  const plain = header.match(/filename="?([^";]+)"?/i);
+  const value = encoded ? encoded[1] : plain ? plain[1] : "";
+  const text = value.trim();
+  if (!text) return "";
+  try {
+    return decodeURIComponent(text);
+  } catch (exc) {
+    return text;
   }
 }
 

@@ -12,13 +12,7 @@
 
 import { button, cards, control, el, empty, fieldGroup, fmtMs, fmtNumber, fmtRate, panel, select, table, textInput, userLabel } from "./ui.js";
 import { barChart, lineChart } from "./charts.js";
-
-const SINCE_OPTIONS = [
-  { value: "7d", label: "最近 7 天" },
-  { value: "30d", label: "最近 30 天" },
-  { value: "90d", label: "最近 90 天" },
-  { value: "", label: "全部（保留所有记录）" },
-];
+import { DateRange } from "./date_range.js";
 
 const GROUP_OPTIONS = [
   { value: "model", label: "按模型" },
@@ -69,7 +63,7 @@ const USAGE_TABS = [
 
 export async function renderUsage(root, ctx) {
   // 全局筛选：所有页签共用
-  const sinceNode = select(SINCE_OPTIONS, "");
+  const range = new DateRange();
   const userNode = textInput("", "留空表示不限");
 
   // 概览：平台 / 模型 / 曲线粒度
@@ -103,6 +97,7 @@ export async function renderUsage(root, ctx) {
   const dimGroup = textInput("model", "例如 user,model 或 month,user,model");
   const dimEndpoint = textInput("", "例如 passthrough:example-service");
   const dimButton = button("查询维度", "primary");
+  const dimExportButton = button("导出 CSV");
   const dimKeysBox = el("div", { class: "option-chips" }, [
     el("span", { class: "muted", text: "读取可用维度中…" }),
   ]);
@@ -126,16 +121,16 @@ export async function renderUsage(root, ctx) {
       control("入口", dimEndpoint),
     ]),
     fieldGroup("可用维度 / 分组键", dimKeysBox),
-    el("p", { class: "muted", text: "维度名用英文逗号分隔；user=用户，endpoint=入口，day/month=时间，其余是透传路由声明的维度。时间范围和用户标签取上方「全局筛选」；点「查询维度」只刷新本页签。" }),
+    el("p", { class: "muted", text: "维度名用英文逗号分隔；user=用户，endpoint=入口，day/month=时间，其余是透传路由声明的维度。日期范围和用户标签取上方「全局筛选」；点「查询维度」只刷新本页签。" }),
     el("p", { class: "muted", text: DIMENSION_METRIC_HINT }),
   ];
 
   const globalPanel = panel("全局筛选", [
     el("div", { class: "filters" }, [
-      control("时间范围", sinceNode),
+      ...range.controls(),
       control("用户标签", userNode),
     ]),
-    el("p", { class: "muted", text: "这两个条件对所有页签生效；改完点「查询全部」刷新所有页签，或在各页签内单独查询。" }),
+    el("p", { class: "muted", text: "日期留空表示不限，结束日期当天包含在内；这两个条件对所有页签生效。改完点「查询全部」刷新所有页签，或在各页签内单独查询。" }),
   ], loadButton);
 
   // 最近一次查询结果：切回图表页签时要用它重画，避免隐藏状态下量不到宽度
@@ -157,7 +152,7 @@ export async function renderUsage(root, ctx) {
     ]),
     daily: el("div", {}, [
       panel("每日用量（全量，按天 / 用户，不随审计清理）", [
-        el("p", { class: "muted", text: "使用上方全局筛选（时间范围、用户标签）。" }),
+        el("p", { class: "muted", text: "使用上方全局筛选（日期范围、用户标签）。" }),
         dailyBox,
       ], dailyButton),
     ]),
@@ -169,7 +164,8 @@ export async function renderUsage(root, ctx) {
       ], modelsButton),
     ]),
     dimensions: el("div", {}, [
-      panel("透传维度汇总（永久日汇总）", [...dimensionControls, dimensionBox], dimButton),
+      panel("透传维度汇总（永久日汇总）", [...dimensionControls, dimensionBox],
+        el("div", { class: "row-actions" }, [dimButton, dimExportButton])),
     ]),
     aggregate: el("div", {}, [
       panel("聚合明细（审计明细范围内）", [
@@ -217,6 +213,7 @@ export async function renderUsage(root, ctx) {
   modelsButton.addEventListener("click", () => loadModels());
   aggregateButton.addEventListener("click", () => loadAggregate());
   dimButton.addEventListener("click", () => loadDimensions());
+  dimExportButton.addEventListener("click", () => exportDimensions());
 
   async function loadAll(quiet = false) {
     loadButton.disabled = true;
@@ -235,16 +232,16 @@ export async function renderUsage(root, ctx) {
   }
 
   async function loadOverview(quiet = false) {
-    const since = sinceNode.value;
+    const { since, until } = range.params();
     const user = userNode.value.trim();
     const platform = overviewPlatform.value.trim();
     const model = overviewModel.value.trim();
     overviewButton.disabled = true;
     try {
       const [totals, daily, series] = await Promise.all([
-        ctx.api.postQuery("/admin/usage/summary", { since, platform, model, user, group_by: "outcome", limit: 20 }),
-        ctx.api.postQuery("/admin/usage/daily", { since, user, limit: 2000 }),
-        ctx.api.postQuery("/admin/usage/timeseries", { since, platform, model, user, bucket: overviewBucket.value }),
+        ctx.api.postQuery("/admin/usage/summary", { since, until, platform, model, user, group_by: "outcome", limit: 20 }),
+        ctx.api.postQuery("/admin/usage/daily", { since, until, user, limit: 2000 }),
+        ctx.api.postQuery("/admin/usage/timeseries", { since, until, platform, model, user, bucket: overviewBucket.value }),
       ]);
       renderCards(kpiBox, totals, daily.totals);
       latest.series = series;
@@ -261,7 +258,7 @@ export async function renderUsage(root, ctx) {
     dailyButton.disabled = true;
     try {
       const daily = await ctx.api.postQuery("/admin/usage/daily", {
-        since: sinceNode.value,
+        ...range.params(),
         user: userNode.value.trim(),
         limit: 2000,
       });
@@ -278,7 +275,7 @@ export async function renderUsage(root, ctx) {
     modelsButton.disabled = true;
     try {
       const ranking = await ctx.api.postQuery("/admin/usage/models", {
-        since: sinceNode.value,
+        ...range.params(),
         user: userNode.value.trim(),
         sort: modelsSort.value,
         limit: 10,
@@ -295,7 +292,7 @@ export async function renderUsage(root, ctx) {
   }
 
   async function loadAggregate(quiet = false) {
-    const since = sinceNode.value;
+    const { since, until } = range.params();
     const user = userNode.value.trim();
     const platform = aggregatePlatform.value.trim();
     const model = aggregateModel.value.trim();
@@ -303,6 +300,7 @@ export async function renderUsage(root, ctx) {
     try {
       const grouped = await ctx.api.postQuery("/admin/usage/summary", {
         since,
+        until,
         platform,
         model,
         user,
@@ -319,14 +317,20 @@ export async function renderUsage(root, ctx) {
     }
   }
 
+  function dimensionParams() {
+    return {
+      ...range.params(),
+      group_by: dimGroup.value.trim() || "model",
+      endpoint: dimEndpoint.value.trim(),
+      user: userNode.value.trim(),
+    };
+  }
+
   async function loadDimensions(quiet = false) {
     dimButton.disabled = true;
     try {
       const payload = await ctx.api.postQuery("/admin/usage/dimensions", {
-        group_by: dimGroup.value.trim() || "model",
-        since: sinceNode.value,
-        endpoint: dimEndpoint.value.trim(),
-        user: userNode.value.trim(),
+        ...dimensionParams(),
         limit: 500,
       });
       renderDimensions(dimensionBox, payload);
@@ -335,6 +339,23 @@ export async function renderUsage(root, ctx) {
       ctx.guard(error);
     } finally {
       dimButton.disabled = false;
+    }
+  }
+
+  async function exportDimensions() {
+    dimExportButton.disabled = true;
+    try {
+      const file = await ctx.api.download(
+        "/admin/usage/dimensions/export",
+        dimensionParams(),
+        "dimensions.csv",
+      );
+      saveBlob(file.blob, file.filename);
+      ctx.notice("维度汇总 CSV 已导出", "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      dimExportButton.disabled = false;
     }
   }
 
@@ -355,6 +376,16 @@ export async function renderUsage(root, ctx) {
 }
 
 // ---------- 呈现 ----------
+
+/** 触发浏览器下载：Blob 转临时 URL，点完即回收 */
+function saveBlob(blob, filename) {
+  const href = URL.createObjectURL(blob);
+  const link = el("a", { href, download: filename, style: "display: none" });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(href);
+}
 
 function renderCards(box, totals, dailyTotals = {}) {
   const sums = totals.items.reduce((acc, item) => {
