@@ -1,0 +1,362 @@
+/* AI Model Gateway 管理台样式：无框架、无外部字体，深/浅自适应 */
+
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #16181d;
+  --muted: #6b7280;
+  --line: #d8dce3;
+  --accent: #2f6feb;
+  --ok: #1a7f4b;
+  --warn: #b26a00;
+  --bad: #b42318;
+  --chip: #eef2f7;
+  /* 差异行的底色：比状态色淡很多，整页不会变成红绿灯 */
+  --add-bg: #eaf6ef;
+  --mod-bg: #fdf4de;
+  --del-bg: #fdeceb;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f24;
+    --ink: #e8eaed;
+    --muted: #9aa2ad;
+    --line: #2c3138;
+    --accent: #7aa2f7;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --chip: #23272e;
+    --add-bg: #10231a;
+    --mod-bg: #26200f;
+    --del-bg: #2b1517;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, "Segoe UI", "Noto Sans SC", sans-serif;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; }
+.logo {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.title { font-weight: 600; }
+
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+/* 页面内的二级页签：和下面的面板留出间距；顶部导航不套这个类，不受影响 */
+.tabs.view-tabs { margin-bottom: 14px; }
+.tab {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.tab[aria-selected="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.keybox { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.keybox label { color: var(--muted); }
+
+input, select, textarea, button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 9px;
+}
+input[type="password"] { min-width: 220px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.ghost { background: transparent; color: var(--muted); }
+button.danger { color: var(--bad); border-color: var(--bad); background: transparent; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+input.key-reveal {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--chip);
+}
+
+main { padding: 16px 18px 40px; max-width: 1280px; margin: 0 auto; }
+
+.notice {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--warn);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.notice.bad { border-left-color: var(--bad); }
+.notice.ok { border-left-color: var(--ok); }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+/* 可折叠区块：折叠时只留标题与摘要，配置多起来也不会一屏全是表单 */
+details.collapsible { padding: 0; }
+details.collapsible > summary {
+  padding: 12px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  cursor: pointer;
+  list-style: none;
+}
+details.collapsible > summary::-webkit-details-marker { display: none; }
+details.collapsible > summary::before { content: "\25B8"; color: var(--muted); }
+details.collapsible[open] > summary::before { content: "\25BE"; }
+details.collapsible > summary .panel-title { font-weight: 700; }
+details.collapsible > summary .panel-meta { color: var(--muted); font-size: 12px; }
+details.collapsible > .panel-body { padding: 0 14px 14px; }
+/* 折叠块内部统一节奏：原先只靠浏览器默认 margin，间距忽大忽小 */
+details.collapsible > .panel-body > * + * { margin-top: 10px; }
+details.collapsible > .panel-body h4 { margin: 14px 0 0; font-size: 14px; }
+/* 区块级动作（比如删除平台）靠右上角，不像孤零零吊在左上角 */
+details.collapsible > .panel-body > .row-actions:first-child {
+  justify-content: flex-end;
+  margin-top: 0;
+  margin-bottom: 6px;
+}
+
+/* 键值对：配置页、预演结果、审计详情都用它（原来只在审计详情里生效，配置页会竖排堆叠） */
+dl.kv { display: grid; grid-template-columns: minmax(92px, 150px) 1fr; gap: 4px 12px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+
+/* 字段说明：编辑行下面直接跟着这个字段的文档，不用翻页查 */
+.editor-block { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
+.field-doc { font-size: 13px; line-height: 1.5; display: flex; flex-direction: column; gap: 3px; }
+.field-doc .muted, .panel-meta { color: var(--muted); }
+.doc-note { color: var(--warn); font-size: 12px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* 字段字典卡片：窄屏自动减列，不会出现横向滚动 */
+.doc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 10px; }
+.doc-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.doc-card .doc-head { display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; align-items: center; }
+.doc-card code, .doc-card .doc-meta { overflow-wrap: anywhere; }
+.doc-card .doc-meta { color: var(--muted); font-size: 12px; }
+pre.guide-body { white-space: pre-wrap; margin: 0 0 10px; line-height: 1.55; }
+
+/* 配置页的表格允许换行：审计明细那种一行一条的表才需要不换行 + 横向滚动 */
+table.wrap th, table.wrap td { white-space: normal; }
+table.wrap td code { overflow-wrap: anywhere; }
+
+/* 别名一行三列：名字 / 指向 / 按钮，多行对齐 */
+.alias-row { display: grid; grid-template-columns: minmax(120px, 200px) minmax(220px, 1fr) auto auto; gap: 6px; align-items: start; }
+.alias-row .muted { font-size: 12px; }
+/* 窄屏：名字与按钮共用第一行，指向整行铺开，标签和下拉才有地方换行而不是挤成一列 */
+@media (max-width: 720px) {
+  /* dense 让「覆盖别名指向」回填到名字那一行，而不是掉到整块的最下面 */
+  .alias-row { grid-template-columns: minmax(110px, 1fr) auto; grid-auto-flow: row dense; }
+  .alias-row > code { grid-column: 1; }
+  .alias-row > button { grid-column: 2; justify-self: end; }
+  .alias-row > .option-picker { grid-column: 1 / -1; }
+}
+@media (max-width: 480px) {
+  .alias-row { grid-template-columns: 1fr; }
+  .alias-row > .option-picker { grid-column: auto; }
+}
+
+.filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+/* 「一次填一整个条目」的表单（新增平台）：等宽栅格，窄屏自动换行，块与块的顺序不会乱 */
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; align-items: end; }
+/* 小标签 + 控件：用 label 包一层。fieldset 自带边框，放在表单区里会变成一个巨大的空框 */
+.control { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field-label { color: var(--muted); font-size: 12px; }
+/* 带小标签的控件与按钮混在一行：按底边对齐，按钮才和输入控件竖着对上 */
+.control-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-end; }
+
+/* 取值控件的槽位：字段类型不同控件宽度差很多，靠这里换行而不是挤歪编辑行 */
+.value-slot { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+
+/* 勾选式选项：第一行是已选标签（会换行，长指向不会被截断），第二行是「筛选框（候选多时才有）+ 下拉 + 清空」 */
+.option-picker { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.option-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.option-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+/* 下拉与「清空这一行」重建时不会动到筛选框：否则一边打字一边失去焦点 */
+.option-select { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.option-filter { min-width: 190px; flex: 1 1 190px; }
+.option-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--chip);
+}
+.option-chip code { overflow-wrap: anywhere; }
+.option-chip button { border: none; background: transparent; color: var(--muted); padding: 0 4px; border-radius: 6px; }
+.option-chip button:hover { color: var(--bad); }
+
+/* 数字字段用带边界的 number 输入框，手填字段给足宽度 */
+input.num { width: 120px; }
+input.wide { min-width: 200px; flex: 1 1 200px; }
+
+/* 新增模型条目：模型名一行，覆盖用选项另起一行（不再有自由文本的「可选覆盖」框） */
+.model-add { display: flex; flex-direction: column; gap: 6px; }
+.overrides-picker { display: flex; flex-direction: column; gap: 6px; }
+/* 一次填一个的列表输入框（新增平台的模型条目）：和勾选式选项一样是「输入框一行 + 标签一行」 */
+.chips-input { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+/* 键值对编辑器（透传维度、附加请求头）：一行一对，窄屏自动换行 */
+.map-editor { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.map-rows { display: flex; flex-direction: column; gap: 4px; }
+.map-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.map-row input { flex: 1 1 160px; min-width: 120px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+.card .value { font-size: 22px; font-weight: 700; }
+.card .label { color: var(--muted); font-size: 12px; }
+.card.ok .value { color: var(--ok); }
+.card.bad .value { color: var(--bad); }
+
+table { width: 100%; border-collapse: collapse; }
+/* 表格统一套这两层：.table-scroll 让列多的表在窄屏只在自己的区域里横向平移，
+   整页不会出现横向滚动条；.table-box 保证它在栅格里可以被压缩（min-width: 0） */
+.table-box { min-width: 0; }
+.table-scroll { overflow-x: auto; }
+th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* 平移提示默认不出现，只在窄屏给 */
+.table-hint { display: none; }
+/* 窄屏：文本列允许换行（只在空格与标点处断，不会把一个词竖着拆成一个字符一列）；
+   min-width 让列不会被压成一个字符宽，实在放不下的表就在 .table-scroll 里平移 */
+@media (max-width: 720px) {
+  th, td { white-space: normal; min-width: 4.2em; }
+  .table-hint { display: block; color: var(--muted); font-size: 12px; margin: 0 0 6px; }
+}
+tr.clickable { cursor: pointer; }
+tr.clickable:hover { background: var(--chip); }
+.chip { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--chip); font-size: 12px; white-space: nowrap; }
+.chip.ok { color: var(--ok); }
+.chip.bad { color: var(--bad); }
+.chip.warn { color: var(--warn); }
+
+.chart { width: 100%; height: 210px; display: block; }
+
+.stack { display: grid; grid-template-columns: minmax(320px, 1.2fr) minmax(280px, 1fr); gap: 14px; }
+@media (max-width: 980px) { .stack { grid-template-columns: 1fr; } }
+
+.detail h3, .detail h4 { margin: 0 0 8px; }
+
+.issue { padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.issue.error { color: var(--bad); }
+.issue.warning { color: var(--warn); }
+
+pre.yaml {
+  background: var(--chip);
+  border-radius: 8px;
+  padding: 10px;
+  overflow: auto;
+  max-height: 420px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* 差异与待提交清单共用这一套列宽：状态 / 位置 / 原 / 新，四列在所有表里都一样宽 */
+.align-grid { display: flex; flex-direction: column; gap: 4px; }
+.align-row {
+  display: grid;
+  grid-template-columns: 64px minmax(150px, 1fr) minmax(150px, 1.1fr) minmax(150px, 1.1fr);
+  gap: 4px 10px;
+  align-items: start;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line);
+  border-radius: 8px;
+}
+.align-row code { overflow-wrap: anywhere; white-space: pre-wrap; }
+.align-row .cell-kind { font-size: 12px; font-weight: 600; }
+.align-row .cell-path { color: var(--muted); }
+.align-row .cell-old, .align-row .cell-new { min-width: 0; }
+/* 只有一侧有取值的行：空的那一列写灰字，不留看不懂的空白 */
+.align-row.add .cell-old, .align-row.remove .cell-new { color: var(--muted); }
+
+/* 新增绿 / 修改黄 / 删除红：整行淡色底 + 左侧色条 + 状态字同色 */
+.align-row.add { border-left-color: var(--ok); background: var(--add-bg); }
+.align-row.add .cell-kind { color: var(--ok); }
+.align-row.modify { border-left-color: var(--warn); background: var(--mod-bg); }
+.align-row.modify .cell-kind { color: var(--warn); }
+.align-row.remove { border-left-color: var(--bad); background: var(--del-bg); }
+.align-row.remove .cell-kind { color: var(--bad); }
+
+/* 表头行不抢视觉：没有底色和色条 */
+.align-row.head { background: transparent; border: none; padding: 0 8px; }
+.align-row.head span { color: var(--muted); font-size: 12px; }
+
+/* 颜色口径写在页面上 */
+.diff-legend { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 6px 0 8px; font-size: 12px; }
+.diff-legend .legend { display: inline-flex; align-items: center; gap: 6px; }
+.diff-legend .legend::before { content: ""; width: 12px; height: 12px; border-radius: 4px; }
+.diff-legend .legend.add { color: var(--ok); }
+.diff-legend .legend.add::before { background: var(--ok); }
+.diff-legend .legend.modify { color: var(--warn); }
+.diff-legend .legend.modify::before { background: var(--warn); }
+.diff-legend .legend.remove { color: var(--bad); }
+.diff-legend .legend.remove::before { background: var(--bad); }
+
+/* 窄屏：位置自己占一行，原值与新值仍然并排对得齐 */
+@media (max-width: 720px) {
+  .align-row { grid-template-columns: 56px minmax(120px, 1fr) minmax(120px, 1fr); }
+  .align-row .cell-path { grid-column: 2 / -1; }
+  /* 显式指定列：否则自动摆放会把「原值」放回第一列，整行就歪了 */
+  .align-row .cell-old { grid-column: 2; }
+  .align-row .cell-new { grid-column: 3; }
+}
+
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.inline-form { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.muted { color: var(--muted); }
+.foot { color: var(--muted); padding: 12px 18px; border-top: 1px solid var(--line); display: flex; gap: 16px; flex-wrap: wrap; }

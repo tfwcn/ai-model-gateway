@@ -5,6 +5,27 @@
 #     - "modelscope"
 #     - "openrouter"
 
+# 透传接口示例：把 /proxy/example-service/** 原样转发到上游
+# 客户端请求 /proxy/example-service/assets/render 会转发到
+# https://api.example.com/v1/assets/render
+# passthrough:
+#   example-service:
+#     enabled: true
+#     prefix: "/proxy/example-service"
+#     upstream: "https://api.example.com/v1"
+#     apiKey: "${EXAMPLE_PLATFORM_API_KEY}"
+#     timeout: 300
+#     connect_timeout: 10
+#     forward_headers:
+#       - "x-request-id"
+#     extra_headers:
+#       X-API-Version: "2026-01-01"
+#     # 键名就是汇总时的分组名；model 会覆盖默认的“路由名”
+#     dimensions:
+#       model: "body.model"
+#       size: "body.size"
+#       quality: "body.quality"
+
 # ModelScope 免费模型配置示例
 # 使用网页爬虫从 modelscope.cn 获取热门免费模型列表
 modelscope:
@@ -28,7 +49,7 @@ modelscope:
       enable_tool_capability_test: true
       max_concurrent_tests: 1 # 串行测试，避免限流
       test_timeout_seconds: 60
-  models: [] # 静态配置的模型（可选）
+  models: [] # 静态配置的模型（可选）：可写字符串，也可写对象做模型级覆盖（见文件末尾说明）
   # 黑名单：爬虫抓取但无法使用的模型，支持 * 通配符匹配
   # 示例：
   #   - "Qwen/Qwen2.5-7B-Instruct"  # 精确匹配
@@ -39,6 +60,8 @@ modelscope:
   enabled: true
   quota_period: "daily" # 每日额度刷新
   retry_count: 3 # 单个模型调用失败时的重试次数，默认3次
+  # connect_timeout: 5 # 连接建立超时（DNS+TCP+TLS），默认取全局配置
+  # first_chunk_timeout: 20 # 首块预算，超时即切换模型，默认取全局配置
 
 # openai:
 #   baseUrl: "https://api.openai.com/v1"
@@ -140,3 +163,25 @@ nvidia:
 #   enabled: true
 #   retry_count: 1 # 本地模型无需重试，设为1
 #   # 无quota_period配置，表示无额度限制，始终可用
+
+# ===== 模型级配置（可选）=====
+# models 列表支持两种写法，可混用：
+#   1) 字符串：只声明模型，参数全部继承平台级配置
+#   2) 对象：声明模型（name/model）+ 覆盖部分参数
+# 可覆盖字段：timeout / weight / enabled / quota_period / retry_count /
+#             stream_probe_timeout / connect_timeout / first_chunk_timeout /
+#             enable_tool_call_conversion
+# 连接信息（baseUrl / apiKey）不允许在模型级别覆盖，始终来自平台配置。
+#
+# 示例：同一平台里给慢模型更宽的首块预算，给不稳定模型更激进的预算
+# example-platform:
+#   baseUrl: "https://api.example.com/v1"
+#   apiKey: "${EXAMPLE_PLATFORM_API_KEY}"
+#   timeout: 120
+#   connect_timeout: 5
+#   first_chunk_timeout: 20        # 平台级默认：首块超过 20s 就切下一个模型
+#   models:
+#     - "model-a"                  # 继承上面的 20s
+#     - name: "model-b"            # 该模型首块更慢，单独放宽到 45s
+#       first_chunk_timeout: 45
+#       retry_count: 1

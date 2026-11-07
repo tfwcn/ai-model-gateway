@@ -15,7 +15,45 @@
 
 🌐 Languages: [中文](README.md) | [English](README_EN.md)
 
-**[快速开始](#-快速开始)** · **[API 参考](#-api-参考)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[监控运维](docs/MONITORING.md)** · **[贡献指南](#-贡献指南)**
+**[快速开始](#-快速开始)** · **[管理台](#-管理台)** · **[API 参考](#-api-参考)** · **[配置指南](docs/CONFIGURATION_GUIDE.md)** · **[监控运维](docs/MONITORING.md)** · **[贡献指南](#-贡献指南)**
+
+---
+
+## 🖥️ 管理台
+
+装好并启动服务后，先开管理台：平台权重、模型超时、黑名单、用户密钥都能在网页里点完，**不用手写 `models.yaml`**。
+
+```text
+http://localhost:8000/admin/ui/     # 打开后输入 GATEWAY_API_KEY 连接
+```
+
+五个标签页：用量与性能、审计明细、用户密钥、模型配置、备份与回滚。
+纯静态页面（无构建、无外部依赖），密钥只存在浏览器 `sessionStorage`；**密钥内容永不下发**，配置视图只给出它引用的环境变量名与是否已设置。
+
+| 想做的事 | 在管理台怎么点 |
+| --- | --- |
+| 改平台权重、模型超时、黑名单 | 「模型配置」页直接编辑；写盘前自动备份，可随时回滚 |
+| 让改动生效 | 保存后点重载，进程内生效；新增/删除平台这类结构变化才需要自行重启 |
+| 给用户发密钥 | 「用户密钥」页填写标签即可生成，流量按用户单独统计 |
+| 看谁用了多少、慢在哪里 | 「用量与性能」按用户 / 模型 / 时间维度聚合 |
+
+**用户级密钥**：`GATEWAY_API_KEY` 是管理台密钥；给不同用户单独发密钥时，打开「用户密钥」页填写标签并生成。
+密钥在 SQLite 里加密保存，可用 `POST /admin/users/key` 按用户名取回。每把用户密钥只能访问 `/v1/*` 与 `/proxy/*`，
+流量会记到对应用户标签上，可在「用量与性能」按用户聚合，或在命令行用 `--user` 过滤。
+
+数据面也支持管理密钥 + 用户名 header：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H "X-Gateway-User: user-a" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "all", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+用户名不存在时会自动创建用户和密钥，然后正常转发并记账。
+
+> 不方便开浏览器时，`manage.py` 提供等价能力，详见 [🖥️ 管理台前端](docs/ADMIN_UI.md) 与 [⌨️ 命令行管理工具](docs/CONFIG_CLI.md)。
 
 ---
 
@@ -37,7 +75,7 @@
 - 🛡️ **智能错误分类**：7 种错误类型精细化处理，区分可重试/不可重试
 - 🔧 **工具调用格式转换**：自动将非标准 tool call 格式（NVIDIA JSON、Minimax XML）转换为标准 OpenAI 格式
 - 📡 **OpenAI Responses API**：支持 `/v1/responses` 协议转换（含流式）
-- 🔑 **Bearer Token 认证**：可选 `GATEWAY_API_KEY` 保护所有接口
+- 🔑 **管理密钥 + 用户级密钥**：`GATEWAY_API_KEY` 连接管理台，用户密钥按用户统计流量
 - 📊 **Prometheus 监控**：实时监控请求量、延迟、错误率
 - 🚀 **零客户端改造**：完全兼容 OpenAI API
 
@@ -50,12 +88,17 @@
 | **流式工具调用缓冲**     | 智能缓冲检测流式响应中的非标准工具调用，零延迟切换                           |
 | **工具能力测试**         | 新增模型时自动测试 tool call 能力，只保留真正支持的模型                      |
 | **模型重试机制**         | 单模型支持多次重试（可配置 `retry_count`），基于错误类型智能重试             |
+| **首块预算 & 故障转移**  | 首块超过预算（默认 20s，`first_chunk_timeout`）即切换模型，避免连接卡死干等  |
 | **模型别名 & 黑名单**    | `all_aliases` 支持多别名，`blacklist` 支持 `*` 通配符过滤                    |
-| **GATEWAY_API_KEY 认证** | 可选 Bearer Token 认证保护所有 API 接口                                      |
+| **GATEWAY_API_KEY 认证** | 管理密钥保护 `/admin/*` 与 `/metrics`，密码永不下发                     |
+| **用户级密钥**           | 管理台可视化新增/删除用户密钥，按用户统计请求量、tokens 与失败率           |
 | **Redis 缓存 & 会话**    | 响应缓存 + Responses API 会话历史，Redis 不可用时自动降级为文件              |
 | **SSE 事件标准化**       | 统一 SSE 格式，消除多端点重复代码                                            |
 | **错误分类系统**         | 7 种错误类型（超时/连接/认证/限流/服务器/格式/模型），精细控制重试和禁用策略 |
 | **SKIP_PLUGIN_SCRAPER**  | 跳过插件爬虫直接使用缓存，适合离线环境或加速启动                             |
+| **用量与性能审计**   | 一次上游尝试一行：成功率、P95 耗时、首块耗时、tokens/s、故障转移链、错误分类 |
+| **任意接口透传**     | `/proxy/<route>/**` 原样转发到上游，复用用户鉴权与审计；参数可声明为汇总维度 |
+| **管理台 & 命令行**  | `/admin/ui/` 网页与 `manage.py` 都能看审计、改模型配置（保留 YAML 注释）     |
 | **Docker 一键部署**      | 内置 Redis、Playwright，开箱即用的容器化部署方案                             |
 
 ### 对比传统方案
@@ -95,6 +138,8 @@ nano .env  # 填入你的 API 密钥（可选设置 GATEWAY_API_KEY 开启认证
 
 详细配置请参考：[📖 配置指南](docs/CONFIGURATION_GUIDE.md)
 
+> 不想手写配置？按默认 `models.yaml` 启动后，用 [🖥️ 管理台](#-管理台)在网页里增删平台、改权重与超时。
+
 ### 3️⃣ 启动
 
 直接运行（默认端口 8000）：
@@ -103,11 +148,12 @@ nano .env  # 填入你的 API 密钥（可选设置 GATEWAY_API_KEY 开启认证
 python run.py
 ```
 
-或使用启动脚本（自动管理 Redis 和虚拟环境，默认端口 8100）：
+或使用启动脚本（自动加载 `.env`、管理 Redis 和虚拟环境）：
 
 ```bash
-bash start.sh          # 默认端口 8100
-bash start.sh --port 8000  # 指定端口
+bash start.sh          # 读取 .env；PORT 未设置时默认 8000
+bash start.sh --port 8000  # 命令行参数优先于 .env
+ENV_FILE=/etc/gateway.env bash start.sh  # 指定别的环境变量文件
 ```
 
 也可通过环境变量指定端口：
@@ -151,9 +197,15 @@ curl http://localhost:8000/v1/responses \
 | `/v1/chat/completions` | POST | OpenAI Chat Completions（需认证）         |
 | `/v1/responses`        | POST | OpenAI Responses API（需认证）            |
 | `/v1/models`           | GET  | 获取可用模型列表（支持筛选/分页，需认证） |
-| `/health`              | GET  | 基本健康检查（免认证）                    |
+| `/health`              | GET/POST | 基本健康检查（免认证）                 |
 | `/health/detailed`     | GET  | 详细健康检查                              |
-| `/metrics`             | GET  | Prometheus 监控指标                       |
+| `/metrics`             | POST/GET | Prometheus 监控指标（需管理密钥；GET 供抓取） |
+| `/admin/usage/*`       | POST | 用量与性能聚合（含永久维度日汇总，需管理密钥） |
+| `/admin/audit*`        | POST | 审计明细与故障转移链（需管理密钥）            |
+| `/proxy/<route>/**`    | 任意 | 透传第三方接口（需网关密钥；上游鉴权由配置决定） |
+| `/admin/config/*`      | POST | 配置读取、预演、写盘、回滚（需管理密钥）      |
+| `/admin/users*`        | POST | 用户密钥新增、查询、删除（需管理密钥）        |
+| `/admin/ui/`           | GET  | 管理台前端（静态壳免密钥，数据接口仍需密钥）  |
 
 ### 模型选择策略
 
@@ -288,8 +340,13 @@ OPENROUTER_API_KEY=your-openrouter-api-key
 NVIDIA_API_KEY=your-nvidia-api-key
 OPENAI_API_KEY=your-openai-api-key
 
-# Gateway 认证（可选，为空则跳过）
+# Gateway 管理密钥（连接管理台 /admin/* 与 /metrics；为空则管理接口关闭）
 GATEWAY_API_KEY=your-gateway-api-key
+
+# 用户级密钥库（用户密钥在管理台「用户密钥」页新增/删除）
+# API_KEYS_DB_PATH=data/api_keys.db
+# 用户密钥加密密钥（支持按用户名取回；为空时回退使用 GATEWAY_API_KEY）
+# API_KEYS_ENCRYPTION_KEY=your-random-encryption-secret
 
 # Redis 配置（可选，Responses API 会话管理）
 REDIS_URL=redis://localhost:6379
@@ -302,6 +359,41 @@ RESPONSES_SESSION_TTL=86400
 # DEBUG=true                     # 启用 DEBUG 级别日志（默认 INFO）
 # ENABLE_CONSOLE_LOGS=false      # 禁用控制台输出（默认 true）
 # LOG_DIR=logs                   # 日志目录（默认 logs/）
+
+# 流式响应心跳（可选）：上游首个 token 前的静默期，每隔该秒数下发一条 SSE 注释
+# 设为 0 可关闭心跳
+# SSE_KEEPALIVE_INTERVAL=1.0
+
+# [DONE] 收尾窗口（可选）：转发完终止标记 [DONE] 之后，还为「可能跟在后面的 usage 尾片」多等这么多秒；
+# 到期即收尾并释放上游连接。审计据此把「[DONE] 已发完后客户端才关闭」记为 success，而不是客户端中断
+# SSE_DONE_DRAIN_TIMEOUT=0.5
+
+# 流探超时（可选）：探测上游是否返回有效内容的最长等待秒数
+# STREAM_PROBE_TIMEOUT=8
+
+# 首块预算（可选）：从发起请求到「响应头 + 首个有效内容」的最长等待秒数，
+# 超出即放弃当前模型并执行故障转移（覆盖 DNS/TCP/TLS、上游排队与等响应头）
+# STREAM_FIRST_CHUNK_TIMEOUT=20
+
+# 连接建立超时（可选）：只覆盖 DNS + TCP + TLS，避免连接卡死吃掉整个 timeout
+# STREAM_CONNECT_TIMEOUT=5
+
+# 首块耗时告警阈值（可选）：统计日志中首块超过该值会额外打一条 WARNING
+# SLOW_FIRST_CHUNK_WARNING=15
+
+# 审计与用量统计（可选）：一次上游尝试一行，写入 SQLite
+# 优先级：默认值 < 这里的 AUDIT_* < models.yaml 顶层 audit: 段
+# AUDIT_ENABLED=true                  # 总开关，关闭后转发热路径零开销
+# AUDIT_DB_PATH=data/audit.db         # 审计库路径
+# AUDIT_RETENTION_DAYS=30             # 审计明细保留天数（启动时与运行中定期清理）；全量日用量永久保留
+# AUDIT_RECORD_FAILED_ONLY=false      # 只记失败尝试，省磁盘但看不到用量
+# AUDIT_PROMETHEUS=true               # 审计落库时同步喂 Prometheus
+
+# 管理接口与管理台（/admin/* 与 /metrics 都需要 GATEWAY_API_KEY）
+# ADMIN_UI_ENABLED=true               # 管理台前端 /admin/ui，false 则返回 404
+# CONFIG_API_ENABLED=true             # 配置读写接口 /admin/config/*，false 则不提供
+# CONFIG_BACKUP_DIR=data/config_backups   # 每次写盘前的自动备份目录
+# MODEL_CONFIG_FILE=models.yaml       # 命令行默认读取的配置文件
 ```
 
 ### 平台配置示例
@@ -315,6 +407,8 @@ modelscope:
   enabled: true
   quota_period: "daily"       # 额度刷新周期
   retry_count: 3              # 单模型重试次数
+  connect_timeout: 5          # 连接建立超时（DNS+TCP+TLS），默认取全局配置
+  first_chunk_timeout: 20     # 首块预算，超时即故障转移，默认取全局配置
   plugin:                     # 插件配置（可选）
     code: "plugin.modelscope"
     cache_timeout: 3600       # 模型列表缓存时间（秒）
@@ -329,6 +423,29 @@ modelscope:
     - "iic/*"
   models: []                  # 静态模型列表（可选）
 ```
+
+### 模型级配置覆盖
+
+`models` 列表支持两种写法，可混用：字符串表示继承平台配置，对象表示只覆盖指定字段。
+
+```yaml
+example-platform:
+  baseUrl: "https://api.example.com/v1"
+  apiKey: "${EXAMPLE_PLATFORM_API_KEY}"
+  timeout: 120
+  connect_timeout: 5
+  first_chunk_timeout: 20          # 平台级默认：首块超过 20s 就切下一个模型
+  models:
+    - "model-a"                    # 继承平台级的 20s
+    - name: "model-b"              # 该模型首块更慢，单独放宽到 45s
+      first_chunk_timeout: 45
+      retry_count: 1
+```
+
+- 可覆盖字段：`timeout`、`weight`、`enabled`、`quota_period`、`retry_count`、`stream_probe_timeout`、`connect_timeout`、`first_chunk_timeout`、`enable_tool_call_conversion`
+- 连接信息（`baseUrl` / `apiKey`）**不允许**在模型级别覆盖，始终来自平台配置；写了只告警不生效
+- 取值优先级：**模型级 > 平台级 > 环境变量默认值**，且 `connect_timeout` / `first_chunk_timeout` 不会超过该模型的 `timeout`
+- 插件动态发现的模型若在 `models` 里再次声明，按模型名去重（不会重复调用），静态声明中的覆盖优先生效
 
 ### 工具调用能力测试
 
@@ -349,6 +466,44 @@ modelscope:
 
 ---
 
+## 📊 观测与管理
+
+网关的每一次上游调用都会记一行审计（默认写入 `data/audit.db`），用来回答「谁被用了多少、慢在哪里、为什么失败」。
+
+统计口径：**一次客户端请求 = 一个 `gateway_request_id`，每次上游尝试 = 一行**，因此可以完整还原故障转移链。
+成功率只统计已收尾的尝试（`finalized=1`），正在转发的流式请求记为 `stream_open`，不进分母。
+
+保留策略分开：**审计明细默认保留 30 天**（用于下钻排障），**全量日用量永久保留**（按日期 + 用户累加输入 / 缓存 / 输出 tokens），
+所以清理明细不会把历史用量一起删掉。日汇总是独立的 `usage_daily` 表，查询接口是 `POST /admin/usage/daily`。
+管理台的入口、五个标签页与密钥用法见上文 [🖥️ 管理台](#-管理台)；`/admin/*` 与 `/metrics` 都要求 `GATEWAY_API_KEY`。
+
+### 命令行
+
+```bash
+# 看用量与性能
+python manage.py usage summary --group-by model --since 7d
+python manage.py usage summary --group-by user --since 30d   # 按用户统计流量
+python manage.py usage daily --since 90d                     # 全量日用量：输入/缓存/输出 tokens
+python manage.py usage models --sort p95              # 谁最慢
+python manage.py usage attempts --outcome failure     # 只看失败的尝试
+python manage.py usage chain <gateway_request_id>     # 还原整条故障转移链
+
+# 看与改配置（写盘前先备份，--dry-run 先看行级差异）
+python manage.py config document
+python manage.py platform set example-platform --field weight --value 5 --dry-run
+python manage.py model set example-platform model-a --field first_chunk_timeout --value 45
+python manage.py config backups
+python manage.py config rollback models.yaml.20260101T000000Z.bak
+```
+
+改配置有三种等价做法：管理台页面、`manage.py`、直接编辑 `models.yaml`。
+后两种改完之后，调用 `POST /admin/config/reload`（带 `GATEWAY_API_KEY`）即可进程内生效；
+涉及新增/删除平台、插件结构变化的改动**需要你自行重启服务**，网关永远不会自行重启。
+
+详见 [🧾 审计与用量统计](docs/AUDIT.md)、[🖥️ 管理台前端](docs/ADMIN_UI.md)、[⌨️ 命令行管理工具](docs/CONFIG_CLI.md)。
+
+---
+
 ## 📖 详细文档
 
 ### 配置与部署
@@ -360,6 +515,11 @@ modelscope:
 
 ### 高级功能
 
+- [🧾 审计与用量统计](docs/AUDIT.md)
+- [🔀 透传接口与维度用量](docs/PASSTHROUGH.md)
+- [🖥️ 管理台前端](docs/ADMIN_UI.md)
+- [⌨️ 命令行管理工具](docs/CONFIG_CLI.md)
+- [📡 管理接口契约](web/API.md)
 - [📊 监控与运维](docs/MONITORING.md)
 - [⚡ 负载均衡策略](docs/LOAD_BALANCING.md)
 - [🛡️ 错误分类系统](docs/error-classification.md)

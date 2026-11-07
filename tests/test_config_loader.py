@@ -196,6 +196,112 @@ class TestConfigLoaderLoadConfig:
                 assert model.weight == 1  # 默认值
                 assert model.enabled is True  # 默认值
 
+    async def test_model_level_overrides(self):
+        """模型条目可写成对象，按字段覆盖平台级配置"""
+        config_data = {
+            'example-platform': {
+                'baseUrl': 'https://api.example.com/v1',
+                'apiKey': 'test-key',
+                'timeout': 120,
+                'retry_count': 2,
+                'connect_timeout': 5,
+                'first_chunk_timeout': 20,
+                'models': [
+                    'fast-model',
+                    {
+                        'name': 'slow-model',
+                        'first_chunk_timeout': 45,
+                        'connect_timeout': 8,
+                        'retry_count': 1,
+                    },
+                ],
+            }
+        }
+
+        with patch('builtins.open', mock_open(read_data=yaml.dump(config_data))):
+            with patch('os.path.exists') as mock_exists:
+                mock_exists.return_value = True
+
+                loader = ConfigLoader('test.yaml')
+                result = await loader.load_config()
+
+                fast, slow = result['example-platform']
+                # 字符串写法：完整继承平台级配置
+                assert (fast.model, fast.first_chunk_timeout, fast.connect_timeout, fast.retry_count) == ('fast-model', 20, 5, 2)
+                # 对象写法：逐字段覆盖，未覆盖的仍继承平台级
+                assert (slow.model, slow.timeout) == ('slow-model', 120)
+                assert slow.first_chunk_timeout == 45
+                assert slow.connect_timeout == 8
+                assert slow.retry_count == 1
+
+    async def test_model_entry_rejects_connection_overrides(self):
+        """模型级别不允许覆盖连接信息，baseUrl/apiKey 始终来自平台"""
+        config_data = {
+            'stable': {
+                'baseUrl': 'https://real.api.com/v1',
+                'apiKey': 'real-key',
+                'models': [
+                    {'name': 'm1', 'baseUrl': 'https://other.api.com/v1', 'apiKey': 'other-key', 'timeout': 45},
+                ],
+            }
+        }
+
+        with patch('builtins.open', mock_open(read_data=yaml.dump(config_data))):
+            with patch('os.path.exists') as mock_exists:
+                mock_exists.return_value = True
+
+                loader = ConfigLoader('test.yaml')
+                result = await loader.load_config()
+
+                model = result['stable'][0]
+                assert model.base_url == 'https://real.api.com/v1'
+                assert model.api_key == 'real-key'
+                assert model.timeout == 45
+
+    async def test_plugin_and_static_models_deduplicated(self):
+        """插件模型与静态模型同名时不重复，且静态覆盖生效"""
+        config_data = {
+            'openrouter': {
+                'baseUrl': 'https://openrouter.ai/api/v1',
+                'apiKey': 'test-key',
+                'plugin': {'code': 'plugin.openrouter', 'args': {'model_list_method': 'GET'}},
+                'models': [{'name': 'model1:free', 'first_chunk_timeout': 30}],
+            }
+        }
+
+        with patch('builtins.open', mock_open(read_data=yaml.dump(config_data))):
+            with patch('os.path.exists') as mock_exists:
+                mock_exists.return_value = True
+
+                loader = ConfigLoader('test.yaml')
+                with patch.object(loader.plugin_manager, 'load_plugin_models') as mock_plugin_mgr:
+                    mock_plugin_mgr.return_value = ['model1:free', 'model2:free']
+                    result = await loader.load_config()
+
+                models = result['openrouter']
+                assert [m.model for m in models] == ['model1:free', 'model2:free']
+                assert models[0].first_chunk_timeout == 30
+
+    async def test_blacklist_applies_to_object_entries(self):
+        """黑名单对对象写法的模型条目同样生效"""
+        config_data = {
+            'platform': {
+                'baseUrl': 'https://test.api.com/v1',
+                'apiKey': 'test-key',
+                'models': [{'name': 'keep/model'}, {'name': 'drop/model'}],
+                'blacklist': ['drop/*'],
+            }
+        }
+
+        with patch('builtins.open', mock_open(read_data=yaml.dump(config_data))):
+            with patch('os.path.exists') as mock_exists:
+                mock_exists.return_value = True
+
+                loader = ConfigLoader('test.yaml')
+                result = await loader.load_config()
+
+                assert [m.model for m in result['platform']] == ['keep/model']
+
 
 class TestConfigLoaderIntegration:
     """配置加载器集成测试"""

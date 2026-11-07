@@ -2,12 +2,71 @@
 
 set -e  # 如果任何命令失败，则立即退出
 
-# 默认值
-HOST="0.0.0.0"
-PORT="${PORT:-8000}"  # 优先使用环境变量 PORT，默认 8000
+# 固定工作目录：容器里是 /app，本地就是脚本启动时的目录
+if [ -d "/app" ]; then
+    cd /app
+fi
+APP_PATH="$(pwd)"
+VENV_PATH="$APP_PATH/.venv"
+
+# 只把合法的 shell 变量名导出到当前进程；像 1EXAMPLE_API_KEY 这种数字开头的名字
+# shell 无法 export，但 Python 的 load_dotenv() 仍会从 .env 读到它。
+load_env_file() {
+    local file="$1"
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        # 去掉首尾空白
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        # 支持 export KEY=VALUE 写法
+        if [[ "$line" == export[[:space:]]* ]]; then
+            line="${line#export}"
+            line="${line#"${line%%[![:space:]]*}"}"
+        fi
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        # KEY = value 这种写法：等号后允许有空白
+        value="${value#"${value%%[![:space:]]*}"}"
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "跳过无法导出的变量: $key（Python 仍会从 .env 读取）"
+            continue
+        fi
+        # 去掉成对的引号；未加引号时允许行尾注释：PORT=8000 # 注释
+        if [[ "$value" == \"*\" ]]; then
+            value="${value:1}"
+            value="${value%%\"*}"
+        elif [[ "$value" == \'*\' ]]; then
+            value="${value:1}"
+            value="${value%%\'*}"
+        else
+            value="${value%%#*}"
+            value="${value%"${value##*[![:space:]]}"}"
+        fi
+        export "$key=$value"
+    done < "$file"
+}
+
+# 先加载 .env，再解析命令行参数：
+# - shell 里的 PORT / HOST / 密钥等与 Python 进程看到的一致
+# - 命令行 --host / --port 仍然优先于 .env
+ENV_FILE="${ENV_FILE:-$APP_PATH/.env}"
+if [ -f "$ENV_FILE" ]; then
+    load_env_file "$ENV_FILE"
+    echo "已加载环境变量: $ENV_FILE"
+else
+    echo "未找到 .env（$ENV_FILE），使用当前环境变量与默认值"
+fi
+
+# 默认值（.env 已设置时以 .env 为准）
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"  # 优先使用 .env / 环境变量 PORT，默认 8000
 RELOAD=false
 
-# 解析命令行参数
+# 解析命令行参数（优先级最高）
 while [[ $# -gt 0 ]]; do
     case $1 in
         --host)
@@ -29,14 +88,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-if [ -d "/app" ]; then
-    cd /app
-fi
-
-# 设置虚拟环境路径
-VENV_PATH="$(pwd)/.venv"
-APP_PATH="$(pwd)"
 
 echo "检查虚拟环境是否存在..."
 

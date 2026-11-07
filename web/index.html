@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Model Gateway 管理台</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">GW</span>
+      <span class="title">AI Model Gateway 管理台</span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab" data-view="usage">用量与性能</button>
+      <button class="tab" data-view="audit">审计明细</button>
+      <button class="tab" data-view="users">用户密钥</button>
+      <button class="tab" data-view="config">模型配置</button>
+      <button class="tab" data-view="backups">备份与回滚</button>
+    </nav>
+    <form class="keybox" id="keybox">
+      <label for="apikey">管理密钥</label>
+      <input id="apikey" type="password" placeholder="GATEWAY_API_KEY" autocomplete="off">
+      <button type="submit">连接</button>
+    </form>
+  </header>
+
+  <main id="main">
+    <section class="notice" id="notice" hidden></section>
+    <div id="view"></div>
+  </main>
+
+  <footer class="foot">
+    <span>本页面只读取与改写配置，密钥内容永不下发到浏览器。</span>
+    <span id="build-info"></span>
+  </footer>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
