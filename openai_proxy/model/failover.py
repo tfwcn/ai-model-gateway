@@ -719,15 +719,18 @@ class ModelFailoverManager:
                     f"模型 {model_config.name} 第 {attempt}/{max_retries} 次尝试失败: {error_summary}"
                 )
 
-                # 如果错误分类建议禁用模型，则禁用
+                # 如果错误分类建议禁用模型，则按配额情况处理
+                # 说明：仅配置了 quota_period 的模型才视为额度耗尽，需持久禁用并直接返回；
+                # 未配置 quota_period 时（如纯速率限制 429），只做本次请求内重试，不直接跳出。
                 if classified_error.should_disable_model:
                     if model_config.quota_period is not None:
                         logger.warning(
                             f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）"
                         )
                         await self.model_state_manager.disable_model_for_period(model_config)
-                    # 配置了 quota_period 的模型禁用后不再重试
-                    return {"success": False, "error": classified_error.message, "data": None}
+                        # 配置了 quota_period 的模型禁用后不再重试
+                        return {"success": False, "error": classified_error.message, "data": None}
+                    # 未配置 quota_period：落到下面的可重试判断，继续重试
 
                 # 如果错误不可重试，直接返回失败
                 if not classified_error.is_retryable:
