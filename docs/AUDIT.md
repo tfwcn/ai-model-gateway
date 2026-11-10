@@ -110,6 +110,11 @@ failover_count = 同一请求里 attempt_seq > 1 的尝试数
 
 `P95` / `P50` 用名次近似（`ROW_NUMBER`，SQLite 没有 percentile 函数），只统计已收尾且 `duration_ms` 非空的尝试；没有数据的分组返回 `null`，排序时缺失值一律排最后。
 
+分组的 `tokens/s` 不是把每行的 `throughput` 简单平均，而是
+`SUM(output_tokens) / SUM(duration_ms)`（只取有 usage、输出 token 大于 0、耗时为正的行）。
+单行 `throughput` 也由 `output_tokens` 和该次尝试的真实 `duration_ms` 重算；耗时缺失或为 0 时留空，
+不会用微秒级的统计窗口编出一个几十万 tokens/s 的假速度。
+
 ## 记录哪些字段
 
 表名 `audit_attempts`（SQLite，WAL）：

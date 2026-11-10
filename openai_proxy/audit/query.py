@@ -48,7 +48,12 @@ _SORT_KEYS: Dict[str, tuple] = {
 
 _RELATIVE_RE = re.compile(r"^(\d+)\s*([dhm])$", re.IGNORECASE)
 
-_AGGREGATE_COLUMNS = """
+# 有效吞吐样本：有 usage、产出 token、耗时为正。
+# 旧版本非流式行曾用「提取响应体的耗时」算过 throughput，出现过量级错误的行；
+# 分组聚合时不再信任 throughput 列，直接用 token 总量 / 总耗时重算。
+_THROUGHPUT_SAMPLE = "has_usage = 1 AND output_tokens > 0 AND duration_ms > 0"
+
+_AGGREGATE_COLUMNS = f"""
     COUNT(*) AS attempts,
     COUNT(DISTINCT gateway_request_id) AS requests,
     SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END) AS finalized,
@@ -60,7 +65,11 @@ _AGGREGATE_COLUMNS = """
     AVG(CASE WHEN finalized = 1 THEN duration_ms END) AS avg_duration_ms,
     AVG(ttft_ms) AS avg_ttft_ms,
     AVG(CASE WHEN finalized = 1 THEN probe_ms END) AS avg_probe_ms,
-    AVG(throughput) AS avg_throughput,
+    CASE
+        WHEN SUM(CASE WHEN {_THROUGHPUT_SAMPLE} THEN duration_ms ELSE 0 END) > 0
+        THEN SUM(CASE WHEN {_THROUGHPUT_SAMPLE} THEN output_tokens ELSE 0 END) * 1000.0
+             / SUM(CASE WHEN {_THROUGHPUT_SAMPLE} THEN duration_ms ELSE 0 END)
+    END AS avg_throughput,
     SUM(input_tokens) AS input_tokens,
     SUM(cached_tokens) AS cached_tokens,
     SUM(output_tokens) AS output_tokens,

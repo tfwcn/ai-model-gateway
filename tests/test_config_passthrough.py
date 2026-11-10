@@ -144,7 +144,7 @@ class TestLoader:
         path.write_text(_BASE, encoding="utf-8")
         loader = ConfigLoader(str(path))
 
-        models = await loader.load_config()
+        snapshot = await loader.load_snapshot()
 
-        assert models == {}
-        assert loader.passthrough_config["example-service"]["upstream"] == "https://api.example.com/v1"
+        assert snapshot.models == {}
+        assert snapshot.passthrough["example-service"]["upstream"] == "https://api.example.com/v1"

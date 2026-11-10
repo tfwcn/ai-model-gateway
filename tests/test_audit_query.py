@@ -119,6 +119,33 @@ class TestSummary:
         assert model_a["success_rate"] == pytest.approx(2 / 3, abs=1e-3)
 
     @pytest.mark.unit
+    def test_分组吞吐按总token和总耗时重算(self, tmp_path):
+        """不能直接平均每行 throughput：历史脏行会把整组速度拉到几十万"""
+        store = SqliteAuditStore(str(tmp_path / "audit.db"))
+        store.init_schema()
+        _insert(store, "r1-1", "2026-01-01T10:00:00.000+00:00", "example-platform|model-a", "success",
+                duration_ms=1000, output_tokens=100)
+        _insert(store, "r2-1", "2026-01-01T10:01:00.000+00:00", "example-platform|model-a", "success",
+                duration_ms=3000, output_tokens=300)
+        # 旧版本留下的假速度与零耗时行都不应该参与分组吞吐
+        _insert(store, "r3-1", "2026-01-01T10:02:00.000+00:00", "example-platform|model-a", "success",
+                duration_ms=1000, output_tokens=200)
+        store._conn.execute(
+            "UPDATE audit_attempts SET throughput = 999999, duration_ms = 0 WHERE attempt_key = 'r3-1'"
+        )
+        store._conn.execute("UPDATE audit_attempts SET throughput = 999999 WHERE attempt_key != 'r3-1'")
+        store._conn.commit()
+
+        result = UsageQueryService(store).summary(group_by="model", since="2026-01-01")
+
+        item = {row["bucket"]: row for row in result["items"]}["example-platform|model-a"]
+        # (100 + 300) tokens / (1 + 3) 秒 = 100 tokens/s
+        assert item["avg_throughput"] == pytest.approx(100.0, abs=0.01)
+        assert item["output_tokens"] == 600
+
+        store.close()
+
+    @pytest.mark.unit
     def test_未收尾的流不计入成功率(self, queries):
         result = queries.summary(group_by="model", since="2026-01-01")
 

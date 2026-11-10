@@ -46,7 +46,7 @@ python manage.py usage summary --config /etc/gateway/models.yaml
 ```bash
 --dry-run      只预演：打印变更与行级差异，绝不写盘
 --note "文本"   写进备份元数据的备注（回滚时靠它认出是哪次改动）
---no-reload    写盘后不尝试进程内重载
+--no-reload    本命令不尝试进程内重载（不会关闭网关侧的配置文件监听）
 ```
 
 ## 退出码
@@ -201,9 +201,8 @@ example-platform|model-a  2   2   50.0%   0   130   1,000  1,000  42.50     400
 `manage.py` 直接读写配置文件，**不会也不该去重启别人的进程**。写盘成功后命令会提示：
 
 ```text
-提示：如果网关正在运行，让改动立即生效有两种做法：
-  1) 调用管理接口 POST /admin/config/reload（带 GATEWAY_API_KEY）
-  2) 自行重启网关进程
+提示：如果网关正在运行，默认会自动监听到 models.yaml 的变化并热重载；
+      也可以手动调用 POST /admin/config/reload，或自行重启网关进程。
 ```
 
 ```bash
@@ -211,10 +210,10 @@ curl -X POST -H "Authorization: Bearer $GATEWAY_API_KEY" \
   http://localhost:8000/admin/config/reload
 ```
 
-- 平台级/模型级参数、别名、`audit:` 段：进程内重载即可生效；
-- 新增/删除平台、改 `plugin` 结构：命令会标记「需要你自行重启服务」，进程内重载做不到。
+- 平台级/模型级参数、别名、`passthrough:` 段：进程内重载即可生效；
+- `audit:` 段、新增/删除平台、改 `plugin` 结构：命令会标记「需要你自行重启服务」，进程内重载做不到。
 
-服务本身永远不会自行重启。
+服务本身永远不会自行重启。监听默认开启；不需要时用 `CONFIG_WATCH_ENABLED=false` 关闭。
 
 ## 脚本里怎么用
 

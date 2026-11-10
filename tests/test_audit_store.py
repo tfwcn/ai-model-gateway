@@ -172,6 +172,28 @@ class TestSchemaMigration:
         upgraded.close()
 
     @pytest.mark.unit
+    def test_重算历史tokens每秒(self, tmp_path):
+        """旧版本把提取响应体的耗时当成请求耗时，迁移后按真实 duration_ms 重算"""
+        path = str(tmp_path / "audit.db")
+        legacy = SqliteAuditStore(path)
+        legacy.init_schema()
+        legacy.insert_many([_row("req1-1")])
+        legacy._conn.execute(
+            "UPDATE audit_attempts SET duration_ms = 1000, output_tokens = 200, "
+            "has_usage = 1, throughput = 999999 WHERE attempt_key = 'req1-1'"
+        )
+        legacy._conn.execute("PRAGMA user_version = 6")
+        legacy._conn.commit()
+        legacy.close()
+
+        upgraded = SqliteAuditStore(path)
+        upgraded.init_schema()
+
+        row = upgraded.query("SELECT duration_ms, output_tokens, throughput FROM audit_attempts")[0]
+        assert row == {"duration_ms": 1000, "output_tokens": 200, "throughput": 200.0}
+        upgraded.close()
+
+    @pytest.mark.unit
     def test_迁移只会执行一次(self, tmp_path):
         upgraded = SqliteAuditStore(self._legacy_db(tmp_path))
         upgraded.init_schema()
@@ -182,7 +204,7 @@ class TestSchemaMigration:
         upgraded.init_schema()
 
         columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(audit_attempts)")}
-        assert version == 6
+        assert version == 7
         assert "done_sent" not in columns
         upgraded.close()
 
@@ -231,7 +253,7 @@ class TestSchemaMigration:
         assert {"input_tokens", "cached_tokens", "output_tokens"} <= columns
         row = upgraded.query("SELECT input_tokens, cached_tokens, output_tokens FROM usage_dimension_daily")[0]
         assert row == {"input_tokens": 100, "cached_tokens": 10, "output_tokens": 20}
-        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 7
         upgraded.close()
 
 

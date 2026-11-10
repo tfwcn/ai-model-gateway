@@ -23,7 +23,8 @@ from openai_proxy.config_store.writer import ConfigWriter
 logger = logging.getLogger(__name__)
 
 # 这些操作无法在进程内生效，必须重启进程
-_RESTART_OPS = ("add_platform", "remove_platform")
+# audit 段只在启动时应用一次（数据库路径/开关/刷盘参数都可能变化），同样按重启处理
+_RESTART_OPS = ("add_platform", "remove_platform", "set_audit_field")
 
 
 class ConfigConflict(Exception):
@@ -53,6 +54,7 @@ class ConfigCommandService:
         backup_dir: str = "data/config_backups",
         reload_callback: Optional[Callable[[], Any]] = None,
         audit_recorder: Optional[Callable[..., bool]] = None,
+        write_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         """
         Args:
@@ -60,11 +62,14 @@ class ConfigCommandService:
             backup_dir: 备份目录
             reload_callback: 写盘后调用的进程内重载函数（由服务层注入）
             audit_recorder: 记录配置变更的回调（写进审计表，可在 /admin/audit 查历史）
+            write_observer: 每次写盘/回滚后的观察回调（服务层用它告诉文件监听「这次已处理」，
+                            避免主动跳过重载后又被监听器自动重载）
         """
         self.config_file = config_file
         self.writer = ConfigWriter(config_file, backup_dir)
         self.reload_callback = reload_callback
         self.audit_recorder = audit_recorder
+        self.write_observer = write_observer
 
     # ---------- 读 ----------
 
@@ -138,8 +143,14 @@ class ConfigCommandService:
             outcome = self.reload_callback() or {}
             summary["reload"] = outcome
             summary["reloaded"] = bool(outcome.get("reloaded"))
+            # 重载器可能发现文件里还有更早提交、但一直没生效的变化（例如 audit 段）
+            if outcome.get("needs_restart"):
+                summary["needs_restart"] = True
+            if outcome.get("message"):
+                summary["message"] = outcome["message"]
 
         self._record(_ops_names(ops), written["version_after"], success=True)
+        self._notify_written(summary)
         return summary
 
     def rollback(self, name: str, reload: bool = True) -> Dict[str, Any]:
@@ -158,11 +169,25 @@ class ConfigCommandService:
             outcome = self.reload_callback() or {}
             result["reload"] = outcome
             result["reloaded"] = bool(outcome.get("reloaded"))
+            if outcome.get("needs_restart"):
+                result["needs_restart"] = True
+            if outcome.get("message"):
+                result["message"] = outcome["message"]
 
         self._record("rollback", f"{name} -> {written['version_after'][:12]}", success=True)
+        self._notify_written(result)
         return result
 
     # ---------- 内部 ----------
+
+    def _notify_written(self, result: Dict[str, Any]) -> None:
+        """通知服务层「这次写盘已经处理过」；观察回调失败不能影响写盘结果"""
+        if self.write_observer is None:
+            return
+        try:
+            self.write_observer(result)
+        except Exception as exc:  # noqa: BLE001 - 观察回调只是协调监听器
+            logger.debug(f"配置写盘观察回调失败: {exc}")
 
     def _require_version(self, version: Optional[str]) -> ConfigDocument:
         """加载文档并做乐观并发检查"""

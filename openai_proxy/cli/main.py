@@ -3,7 +3,7 @@
 
 与网关进程的关系：
 - 命令行直接改配置文件，不会（也不该）去重启别人的进程
-- 如果网关正在运行，改完之后需要调用 POST /admin/config/reload 或自行重启才会生效
+- 网关默认监听 models.yaml，写盘后通常会自动热重载；也可以手动调用 POST /admin/config/reload 或自行重启
 """
 import logging
 import os
@@ -93,8 +93,8 @@ class CliApp:
     def _config_service(self, args) -> ConfigCommandService:
         """构建配置命令服务
 
-        命令行进程不是网关本身，所以不传 reload_callback：写完就是写完，
-        是否让正在运行的网关重载由用户决定。
+        命令行进程不是网关本身，所以不传 reload_callback；
+        正在运行的网关默认会通过文件监听自动热重载，关闭监听时由用户手动调用 reload。
         """
         backup_dir = args.backup_dir or os.getenv("CONFIG_BACKUP_DIR") or "data/config_backups"
         return ConfigCommandService(
@@ -126,9 +126,8 @@ class CliApp:
 
 def _hint_running_service(console: Console) -> None:
     console.line("")
-    console.line("提示：如果网关正在运行，让改动立即生效有两种做法：")
-    console.line("  1) 调用管理接口 POST /admin/config/reload（带 GATEWAY_API_KEY）")
-    console.line("  2) 自行重启网关进程")
+    console.line("提示：网关默认会监听 models.yaml，写盘后通常会自动热重载；")
+    console.line("  也可以手动调用 POST /admin/config/reload（带 GATEWAY_API_KEY），或自行重启网关进程。")
 
 
 def main(argv: Optional[List[str]] = None) -> int:

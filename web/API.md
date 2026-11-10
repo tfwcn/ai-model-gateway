@@ -63,7 +63,7 @@ X-Gateway-User: user-a
 | `/admin/config/plan` | POST | 预演补丁（不写盘） |
 | `/admin/config/apply` | POST | 应用补丁并写盘 |
 | `/admin/config/rollback` | POST | 回滚到指定备份 |
-| `/admin/config/reload` | POST | 进程内重载模型配置 |
+| `/admin/config/reload` | POST | 进程内重载配置 |
 | `/metrics` | POST / GET | Prometheus 文本指标（GET 留给 Prometheus 抓取） |
 
 ## 统计口径
@@ -493,8 +493,8 @@ X-Gateway-User: user-a
 | `add` | 只有新行（`before` 为空） | 绿 |
 | `remove` | 只有旧行（`after` 为空） | 红 |
 
-`needs_restart` 为 `true` 表示改动涉及插件/爬虫结构（`add_platform` / `remove_platform` / `.plugin`），
-必须你自己重启服务。
+`needs_restart` 为 `true` 表示改动涉及插件/爬虫结构（`add_platform` / `remove_platform` / `.plugin`）
+或 `audit:` 段（`set_audit_field`），必须你自己重启服务。
 
 补丁操作一览：
 
@@ -509,7 +509,7 @@ X-Gateway-User: user-a
 | `set_model_field` | `platform`, `model`, `field`, `value` | 模型级覆盖 |
 | `unset_model_field` | `platform`, `model`, `field` | 回落到平台取值 |
 | `set_alias_selectors` | `alias`, `selectors` | 整列表覆盖；别名不存在时会把它建出来。指向不存在的平台只报 warning（爬虫平台的模型是运行时灌入的，所以不校验模型段） |
-| `set_audit_field` | `field`, `value` | 写顶层 `audit:` 段 |
+| `set_audit_field` | `field`, `value` | 写顶层 `audit:` 段；需要重启 |
 | `add_passthrough` | `name`, `config` | 新增透传路由 |
 | `remove_passthrough` | `name` | 删除透传路由 |
 | `set_passthrough_field` | `name`, `field`, `value` | 改透传字段（`dimensions` / `extra_headers` 用对象值） |

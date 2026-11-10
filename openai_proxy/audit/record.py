@@ -179,8 +179,21 @@ class AuditAttempt:
         self.duration_ms = self.elapsed_ms()
         self.outcome = OUTCOME_ABORTED
         self.finalized = True
+        self.refresh_throughput()
 
     # ---------- 用量与性能 ----------
+
+    def refresh_throughput(self) -> None:
+        """
+        用「输出 tokens / 已记录的耗时」重算 tokens/s
+
+        throughput 是派生指标：只要 duration_ms 或 output_tokens 变了就必须重算。
+        耗时缺失或为 0 时保持 None，不能用接近 0 的计时窗口编出一个天文数字。
+        """
+        if not self.output_tokens or not self.duration_ms or self.duration_ms <= 0:
+            self.throughput = None
+            return
+        self.throughput = self.output_tokens * 1000.0 / self.duration_ms
 
     def apply_response(self, response: Any) -> None:
         """从非流式响应体提取 usage（上游没返回 usage 时保持未知，不写 0）"""
@@ -210,8 +223,9 @@ class AuditAttempt:
             self.output_tokens = _int_or_none(stats.get("output_tokens"))
 
         self.output_chars = _int_or_none(stats.get("output_chars"))
-        throughput = stats.get("throughput")
-        self.throughput = float(throughput) if isinstance(throughput, (int, float)) else None
+        # throughput 不从 stats 直接抄：非流式提取没有真实计时窗口，
+        # 统一用已经落库的 duration_ms 与 output_tokens 重算，避免出现天文数字。
+        self.refresh_throughput()
 
         upstream_id = stats.get("upstream_id")
         if isinstance(upstream_id, str) and upstream_id:

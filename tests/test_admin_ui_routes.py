@@ -371,6 +371,14 @@ class TestSourceHygiene:
         assert '"全部展开"' in view and '"全部折叠"' in view, "配置视图缺少批量折叠控件"
 
     @pytest.mark.unit
+    def test_删除模型按钮的回调能拿到stage(self):
+        """按钮回调定义在 modelRows 之外：漏传 stage 会在点击时抛 ReferenceError（模型删不掉）"""
+        fields = open(os.path.join(_WEB, "js", "config_fields.js"), encoding="utf-8").read()
+
+        assert "function removeModelButton(platform, target, stage)" in fields, "删除模型按钮没有接收 stage"
+        assert "removeModelButton(platform, target, stage)" in fields, "调用删除模型按钮时没有把 stage 传进去"
+
+    @pytest.mark.unit
     def test_视图模块之间没有互相调用不存在的函数(self):
         """视图里调用本模块函数前必须先定义（曾经调过已经不存在的 renderTail）"""
         for name, raw in self._js_sources().items():

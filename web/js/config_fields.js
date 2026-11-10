@@ -315,7 +315,8 @@ function modelRows(platform, editables, stage, runtimeNames = []) {
     // 选择与删除放同一行：一眼看出这两个动作针对的是同一个模型（按底边对齐，按钮不会卡在标签与下拉框中间）
     nodes.push(el("div", { class: "control-row" }, [
       control("选择模型", target),
-      removeModelButton(platform, target),
+      // stage 必须显式传进去：按钮的点击回调不在 modelRows 的作用域里
+      removeModelButton(platform, target, stage),
     ]));
     nodes.push(fieldEditor(editables.modelFields, editables.kinds, {
       stage,
@@ -369,7 +370,7 @@ function addModelRow(platform, editables, stage) {
   ]);
 }
 
-function removeModelButton(platform, target) {
+function removeModelButton(platform, target, stage) {
   const node = button("删除选中的模型条目", "ghost");
   node.addEventListener("click", () => stage({ op: "remove_model", platform: platform.name, model: target.value }));
   return node;

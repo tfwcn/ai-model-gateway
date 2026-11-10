@@ -78,6 +78,7 @@ class AttemptRecorder:
         self.attempt.finalized = True
         if self.attempt.duration_ms is None:
             self.attempt.duration_ms = self.attempt.elapsed_ms()
+        self.attempt.refresh_throughput()
         self._submit_finalize()
 
     def _submit_finalize(self) -> None:

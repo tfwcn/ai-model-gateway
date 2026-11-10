@@ -365,7 +365,7 @@ class TestFieldDocs:
         fields = sorted(set(schema.PLATFORM_FIELDS) | set(schema.MODEL_FIELDS) | set(schema.AUDIT_FIELDS))
         missing = [field for field in fields if f"  {field} — " not in out]
         assert not missing, f"命令行没有解释这些字段: {', '.join(missing)}"
-        assert "结构说明" in out and "没有文件监听" in out
+        assert "结构说明" in out and "CONFIG_WATCH_ENABLED" in out
 
     @pytest.mark.unit
     def test_config_fields列出界面下拉里能选的取值(self, capsys, cli_args):

@@ -45,6 +45,15 @@ class ModelFailoverManager:
         # 连接建立超时（秒）：只覆盖 DNS + TCP + TLS，避免连接卡死吃掉整个 timeout
         self.connect_timeout = float(os.getenv("STREAM_CONNECT_TIMEOUT", "5"))
 
+    def replace_models(
+        self,
+        models: Dict[str, List[ModelConfig]],
+        all_aliases: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
+        """热重载时替换模型表与别名，保留下游会话与模型健康状态"""
+        self.models = models
+        self.all_aliases = all_aliases or {}
+
     def _get_probe_timeout(self, model_config: ModelConfig) -> float:
         """获取探测超时：优先使用模型单独配置，否则使用全局配置"""
         if model_config.stream_probe_timeout is not None:

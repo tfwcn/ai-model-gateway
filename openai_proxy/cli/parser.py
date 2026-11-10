@@ -95,7 +95,7 @@ def _add_config_group(parser: argparse.ArgumentParser) -> None:
 
     rollback = _action(actions, "rollback", "回滚到指定备份", "config_rollback")
     rollback.add_argument("name")
-    rollback.add_argument("--no-reload", action="store_true", help="回滚后不尝试进程内重载")
+    parser.add_argument("--no-reload", action="store_true", help="回滚后本命令不尝试进程内重载（不会关闭网关侧监听）")
 
 
 def _add_platform_group(groups) -> None:
@@ -255,7 +255,7 @@ def _add_field(parser: argparse.ArgumentParser) -> None:
 def _add_write(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="只预演，不写盘")
     parser.add_argument("--note", default="", help="写进备份元数据的备注")
-    parser.add_argument("--no-reload", action="store_true", help="写盘后不尝试进程内重载")
+    parser.add_argument("--no-reload", action="store_true", help="写盘后本命令不尝试进程内重载（不会关闭网关侧监听）")
 
 
 def _add_filters(parser: argparse.ArgumentParser) -> None:

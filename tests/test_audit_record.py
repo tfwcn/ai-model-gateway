@@ -8,6 +8,8 @@
 - 隐私约束：审计行不允许出现消息内容字段
 """
 
+import time
+
 import pytest
 
 from openai_proxy.audit.record import (
@@ -135,6 +137,24 @@ class TestUsageStats:
         assert attempt.throughput == 35.0
         assert attempt.upstream_id == "chatcmpl-abc"
         assert attempt.keepalive_count == 3
+
+    @pytest.mark.unit
+    def test_非流式响应用真实耗时计算tokens每秒(self):
+        """非流式提取响应体没有计时窗口，不能用提取耗时冒充请求耗时"""
+        attempt = _attempt(started_at=time.time() - 2)
+
+        attempt.mark_success({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 100,
+                "total_tokens": 110,
+            }
+        })
+
+        assert attempt.duration_ms is not None and 1900 <= attempt.duration_ms <= 2100
+        assert attempt.output_tokens == 100
+        assert attempt.throughput is not None
+        assert 45 <= attempt.throughput <= 55
 
     @pytest.mark.unit
     def test_上游没有usage时保持未知而不是0(self):

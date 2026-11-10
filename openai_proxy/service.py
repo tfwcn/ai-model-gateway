@@ -13,7 +13,9 @@ from openai_proxy.admin_ui import AdminUiStatic
 from openai_proxy.core.api_errors import error_response, install_error_handlers, is_forward_path
 from openai_proxy.core.cache import MemoryCache
 from openai_proxy.models import ModelConfig, list_available_models
-from openai_proxy.core.config_loader import ConfigLoader
+from openai_proxy.core.config_loader import ConfigSnapshot
+from openai_proxy.core.config_manager import ConfigManager, ReloadResult
+from openai_proxy.core.config_watcher import ConfigFileWatcher
 from openai_proxy.model.failover import ModelFailoverManager
 from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
@@ -175,9 +177,8 @@ class OpenAIProxyService:
     """AI Model Gateway 主服务类 - 负责FastAPI应用和路由"""
 
     def __init__(self, config_file: str = "models.yaml"):
-        self.config_loader = ConfigLoader(config_file)
-        # 注意：models 将在异步初始化方法中加载
-        self.models: Dict[str, List[ModelConfig]] = {}
+        # 运行时配置统一由 ConfigManager 持有：models / 别名 / audit / passthrough 都在快照里
+        self.config_manager = ConfigManager(config_file)
         self.failover_manager: ModelFailoverManager = None  # type: ignore[assignment]
         self.responses_adapter: ResponsesAdapter = None  # type: ignore[assignment]
         self.session_store: DualModeSessionStore = None  # type: ignore[assignment]
@@ -191,12 +192,22 @@ class OpenAIProxyService:
         self.passthrough = PassthroughManager(self.audit)
         # 用户级密钥：库在 initialize() 里打开，create_app() 时绑定到中间件与路由
         self.user_keys: Optional[UserKeyManager] = None
-        # 插件结构快照：reload 时据此判断「进程内无法生效，需要重启」
-        self._platform_snapshot: Dict[str, Any] = {}
         # 主事件循环：配置接口在工作线程里触发热重载时需要把协程投回这个循环
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         # 配置编辑服务：接口与 CLI 共用同一套补丁
         self._config_service: Optional[ConfigCommandService] = None
+        # 配置文件监听：手改 models.yaml 时也能自动热重载（可用 CONFIG_WATCH_ENABLED=false 关闭）
+        self.config_watcher: Optional[ConfigFileWatcher] = None
+
+    @property
+    def models(self) -> Dict[str, List[ModelConfig]]:
+        """当前生效的模型表（只读视图，来自 ConfigManager 的快照）"""
+        return self.config_manager.current.models
+
+    @models.setter
+    def models(self, value: Dict[str, List[ModelConfig]]) -> None:
+        """允许测试/嵌入式调用注入模型表；正常启动与重载都走 ConfigManager"""
+        self.config_manager.replace_models(value)
 
     async def _resolve_api_user(self, request: Request) -> str:
         """
@@ -247,12 +258,18 @@ class OpenAIProxyService:
         """
         if self._config_service is None:
             self._config_service = ConfigCommandService(
-                config_file=self.config_loader.config_file,
+                config_file=self.config_manager.config_file,
                 backup_dir=os.getenv("CONFIG_BACKUP_DIR", "data/config_backups"),
                 reload_callback=self._reload_models_blocking,
                 audit_recorder=lambda op, detail="", success=True: self.audit.record_config_change(op, detail, success),
+                write_observer=self._on_config_written,
             )
         return self._config_service
+
+    def _on_config_written(self, summary: Dict[str, Any]) -> None:
+        """管理接口写完配置后协调文件监听：跳过重载的版本标记为已处理"""
+        if not summary.get("reloaded"):
+            self.config_manager.ignore_current_file()
 
     def _reload_models_blocking(self) -> Dict[str, Any]:
         """在工作线程里同步等待进程内重载完成（协程必须回到它自己的事件循环执行）"""
@@ -288,10 +305,10 @@ class OpenAIProxyService:
             logger.info("检测到 SKIP_PLUGIN_SCRAPER=true，跳过插件爬虫，直接使用缓存")
             logger.info("=" * 60)
             # 直接加载完整配置（会使用缓存的模型列表）
-            self.models = await self.config_loader.load_config()
+            snapshot = await self.config_manager.initialize()
         else:
             # 第一步：仅加载平台列表（不加载模型，不会触发插件调用）
-            platforms = await self.config_loader.load_platforms_only()
+            platforms = await self.config_manager.load_platforms_only()
 
             # 第二步：启动所有插件的定时任务调度器（会等待首次爬虫完成）
             await self._start_plugin_schedulers_for_platforms(platforms)
@@ -300,12 +317,12 @@ class OpenAIProxyService:
             logger.info("=" * 60)
             logger.info("爬虫任务已完成，加载配置以获取最新模型列表")
             logger.info("=" * 60)
-            self.models = await self.config_loader.load_config()
+            snapshot = await self.config_manager.initialize()
 
         # 第四步：初始化故障转移管理器
         self.failover_manager = ModelFailoverManager(
-            self.models,
-            all_aliases=self.config_loader.all_aliases
+            snapshot.models,
+            all_aliases=snapshot.all_aliases
         )
 
         # 第五步：初始化 Responses API 适配器和会话存储
@@ -313,10 +330,46 @@ class OpenAIProxyService:
         self.responses_adapter = ResponsesAdapter(session_store=self.session_store)
 
         # 第六步：打开审计（配置来自 models.yaml 顶层 audit: 段）
-        self.audit.apply_yaml(self.config_loader.audit_config)
+        self.audit.apply_yaml(snapshot.audit)
         # 第七步：加载透传路由（配置来自顶层 passthrough: 段）
-        self.passthrough.configure(self.config_loader.passthrough_config)
+        self.passthrough.configure(snapshot.passthrough)
         await self.audit.start()
+        await self._start_config_watcher()
+
+    async def _start_config_watcher(self) -> None:
+        """启动配置文件监听（默认开启；不需要时用 CONFIG_WATCH_ENABLED=false 关闭）"""
+        if self.config_watcher is not None:
+            return
+        if os.getenv("CONFIG_WATCH_ENABLED", "true").strip().lower() != "true":
+            logger.info("配置文件监听已关闭（CONFIG_WATCH_ENABLED=false）")
+            return
+        try:
+            interval = float(os.getenv("CONFIG_WATCH_INTERVAL", "2"))
+        except ValueError:
+            interval = 2.0
+        self.config_watcher = ConfigFileWatcher(
+            self.config_manager,
+            on_reloaded=self._on_config_file_reloaded,
+            interval=interval,
+        )
+        await self.config_watcher.start()
+
+    async def _on_config_file_reloaded(self, result: ReloadResult) -> None:
+        """配置文件被手改后自动重载：把新快照应用到运行时状态"""
+        try:
+            self._apply_snapshot(result.snapshot)
+            await self.model_list_cache.clear()
+        except Exception as exc:  # noqa: BLE001 - 应用失败时回退，继续用旧配置
+            logger.error(f"应用自动重载的配置失败，已回退: {exc}", exc_info=True)
+            self.config_manager.restore(result.previous)
+
+    def _apply_snapshot(self, snapshot: ConfigSnapshot) -> None:
+        """把一份已提交的配置快照应用到运行时组件"""
+        # 复用同一个故障转移管理器（保住 aiohttp 会话），模型表与别名一起替换
+        if self.failover_manager is not None:
+            self.failover_manager.replace_models(snapshot.models, snapshot.all_aliases)
+        # 透传路由整体替换；进行中的请求各自持有旧配置
+        self.passthrough.configure(snapshot.passthrough)
 
     async def _start_plugin_schedulers_for_platforms(self, platforms: Dict[str, Any]):
         """
@@ -335,7 +388,7 @@ class OpenAIProxyService:
 
                 logger.info(f"检查平台 [{platform_name}] 的插件...")
                 # 尝试从插件管理器获取插件实例
-                plugin = self.config_loader.plugin_manager.get_plugin(platform_name)
+                plugin = self.config_manager.plugin_manager.get_plugin(platform_name)
                 logger.info(f"平台 [{platform_name}] 获取到的插件: {plugin}")
 
                 if plugin and hasattr(plugin, 'start_scheduler'):
@@ -365,7 +418,7 @@ class OpenAIProxyService:
                 first_model = model_configs[0] if model_configs else None
 
                 # 尝试从插件管理器获取插件实例
-                plugin = self.config_loader.plugin_manager.get_plugin(platform_name)
+                plugin = self.config_manager.plugin_manager.get_plugin(platform_name)
                 if plugin and hasattr(plugin, 'start_scheduler'):
                     logger.info(f"正在启动平台 [{platform_name}] 的插件调度器...")
                     try:
@@ -382,6 +435,9 @@ class OpenAIProxyService:
 
     async def close(self):
         """关闭服务"""
+        if self.config_watcher is not None:
+            await self.config_watcher.stop()
+            self.config_watcher = None
         # 停止所有插件的定时任务调度器
         await self._stop_plugin_schedulers()
         if self.failover_manager:
@@ -398,38 +454,28 @@ class OpenAIProxyService:
 
     async def reload_models(self) -> Dict[str, Any]:
         """
-        进程内重载模型配置：只重建模型表与别名，不重启插件调度器
+        进程内重载配置：由 ConfigManager 构建完整新快照后统一替换
 
         aiohttp 会话与进行中的流保持不变（流各自持有已取出的对象），
-        因此模型级/平台级参数立即生效；插件结构（爬虫参数）变化需要用户自行重启。
+        因此模型级/平台级参数、别名与透传路由立即生效；
+        插件结构与 audit 段的变化需要用户自行重启。
 
         Returns:
             {"reloaded": bool, "needs_restart": bool, "message": str}
         """
+        result = await self.config_manager.reload()
+        if not result.reloaded:
+            return result.to_dict()
+
         try:
-            platforms = await self.config_loader.load_platforms_only()
-            snapshot = {
-                name: (cfg.get("plugin") if isinstance(cfg, dict) else None)
-                for name, cfg in platforms.items()
-            }
-            needs_restart = bool(self._platform_snapshot) and snapshot != self._platform_snapshot
-            self._platform_snapshot = snapshot
-
-            self.models = await self.config_loader.load_config()
-            # 复用同一个故障转移管理器（保住 aiohttp 会话），只替换模型表
-            self.failover_manager.models = self.models
-            self.failover_manager.all_aliases = self.config_loader.all_aliases
-            # 透传路由整体替换；进行中的请求各自持有旧配置
-            self.passthrough.configure(self.config_loader.passthrough_config)
-
+            snapshot = result.snapshot
+            self._apply_snapshot(snapshot)
             await self.model_list_cache.clear()
-
-            message = "模型配置已重载" + ("；插件结构有变化，重启服务后完全生效" if needs_restart else "")
-            logger.info(message)
-            return {"reloaded": True, "needs_restart": needs_restart, "message": message}
-        except Exception as exc:  # noqa: BLE001 - 重载失败时保留旧配置继续服务
-            logger.error(f"重载模型配置失败，继续使用旧配置: {exc}", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 应用失败时回退到上一份快照
+            logger.error(f"应用新配置快照失败，继续使用旧配置: {exc}", exc_info=True)
+            self.config_manager.restore(result.previous)
             return {"reloaded": False, "needs_restart": True, "message": f"重载失败: {exc}"}
+        return result.to_dict()
 
     async def _stop_plugin_schedulers(self):
         """停止所有插件的定时任务调度器"""
@@ -438,7 +484,7 @@ class OpenAIProxyService:
                 if not model_configs:
                     continue
 
-                plugin = self.config_loader.plugin_manager.get_plugin(platform_name)
+                plugin = self.config_manager.plugin_manager.get_plugin(platform_name)
                 if plugin and hasattr(plugin, 'stop_scheduler'):
                     logger.info(f"正在停止平台 [{platform_name}] 的插件调度器...")
                     try:
@@ -476,7 +522,7 @@ class OpenAIProxyService:
             """应用生命周期管理器"""
             # 启动事件
             logger.info("AI Model Gateway 启动中...")
-            logger.info(f"正在加载配置文件: {self.config_loader.config_file}")
+            logger.info(f"正在加载配置文件: {self.config_manager.config_file}")
 
             # 初始化服务（加载配置和插件）
             await self.initialize()
@@ -816,7 +862,7 @@ class OpenAIProxyService:
                     q=q,
                     limit=limit,
                     offset=offset,
-                    all_aliases=self.config_loader.all_aliases,
+                    all_aliases=self.config_manager.current.all_aliases,
                 )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"无法获取模型列表: {str(e)}")

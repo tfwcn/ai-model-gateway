@@ -24,9 +24,11 @@ USAGE_TABLE = "usage_daily"
 # 维度日汇总：按「完整维度组合」累加，同样永久保留
 USAGE_DIMENSION_TABLE = "usage_dimension_daily"
 
-# 结构版本：版本 5 起标准维度改为 dimensions + 生成列；版本 6 给维度日汇总加 token
+# 结构版本：版本 5 起标准维度改为 dimensions + 生成列；版本 6 给维度日汇总加 token；
+# 版本 7 修正历史行里按「提取响应体耗时」算出的假 tokens/s
 DIMENSIONS_VERSION = 5
-SCHEMA_VERSION = 6
+TOKEN_COLUMNS_VERSION = 6
+SCHEMA_VERSION = 7
 
 # 主键 + 常用过滤维度的索引：按时间、按模型、按结局、按请求链
 _INDEX_DDL = (
@@ -284,8 +286,12 @@ class SqliteAuditStore(AuditStore):
             self._migrate_to_dimensions()
             version = DIMENSIONS_VERSION
 
-        if version < SCHEMA_VERSION:
+        if version < TOKEN_COLUMNS_VERSION:
             self._migrate_dimension_tokens()
+            version = TOKEN_COLUMNS_VERSION
+
+        if version < SCHEMA_VERSION:
+            self._migrate_throughput()
 
     def _migrate_to_dimensions(self) -> None:
         """把老结构收拢为 dimensions + 生成列，并回填维度日汇总"""
@@ -359,8 +365,29 @@ class SqliteAuditStore(AuditStore):
                 ), 0)
             """
         )
-        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self._conn.execute(f"PRAGMA user_version = {TOKEN_COLUMNS_VERSION}")
         logger.info("审计库结构升级: 维度日汇总已补充 token 列")
+
+    def _migrate_throughput(self) -> None:
+        """版本 7：按真实 duration_ms 重算历史 tokens/s，耗时无效的行置空"""
+        updated = self._conn.execute(
+            f"""
+            UPDATE {TABLE}
+            SET throughput = CASE
+                WHEN duration_ms > 0 AND output_tokens > 0
+                THEN output_tokens * 1000.0 / duration_ms
+                ELSE NULL
+            END
+            WHERE throughput IS NOT NULL
+              AND (
+                  duration_ms IS NULL OR duration_ms <= 0
+                  OR output_tokens IS NULL OR output_tokens <= 0
+                  OR ABS(throughput - output_tokens * 1000.0 / duration_ms) > 0.01
+              )
+            """
+        ).rowcount
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        logger.info(f"审计库结构升级: 已按真实耗时重算 tokens/s（{updated} 行）")
 
     def _backfill_dimension_usage(self) -> None:
         """维度日汇总表首次创建时，用全部已收尾明细回填一次（不碰 usage_daily）"""

@@ -227,7 +227,7 @@ class TestGuide:
     @pytest.mark.unit
     def test_说清了哪些改动必须重启(self):
         body = "\n".join(item["body"] for item in config_guide.guide_sections())
-        for keyword in ("audit", "plugin", "环境变量", "没有文件监听"):
+        for keyword in ("audit", "plugin", "环境变量", "CONFIG_WATCH_ENABLED"):
             assert keyword in body, f"结构说明里没提到: {keyword}"
 
     @pytest.mark.unit

@@ -34,7 +34,7 @@ the config view only shows which environment variable a key references and wheth
 | What you want to do | Where to click in the admin UI |
 | --- | --- |
 | Change platform weight, model timeout, blacklist | Edit directly on the *model config* tab; every save is backed up first and can be rolled back |
-| Apply the change | Click reload after saving — it applies in-process. Adding/removing a platform still needs your own restart |
+| Apply the change | Saves are picked up automatically by the config watcher; adding/removing a platform, plugin structure or `audit:` changes still need your own restart |
 | Issue a key per user | The *user keys* tab generates one from a label; traffic is accounted per user |
 | See who used how much, and where it is slow | *Usage & performance* aggregates by user / model / time |
 
@@ -292,6 +292,8 @@ REDIS_URL=redis://localhost:6379       # Optional Redis
 # Admin endpoints and admin UI (/admin/* and /metrics both require GATEWAY_API_KEY)
 # ADMIN_UI_ENABLED=true                # Serve /admin/ui, false returns 404
 # CONFIG_API_ENABLED=true              # Expose /admin/config/*, false does not mount them
+# CONFIG_WATCH_ENABLED=true            # Watch models.yaml and hot-reload after manual saves
+# CONFIG_WATCH_INTERVAL=2              # Watch polling interval (seconds)
 # CONFIG_BACKUP_DIR=data/config_backups   # Automatic backup directory used before every write
 # MODEL_CONFIG_FILE=models.yaml        # Config file the CLI reads by default
 ```
@@ -360,8 +362,8 @@ python manage.py config rollback models.yaml.20260101T000000Z.bak
 ```
 
 There are three equivalent ways to change config: the admin UI, `manage.py`, or editing `models.yaml` directly.
-After the last two, call `POST /admin/config/reload` (with `GATEWAY_API_KEY`) to apply changes in-process.
-Changes that add/remove a platform or alter `plugin` structure **require you to restart the service yourself** —
+The config watcher picks up edits to `models.yaml` automatically; you can also call `POST /admin/config/reload` (with `GATEWAY_API_KEY`) to trigger it manually.
+Changes that add/remove a platform, alter `plugin` structure or change the `audit:` section **require you to restart the service yourself** —
 the gateway never restarts itself.
 
 See [🧾 Audit & Usage Stats](docs/AUDIT.md), [🖥️ Admin UI](docs/ADMIN_UI.md), [⌨️ CLI Tool](docs/CONFIG_CLI.md).

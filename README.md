@@ -33,7 +33,7 @@ http://localhost:8000/admin/ui/     # 打开后输入 GATEWAY_API_KEY 连接
 | 想做的事 | 在管理台怎么点 |
 | --- | --- |
 | 改平台权重、模型超时、黑名单 | 「模型配置」页直接编辑；写盘前自动备份，可随时回滚 |
-| 让改动生效 | 保存后点重载，进程内生效；新增/删除平台这类结构变化才需要自行重启 |
+| 让改动生效 | 保存后点重载，进程内生效；新增/删除平台、插件结构或 `audit:` 段的变化才需要自行重启 |
 | 给用户发密钥 | 「用户密钥」页填写标签即可生成，流量按用户单独统计 |
 | 看谁用了多少、慢在哪里 | 「用量与性能」按用户 / 模型 / 时间维度聚合 |
 
@@ -392,6 +392,8 @@ RESPONSES_SESSION_TTL=86400
 # 管理接口与管理台（/admin/* 与 /metrics 都需要 GATEWAY_API_KEY）
 # ADMIN_UI_ENABLED=true               # 管理台前端 /admin/ui，false 则返回 404
 # CONFIG_API_ENABLED=true             # 配置读写接口 /admin/config/*，false 则不提供
+# CONFIG_WATCH_ENABLED=true           # 监听 models.yaml，手改保存后自动热重载
+# CONFIG_WATCH_INTERVAL=2             # 监听轮询间隔（秒）
 # CONFIG_BACKUP_DIR=data/config_backups   # 每次写盘前的自动备份目录
 # MODEL_CONFIG_FILE=models.yaml       # 命令行默认读取的配置文件
 ```
@@ -497,8 +499,8 @@ python manage.py config rollback models.yaml.20260101T000000Z.bak
 ```
 
 改配置有三种等价做法：管理台页面、`manage.py`、直接编辑 `models.yaml`。
-后两种改完之后，调用 `POST /admin/config/reload`（带 `GATEWAY_API_KEY`）即可进程内生效；
-涉及新增/删除平台、插件结构变化的改动**需要你自行重启服务**，网关永远不会自行重启。
+默认会监听 `models.yaml`，手改保存后自动热重载；也可以调用 `POST /admin/config/reload`（带 `GATEWAY_API_KEY`）手动触发。
+涉及新增/删除平台、插件结构变化或 `audit:` 段变化的改动**需要你自行重启服务**，网关永远不会自行重启。
 
 详见 [🧾 审计与用量统计](docs/AUDIT.md)、[🖥️ 管理台前端](docs/ADMIN_UI.md)、[⌨️ 命令行管理工具](docs/CONFIG_CLI.md)。
 

@@ -262,19 +262,20 @@ def summarize_response(response: Any) -> Dict[str, Any]:
     """
     从非流式响应体提取统计（不写日志）
 
-    供审计层复用同一套 usage 字段兼容逻辑，避免两处各写一份字段名映射。
+    只提取 usage 相关字段：调用方（AuditAttempt）已经有真实的 duration_ms，
+    这里没有计时起点，不能顺手算 total / throughput，否则会把微秒级的提取耗时
+    当成请求耗时，算出几十万 tokens/s 的假速度。
     """
-    monitor = StreamPerformanceMonitor(model_name="unknown", started_at=time.time())
+    monitor = StreamPerformanceMonitor(model_name="unknown")
     monitor.record_response(response)
-    finished_at = time.time()
     return {
         "has_usage": monitor.has_usage,
         "ttft": None,
-        "total": finished_at - monitor.started_at,
+        "total": None,
         "input_tokens": monitor.input_tokens,
         "cached_tokens": monitor.cached_tokens,
         "output_tokens": monitor.output_tokens,
         "output_chars": monitor.output_chars,
-        "throughput": monitor._ratio(monitor.output_tokens, finished_at - monitor.started_at),
+        "throughput": None,
         "upstream_id": monitor.upstream_id,
     }

@@ -259,6 +259,59 @@ class TestNeedsRestart:
         assert calls == []
 
     @pytest.mark.unit
+    def test_audit段改动同样需要重启(self, service, config_file):
+        service, _, calls = service
+        summary = service.write([{
+            "op": "set_audit_field",
+            "field": "retention_days",
+            "value": 45,
+        }])
+
+        assert summary["needs_restart"] is True
+        assert summary["reloaded"] is False
+        assert calls == []
+        assert "retention_days: 45" in text_of(config_file)
+
+    @pytest.mark.unit
+    def test_跳过重载时通知文件监听器(self, service):
+        service, _, _ = service
+        seen = []
+        service.write_observer = seen.append
+
+        summary = service.write([{
+            "op": "set_audit_field",
+            "field": "retention_days",
+            "value": 45,
+        }])
+
+        assert seen and seen[0]["reloaded"] is False
+        assert summary["needs_restart"] is True
+
+    @pytest.mark.unit
+    def test_重载器发现更早的待重启改动时同步到摘要(self, config_file):
+        service = ConfigCommandService(
+            config_file=config_file,
+            backup_dir=os.path.join(os.path.dirname(config_file), "backups"),
+            reload_callback=lambda: {
+                "reloaded": True,
+                "needs_restart": True,
+                "message": "已重载；audit 段有变化，请自行重启服务后完全生效",
+            },
+        )
+
+        summary = service.write([{
+            "op": "set_model_field",
+            "platform": "example-platform",
+            "model": "model-b",
+            "field": "first_chunk_timeout",
+            "value": 30,
+        }])
+
+        assert summary["reloaded"] is True
+        assert summary["needs_restart"] is True
+        assert "audit" in summary["message"]
+
+    @pytest.mark.unit
     def test_模型级参数改动可以进程内生效(self, service):
         service, _, calls = service
         summary = service.write([{"op": "set_model_field", "platform": "example-platform", "model": "model-b", "field": "first_chunk_timeout", "value": 30}])
