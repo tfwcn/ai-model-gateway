@@ -45,7 +45,7 @@ export async function renderUsers(root, ctx) {
     try {
       const result = await ctx.api.post("/admin/users", { name });
       nameInput.value = "";
-      renderReveal(revealBox, result);
+      renderReveal(revealBox, result, ctx);
       await load();
       ctx.notice("已生成新密钥，请立即保存", "ok");
     } catch (error) {
@@ -82,13 +82,27 @@ export async function renderUsers(root, ctx) {
 
 // ---------- 呈现 ----------
 
-function renderReveal(box, result) {
+function renderReveal(box, result, ctx) {
   const input = el("input", { readonly: true, class: "key-reveal" });
   input.value = result.key;
 
+  // 密钥很长，手动选中容易漏字符：给一个一键复制，失败时退回「选中 + 提示」
+  const copyButton = button("复制");
+  copyButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(result.key);
+      copyButton.textContent = "已复制";
+      window.setTimeout(() => { copyButton.textContent = "复制"; }, 1500);
+    } catch {
+      input.focus();
+      input.select();
+      ctx.notice("浏览器不允许自动复制：已选中密钥，请按 Ctrl+C", "warn");
+    }
+  });
+
   box.replaceChildren(panel("新密钥", [
     el("p", { class: "muted", text: `用户：${result.user.name}` }),
-    input,
+    el("div", { class: "inline-form" }, [input, copyButton]),
     el("p", { class: "muted", text: "请复制保存后再离开本页；关闭后无法再次查看明文。" }),
   ]));
 }

@@ -8,9 +8,10 @@
  * 点击任意一行会展开它所属请求的整条链路。
  */
 
-import { button, control, el, empty, fmtMs, fmtNumber, fmtRate, fmtTime, panel, readControls, select, table, textInput, userLabel } from "./ui.js";
+import { button, control, el, empty, filterPanel, fmtMs, fmtNumber, fmtRate, fmtTime, panel, readControls, select, table, textInput, userLabel } from "./ui.js";
 import { lineChart } from "./charts.js";
 import { DateRange } from "./date_range.js";
+import { Tabs } from "./tabs.js";
 
 const OUTCOME_OPTIONS = [
   { value: "", label: "全部结局" },
@@ -55,11 +56,35 @@ const TREND_BUCKET_OPTIONS = [
   { value: "hour", label: "按小时" },
 ];
 
+// 明细与聚合各占一个页签：两张长表叠在一屏，谁也看不全
+const AUDIT_TABS = [
+  { key: "list", label: "审计明细" },
+  { key: "aggregate", label: "聚合 / 趋势" },
+];
+
 // 结局口径写在页面上，避免把「[DONE] 已发完后客户端关闭」误读成中断
 const OUTCOME_NOTE =
   "结局口径：success 含「[DONE] 已转发后客户端才关闭连接」；"
   + "aborted 只统计 [DONE] 之前断开（done_sent=0）；"
   + "stream_open 是未收尾的流，不计入成功率。";
+
+/**
+ * 折叠筛选区的一行摘要：日期范围 + 结局 + 有值的平台 / 模型 / 用户 / 请求 ID
+ *
+ * 收起状态看不到输入框，这行文字就是唯一线索，所以只写已经填了值的条件。
+ */
+function describeAuditFilters(range, values) {
+  const parts = [range.summary()];
+  const outcome = OUTCOME_OPTIONS.find((item) => item.value === (values.outcome || ""));
+  parts.push((outcome || OUTCOME_OPTIONS[0]).label);
+  [["platform", "平台"], ["model", "模型"], ["user", "用户"]].forEach(([name, label]) => {
+    const value = String(values[name] || "").trim();
+    if (value) parts.push(`${label} ${value}`);
+  });
+  const requestId = String(values.gateway_request_id || "").trim();
+  if (requestId) parts.push(`请求 ${requestId}`);
+  return parts.join(" · ");
+}
 
 export async function renderAudit(root, ctx) {
   // 明细接口有保留期，默认只看最近 30 天；清空日期即可查全部已保留记录
@@ -76,48 +101,124 @@ export async function renderAudit(root, ctx) {
   const prev = button("上一页");
   const next = button("下一页");
   const listBox = el("div");
-  const chainBox = el("div");
   const statusBox = el("div");
 
   // 30 天聚合与趋势：保留期内的明细聚合成表格和曲线
   const aggregateGroupBy = select(GROUP_OPTIONS, "day");
   const aggregateSort = select(SORT_OPTIONS, "requests");
   const trendBucket = select(TREND_BUCKET_OPTIONS, "day");
-  const aggregateButton = button("查询 30 天聚合", "primary");
+  const aggregateButton = button("查询聚合", "primary");
   const aggregateBox = el("div");
   const aggregateCanvas = el("canvas", { class: "chart" });
 
-  const paging = el("div", { class: "row-actions" }, [prev, next, el("span", { class: "muted", text: "点击任意行看整条链路" })]);
+  const pageInfo = el("span", { class: "muted" });
+  const paging = el("div", { class: "row-actions" }, [
+    prev,
+    next,
+    pageInfo,
+    el("span", { class: "muted", text: "点击任意行展开 / 收起整条链路" }),
+  ]);
+  prev.disabled = true;
+  next.disabled = true;
+
+  // 折叠摘要：收起筛选区时，这行字是「当前筛了什么」的唯一线索
+  const filterMeta = el("span", { class: "panel-meta" });
+  // 最近一次聚合曲线数据：页签隐藏时画不出来，切回来要重画
+  let latestTrend = null;
+  // 当前展开的链路行：同一时刻只保留一条
+  let openChainRow = null;
+
+  const listPane = el("div", {}, [
+    panel("审计明细", [listBox], paging),
+  ]);
+  const aggregatePane = el("div", {}, [
+    panel("聚合 / 趋势（审计明细范围内）", [
+      el("div", { class: "filters compact" }, [
+        control("聚合维度", aggregateGroupBy),
+        control("排序", aggregateSort),
+        control("曲线粒度", trendBucket),
+      ]),
+      el("p", { class: "muted", text: "这里的 P95 是明细精确值；「用量与性能」页的维度汇总是直方图估算值。沿用上方日期范围、用户、平台、模型；结局 / 请求 ID 不参与聚合。" }),
+      aggregateCanvas,
+      aggregateBox,
+    ], aggregateButton),
+  ]);
+
+  const tabs = new Tabs(AUDIT_TABS, { list: listPane, aggregate: aggregatePane }, {
+    onSelect: (key) => {
+      // 页签写回地址栏：刷新和分享都能回到同一处
+      ctx.setTab?.(key);
+      // 曲线在隐藏容器里量不到宽度，切过来再画一次
+      window.requestAnimationFrame(drawAggregateTrendIfVisible);
+    },
+  });
+  ctx.registerTabs?.((key) => tabs.select(key));
 
   root.append(
-    panel("筛选", [
-      el("div", { class: "filters" }, [
+    filterPanel("筛选条件", [
+      el("div", { class: "filters compact" }, [
         ...range.controls(),
         ...filters.map((item) => control(LABELS[item.name], item.node)),
       ]),
       el("p", { class: "muted", text: "日期留空表示不限，结束日期当天包含在内。" }),
       el("p", { class: "muted", text: OUTCOME_NOTE }),
-      el("p", { class: "muted", text: "明细默认保留 30 天（AUDIT_RETENTION_DAYS），更早记录会自动清理；全量用量在「用量与性能」的日汇总里永久保留。" }),
-    ], loadButton),
+      el("p", { class: "muted", text: "明细默认保留 30 天（AUDIT_RETENTION_DAYS），更早记录会自动清理；更长时间范围的全量用量在「用量与性能」页查看。" }),
+    ], { meta: filterMeta, actions: loadButton }),
     statusBox,
-    panel("审计明细", [listBox], paging),
-    chainBox,
-    panel("30 天聚合 / 趋势（审计明细范围内）", [
-      el("div", { class: "filters" }, [
-        control("聚合维度", aggregateGroupBy),
-        control("排序", aggregateSort),
-        control("曲线粒度", trendBucket),
-      ]),
-      el("p", { class: "muted", text: "这里的 P95 是明细精确值；永久维度汇总是直方图估算值。沿用上方日期范围、用户、平台、模型；结局 / 请求 ID 不参与聚合。" }),
-      aggregateCanvas,
-      aggregateBox,
-    ], aggregateButton),
+    tabs.node,
+    listPane,
+    aggregatePane,
   );
+  // 地址栏指定了页签就停在那一页，否则默认看明细
+  tabs.select(ctx.initialTab === "aggregate" ? "aggregate" : "list");
 
-  loadButton.addEventListener("click", () => { page.offset = 0; load(); loadAggregate(true); });
+  // 窗口尺寸变了，canvas 的位图尺寸也要跟着变，否则会被拉伸发虚
+  const handleResize = () => window.requestAnimationFrame(drawAggregateTrendIfVisible);
+  window.addEventListener("resize", handleResize);
+  ctx.onTeardown?.(() => window.removeEventListener("resize", handleResize));
+
+  // 条件一变就刷新摘要，展开改完再收起来也能对得上
+  [range.sinceNode, range.untilNode, ...filters.map((item) => item.node)].forEach((node) => {
+    node.addEventListener("input", syncFilterMeta);
+    node.addEventListener("change", syncFilterMeta);
+  });
+  syncFilterMeta();
+
+  function syncFilterMeta() {
+    // 只写已经生效的条件，空着的项略过，摘要才不至于一行全是「不限」
+    filterMeta.textContent = describeAuditFilters(range, readControls(filters));
+    filterMeta.title = filterMeta.textContent;
+  }
+
+  function runQuery() {
+    page.offset = 0;
+    load();
+    loadAggregate(true);
+  }
+
+  loadButton.addEventListener("click", runQuery);
+  // 筛选框里按 Enter 直接查，不用再去点按钮
+  filters.forEach(({ node }) => {
+    node.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      runQuery();
+    });
+  });
   prev.addEventListener("click", () => { page.offset = Math.max(0, page.offset - page.limit); load(); });
   next.addEventListener("click", () => { page.offset += page.limit; load(); });
   aggregateButton.addEventListener("click", () => loadAggregate());
+
+  /** 页码与上下页状态：第一页禁用「上一页」，最后一页禁用「下一页」 */
+  function updatePaging(result) {
+    const items = result.items || [];
+    const total = Number(result.total) || 0;
+    const from = items.length ? page.offset + 1 : 0;
+    const to = page.offset + items.length;
+    pageInfo.textContent = `第 ${fmtNumber(from)}-${fmtNumber(to)} 条 / 共 ${fmtNumber(total)} 条`;
+    prev.disabled = page.offset <= 0;
+    next.disabled = !items.length || to >= total;
+  }
 
   async function load() {
     const params = { ...readControls(filters), ...range.params() };
@@ -128,7 +229,10 @@ export async function renderAudit(root, ctx) {
         ctx.api.postQuery("/admin/audit/stats"),
       ]);
       renderHealth(statusBox, health);
-      renderList(listBox, result, page, openChain);
+      // 新一页表格重建了，之前展开的链路行已随之移除
+      openChainRow = null;
+      renderList(listBox, result, toggleChain);
+      updatePaging(result);
       ctx.notice(`审计共 ${fmtNumber(health.store.rows)} 行，当前筛出 ${fmtNumber(result.total)} 行`, "ok");
     } catch (error) {
       ctx.guard(error);
@@ -161,8 +265,9 @@ export async function renderAudit(root, ctx) {
         }),
       ]);
       renderAggregate(aggregateBox, grouped);
-      drawAggregateTrend(aggregateCanvas, series);
-      if (!quiet) ctx.notice("30 天聚合已刷新", "ok");
+      latestTrend = series;
+      drawAggregateTrendIfVisible();
+      if (!quiet) ctx.notice("聚合与趋势已刷新", "ok");
     } catch (error) {
       ctx.guard(error);
     } finally {
@@ -170,11 +275,43 @@ export async function renderAudit(root, ctx) {
     }
   }
 
-  async function openChain(gatewayRequestId) {
+  function drawAggregateTrendIfVisible() {
+    if (!aggregatePane.hidden && latestTrend) drawAggregateTrend(aggregateCanvas, latestTrend);
+  }
+
+  /** 收起当前展开的链路行 */
+  function collapseChain() {
+    if (!openChainRow) return;
+    openChainRow.node.remove();
+    openChainRow.row.classList.remove("expanded");
+    openChainRow = null;
+  }
+
+  /**
+   * 在点击的行下面就地展开整条故障转移链
+   *
+   * 同一时刻只展开一条。链路内容长在表格自己的滚动区域里，
+   * 页面不会因为链路块再多出一条滚动条。
+   */
+  async function toggleChain(row, gatewayRequestId, colspan) {
+    if (openChainRow && openChainRow.row === row) {
+      collapseChain();
+      return;
+    }
+    collapseChain();
+
+    const cell = el("td", { class: "chain-cell", colspan });
+    const line = el("tr", { class: "chain-row" }, [cell]);
+    cell.append(el("p", { class: "muted", text: "加载中…" }));
+    row.after(line);
+    row.classList.add("expanded");
+    openChainRow = { row, node: line };
+
     try {
       const chain = await ctx.api.postQuery(`/admin/audit/chain/${encodeURIComponent(gatewayRequestId)}`);
-      renderChain(chainBox, chain);
+      renderChain(cell, chain);
     } catch (error) {
+      cell.replaceChildren(el("p", { class: "issue error", text: "链路读取失败" }));
       ctx.guard(error);
     }
   }
@@ -238,12 +375,12 @@ function chips(row) {
   return el("span", {}, nodes);
 }
 
-function renderList(box, result, page, openChain) {
+function renderList(box, result, onExpand) {
   if (!result.items.length) {
     box.replaceChildren(empty("没有符合条件的审计行"));
     return;
   }
-  box.replaceChildren(table([
+  const columns = [
     { key: "ts", label: "时间", render: (row) => fmtTime(row.ts) },
     { key: "gateway_request_id", label: "请求" },
     { key: "api_user", label: "用户", render: (row) => userLabel(row.api_user) },
@@ -256,13 +393,17 @@ function renderList(box, result, page, openChain) {
     { key: "http_status", label: "状态码", num: true },
     { key: "error_category", label: "错误分类" },
     { key: "error_code", label: "错误码" },
-  ], result.items, { onRow: (row) => openChain(row.gateway_request_id) }));
+  ];
+  box.replaceChildren(table(columns, result.items, {
+    // colspan 用整张表的列数：展开行要横向铺满
+    onRow: (row, tr) => onExpand(tr, row.gateway_request_id, columns.length),
+  }));
 }
 
-function renderChain(box, chain) {
+function renderChain(target, chain) {
   const attempts = chain.attempts || [];
   if (!attempts.length) {
-    box.replaceChildren(panel("故障转移链", [empty(`请求 ${chain.gateway_request_id} 没有审计记录`)]));
+    target.replaceChildren(el("p", { class: "muted", text: `请求 ${chain.gateway_request_id} 没有审计记录` }));
     return;
   }
 
@@ -283,7 +424,10 @@ function renderChain(box, chain) {
     ]),
   ]));
 
-  box.replaceChildren(panel(`故障转移链：${chain.gateway_request_id}（${attempts.length} 次尝试）`, rows));
+  target.replaceChildren(el("div", { class: "chain-inline" }, [
+    el("h4", { class: "chain-title", text: `故障转移链：${chain.gateway_request_id}（${attempts.length} 次尝试）` }),
+    ...rows,
+  ]));
 }
 
 function outcomeChip(row) {

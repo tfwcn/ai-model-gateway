@@ -23,6 +23,9 @@ export async function renderConfig(root, ctx) {
   const planBox = el("div");
   const platformsBox = el("div");
 
+  // 有未提交改动时，切标签 / 刷新 / 关页面都要先确认，别让改动悄悄丢掉
+  ctx.setLeaveGuard?.(() => (state.ops.length ? `还有 ${state.ops.length} 处改动没有写盘` : ""));
+
   const noteInput = textInput("", "写进备份元数据的备注");
   const planButton = button("重新预演", "ghost");
   const applyButton = button("应用并写盘");

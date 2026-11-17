@@ -40,6 +40,22 @@ export class DateRange {
       until: nextDayIso(this.untilNode.value),
     };
   }
+
+  /** 折叠摘要用的一行日期描述：收起筛选区时也能看出当前查的是哪一段 */
+  summary() {
+    const since = this.sinceNode.value;
+    const until = this.untilNode.value;
+    if (!since && !until) return "不限时间";
+    return `${since || "最早"} ~ ${until || "今天"}`;
+  }
+
+  /** 日期一变就刷新摘要（调用方传回调，避免这里直接碰视图） */
+  onChange(handler) {
+    [this.sinceNode, this.untilNode].forEach((node) => {
+      node.addEventListener("input", handler);
+      node.addEventListener("change", handler);
+    });
+  }
 }
 
 /** 本地时区的今天（YYYY-MM-DD） */

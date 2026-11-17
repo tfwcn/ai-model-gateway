@@ -1,6 +1,8 @@
 /* AI Model Gateway 管理台样式：无框架、无外部字体，深/浅自适应 */
 
 :root {
+  /* 原生控件（日期选择器、滚动条）跟随深浅色 */
+  color-scheme: light dark;
   --bg: #f6f7f9;
   --panel: #ffffff;
   --ink: #16181d;
@@ -108,19 +110,184 @@ input.key-reveal {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   background: var(--chip);
 }
+/* 和「复制」按钮同一行时让输入框吃掉剩余宽度 */
+.inline-form input.key-reveal { flex: 1 1 240px; width: auto; min-width: 0; }
 
 main { padding: 16px 18px 40px; max-width: 1280px; margin: 0 auto; }
 
-.notice {
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--warn);
-  background: var(--panel);
-  border-radius: 10px;
-  padding: 10px 14px;
-  margin-bottom: 14px;
+/* ---------- 提示：顶栏消息入口 + 右下角浮动提示 ---------- */
+/* 顶栏里的消息按钮：列表从按钮下方展开，不占页面里的任何一行 */
+.notice-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
 }
-.notice.bad { border-left-color: var(--bad); }
-.notice.ok { border-left-color: var(--ok); }
+
+.toast-dock {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(420px, calc(100vw - 36px));
+  /* 空白处不挡住下面的页面，只有提示本身接收鼠标 */
+  pointer-events: none;
+}
+.toast-dock > * { pointer-events: auto; }
+
+.toast-region {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+/* 一条提示：左侧色条标语气，底部进度条就是剩余停留时间 */
+.toast-item {
+  --tone: var(--accent);
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--tone);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .18);
+  overflow: hidden;
+  animation: toast-in .18s ease-out;
+}
+.toast-item.ok, .toast-log-item.ok { --tone: var(--ok); }
+.toast-item.warn, .toast-log-item.warn { --tone: var(--warn); }
+.toast-item.bad, .toast-log-item.bad { --tone: var(--bad); }
+.toast-text { flex: 1 1 auto; margin: 0; overflow-wrap: anywhere; }
+.toast-close {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1.1;
+}
+.toast-close:hover { color: var(--ink); }
+.toast-item::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  height: 3px;
+  background: var(--tone);
+  opacity: .55;
+  transform-origin: left center;
+  animation: toast-countdown var(--toast-life, 5000ms) linear forwards;
+}
+/* 鼠标停在提示上：倒计时暂停，长消息来得及读完 */
+.toast-item:hover::after { animation-play-state: paused; }
+.toast-item.toast-out { animation: toast-out .2s ease-in forwards; }
+
+/* 最近消息列表：挂在顶栏按钮下方，浮在页面上，不把内容顶下去 */
+.toast-log {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  width: min(360px, calc(100vw - 36px));
+  max-height: min(50vh, 360px);
+  overflow-y: auto;
+  padding: 8px 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .18);
+}
+.toast-log[hidden] { display: none; }
+.toast-log-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.toast-log-title { font-weight: 600; font-size: 13px; }
+.toast-log-tools { display: flex; align-items: center; gap: 8px; }
+.toast-log-meta { color: var(--muted); font-size: 12px; }
+.toast-log-clear {
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
+.toast-log-clear:hover { color: var(--bad); }
+.toast-log-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.toast-log-item {
+  --tone: var(--accent);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  padding-left: 8px;
+  border-left: 3px solid var(--tone);
+  font-size: 13px;
+}
+.toast-log-time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.toast-log-text { margin: 0; overflow-wrap: anywhere; }
+.toast-log-empty { color: var(--muted); font-size: 13px; }
+
+/* 顶栏里的「消息」按钮：未读时带一个数字角标 */
+.toast-log-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+}
+.toast-log-toggle:hover,
+.toast-log-toggle[aria-expanded="true"] { color: var(--ink); border-color: var(--accent); }
+.toast-log-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bad);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+.toast-log-count[hidden] { display: none; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(6px); }
+}
+@keyframes toast-countdown {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+/* 系统关掉动效时：进出场直接切换，倒计时照走（它同时是自动消失的计时器） */
+@media (prefers-reduced-motion: reduce) {
+  .toast-item, .toast-item.toast-out { animation: none; }
+}
 
 .panel {
   background: var(--panel);
@@ -206,6 +373,38 @@ table.wrap td code { overflow-wrap: anywhere; }
 }
 
 .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+/* 折叠筛选区展开后用的紧凑排版：每个条件固定一个窄列，一屏能放下更多项 */
+.filters.compact { gap: 8px 10px; }
+.filters.compact .control { flex: 0 1 170px; min-width: 130px; }
+.filters.compact input,
+.filters.compact select { width: 100%; min-width: 0; }
+
+/* 可折叠筛选区：收起时只占一行（标题 + 条件摘要 + 操作按钮），把高度留给下面的表格 */
+.filter-panel { padding: 0; }
+.filter-panel > summary { align-items: center; }
+/* 条件摘要吃掉剩余宽度，太长就省略，不会把查询按钮挤到第二行 */
+.filter-panel > summary .panel-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filter-panel .summary-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+/* 折叠区里的说明文字紧凑一点，展开时也别把表格顶下去太多 */
+.filter-panel > .panel-body > p { margin: 6px 0 0; }
+/* 折叠筛选区嵌在别的面板里时只留一条分隔线，避免「框套框」 */
+.panel > .filter-panel {
+  border: none;
+  border-bottom: 1px dashed var(--line);
+  border-radius: 0;
+  background: transparent;
+  margin-bottom: 10px;
+}
+.panel > .filter-panel > summary,
+.panel > .filter-panel > .panel-body { padding-left: 0; padding-right: 0; }
+/* 折叠区自己已经有一条分隔线，下面的结果区不用再画一遍 */
+.panel > .filter-panel + .dim-results { border-top: none; padding-top: 0; }
 /* 「一次填一整个条目」的表单（新增平台）：等宽栅格，窄屏自动换行，块与块的顺序不会乱 */
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; align-items: end; }
 /* 小标签 + 控件：用 label 包一层。fieldset 自带边框，放在表单区里会变成一个巨大的空框 */
@@ -316,7 +515,23 @@ table { width: 100%; border-collapse: collapse; }
 /* 表格统一套这两层：.table-scroll 让列多的表在窄屏只在自己的区域里横向平移，
    整页不会出现横向滚动条；.table-box 保证它在栅格里可以被压缩（min-width: 0） */
 .table-box { min-width: 0; }
-.table-scroll { overflow-x: auto; }
+/* 高度自适应：内容少时和以前一样按内容撑开，行数多时最多占一屏（留出顶栏和上下留白），
+   表格自己竖向滚动。这样横向滚动条始终在表格框的底部，不用把整页拉到底才能拖动 */
+.table-scroll {
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: clamp(200px, calc(100vh - 300px), 900px);
+  overscroll-behavior: contain;
+}
+/* 表头粘在滚动框顶部：在框里往下翻时仍知道每一列是什么 */
+.table-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  /* border-collapse 下粘住的表头会把下边框画丢，用内阴影补一条线 */
+  box-shadow: inset 0 -1px 0 var(--line);
+}
 th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; font-size: 12px; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -330,6 +545,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover { background: var(--chip); }
+/* 行内展开的故障转移链：内容长在表格行里，只占表格自己的滚动区，页面不会多出第二条滚动条 */
+tr.clickable.expanded { background: var(--chip); }
+tr.chain-row > .chain-cell {
+  padding: 10px 12px 14px;
+  background: var(--bg);
+  white-space: normal;
+}
+.chain-inline { display: flex; flex-direction: column; gap: 8px; }
+.chain-title { margin: 0; font-size: 13px; }
+.chain-inline .detail { padding: 6px 0 10px; border-bottom: 1px dashed var(--line); }
+.chain-inline .detail:last-child { border-bottom: none; padding-bottom: 0; }
 .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--chip); font-size: 12px; white-space: nowrap; }
 .chip.ok { color: var(--ok); }
 .chip.bad { color: var(--bad); }
@@ -410,4 +636,3 @@ pre.yaml {
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .inline-form { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .muted { color: var(--muted); }
-.foot { color: var(--muted); padding: 12px 18px; border-top: 1px solid var(--line); display: flex; gap: 16px; flex-wrap: wrap; }

@@ -8,9 +8,11 @@
  * 成功率只统计已收尾的尝试（finalized=1），未收尾的 stream_open 不算分母。
  */
 
-import { button, cards, control, el, empty, fmtCompact, fmtMs, fmtNumber, fmtRate, panel, select, table, textInput } from "./ui.js";
+import { button, cards, control, el, empty, filterPanel, fmtCompact, fmtMs, fmtNumber, fmtRate, panel, select, table, textInput } from "./ui.js";
 import { lineChart } from "./charts.js";
+import { ColumnPicker } from "./column_prefs.js";
 import { DateRange } from "./date_range.js";
+import { Tabs } from "./tabs.js";
 import { LastDimensionQuery, RecentCombos } from "./recent_combos.js";
 
 // 组合按钮的展示名：只翻译常见键，未知维度名原样显示
@@ -56,7 +58,27 @@ const DIMENSION_GROUP_KEYS = ["user", "endpoint", "day", "month"];
 
 // 维度表的固定指标列：维度列由用户填写的组合决定，这里把固定列先说清楚
 const DIMENSION_METRIC_HINT =
-  "结果固定包含：请求、尝试、成功、失败、中断、重试、首块、P95（按耗时直方图估算）、平均耗时、tokens/s、输入 tokens、缓存 tokens、输出 tokens、成功率。";
+  "结果包含：请求、尝试、成功、失败、中断、重试、首块、P95（按耗时直方图估算）、平均耗时、tokens/s、输入 tokens、缓存 tokens、输出 tokens、成功率；"
+  + "指标列可以在「显示列」里隐藏或显示，维度列始终显示。";
+
+// 维度汇总表的指标列：维度列跟着查询组合走、始终显示；
+// 这些指标列可以按需隐藏，列顺序就是这里的顺序
+const DIMENSION_METRIC_COLUMNS = [
+  { key: "requests", label: "请求", num: true },
+  { key: "attempts", label: "尝试", num: true },
+  { key: "success", label: "成功", num: true },
+  { key: "failure", label: "失败", num: true },
+  { key: "aborted", label: "中断", num: true },
+  { key: "retries", label: "重试", num: true },
+  { key: "avg_ttft_ms", label: "首块", num: true, render: (row) => fmtMs(row.avg_ttft_ms) },
+  { key: "p95_duration_ms", label: "P95", num: true, render: (row) => fmtMs(row.p95_duration_ms) },
+  { key: "avg_duration_ms", label: "平均耗时", num: true, render: (row) => fmtMs(row.avg_duration_ms) },
+  { key: "avg_throughput", label: "tokens/s", num: true, render: (row) => fmtNumber(row.avg_throughput, 1) },
+  { key: "input_tokens", label: "输入 tokens", num: true },
+  { key: "cached_tokens", label: "缓存 tokens", num: true },
+  { key: "output_tokens", label: "输出 tokens", num: true },
+  { key: "success_rate", label: "成功率", num: true, render: (row) => fmtRate(row.success_rate) },
+];
 
 // 用量页内的分页签：默认看概览，其余表格与图表各占一页，避免一屏堆太多内容
 const USAGE_TABS = [
@@ -109,51 +131,71 @@ export async function renderUsage(root, ctx) {
   let dimPresetButtons = [];
   const dimPresetRow = el("div", { class: "dim-chip-row" }, []);
 
-  const dimensionControls = [
-    el("div", { class: "dim-builder" }, [
-      el("div", { class: "dim-builder-main" }, [
-        control("维度组合", dimGroup),
-        control("入口", dimEndpoint),
-        control("排序", dimSort),
-        control("方向", dimOrder),
-      ]),
-      el("div", { class: "dim-section" }, [
-        el("div", { class: "dim-section-head" }, [
-          el("span", { class: "field-label", text: "按维度筛选" }),
-          el("span", { class: "dim-hint", text: "只筛当前组合里的维度，精确匹配；多个值用英文逗号分隔" }),
-        ]),
-        dimFilterBox,
-      ]),
-      el("div", { class: "dim-section" }, [
-        el("div", { class: "dim-section-head" }, [
-          el("span", { class: "field-label", text: "最近组合" }),
-          el("span", { class: "dim-hint", text: "自动记录前 10 个，查询后置顶" }),
-        ]),
-        dimPresetRow,
-      ]),
-      el("div", { class: "dim-section" }, [
-        el("div", { class: "dim-section-head" }, [
-          el("span", { class: "field-label", text: "可用维度 / 分组键" }),
-          el("span", { class: "dim-hint", text: "点一下加入，再点一下移除" }),
-        ]),
-        dimKeysBox,
-      ]),
-      el("details", { class: "dim-help" }, [
-        el("summary", { text: "维度写法与结果说明" }),
-        el("p", { class: "muted", text: "维度名用英文逗号分隔；user=用户，endpoint=入口，day/month=时间，其余是路由声明的维度。日期范围和用户标签取上方「全局筛选」；点「查询维度」只刷新本页签。" }),
-        el("p", { class: "muted", text: DIMENSION_METRIC_HINT }),
-      ]),
-    ]),
-    el("div", { class: "dim-results" }, [dimensionBox]),
-  ];
+  // 折叠摘要：维度区收起时显示「按什么分组、怎么排序、有没有筛选」
+  const dimMeta = el("span", { class: "panel-meta" });
+  const globalMeta = el("span", { class: "panel-meta" });
 
-  const globalPanel = panel("全局筛选", [
-    el("div", { class: "filters" }, [
+  // 显示列：维度列始终显示，指标列由用户勾选，选择记在浏览器里
+  let latestDimensions = null;
+  const dimColumns = new ColumnPicker(
+    DIMENSION_METRIC_COLUMNS.map(({ key, label }) => ({ key, label })),
+    {
+      storageKey: "ai-model-gateway.usage.dimension-columns.v1",
+      onChange: (visible) => {
+        if (latestDimensions) renderDimensions(dimensionBox, latestDimensions, visible);
+      },
+    },
+  );
+
+  const dimensionBuilder = el("div", { class: "dim-builder" }, [
+    el("div", { class: "dim-builder-main" }, [
+      control("维度组合", dimGroup),
+      control("入口", dimEndpoint),
+      control("排序", dimSort),
+      control("方向", dimOrder),
+    ]),
+    el("div", { class: "dim-section" }, [
+      el("div", { class: "dim-section-head" }, [
+        el("span", { class: "field-label", text: "显示列" }),
+        el("span", { class: "dim-hint", text: "维度列始终显示；高亮的是当前显示的指标列，点一下隐藏 / 再点一下显示" }),
+      ]),
+      dimColumns.node,
+    ]),
+    el("div", { class: "dim-section" }, [
+      el("div", { class: "dim-section-head" }, [
+        el("span", { class: "field-label", text: "按维度筛选" }),
+        el("span", { class: "dim-hint", text: "只筛当前组合里的维度，精确匹配；多个值用英文逗号分隔" }),
+      ]),
+      dimFilterBox,
+    ]),
+    el("div", { class: "dim-section" }, [
+      el("div", { class: "dim-section-head" }, [
+        el("span", { class: "field-label", text: "最近组合" }),
+        el("span", { class: "dim-hint", text: "自动记录前 10 个，查询后置顶" }),
+      ]),
+      dimPresetRow,
+    ]),
+    el("div", { class: "dim-section" }, [
+      el("div", { class: "dim-section-head" }, [
+        el("span", { class: "field-label", text: "可用维度 / 分组键" }),
+        el("span", { class: "dim-hint", text: "点一下加入，再点一下移除" }),
+      ]),
+      dimKeysBox,
+    ]),
+    el("details", { class: "dim-help" }, [
+      el("summary", { text: "维度写法与结果说明" }),
+      el("p", { class: "muted", text: "维度名用英文逗号分隔；user=用户，endpoint=入口，day/month=时间，其余是路由声明的维度。日期范围和用户标签取上方「全局筛选」；点「查询维度」只刷新本页签。" }),
+      el("p", { class: "muted", text: DIMENSION_METRIC_HINT }),
+    ]),
+  ]);
+
+  const globalPanel = filterPanel("全局筛选", [
+    el("div", { class: "filters compact" }, [
       ...range.controls(),
       control("用户标签", userNode),
     ]),
-    el("p", { class: "muted", text: "默认当月（1 日到今天）；日期留空表示不限，结束日期当天包含在内。这两个条件对所有页签生效。本页只读永久日汇总，30 天内的明细、聚合与趋势请到「审计明细」页。" }),
-  ], loadButton);
+    el("p", { class: "muted", text: "默认当月（1 日到今天）；日期留空表示不限，结束日期当天包含在内。这两个条件对所有页签生效。30 天内的明细、聚合与趋势请到「审计明细」页。" }),
+  ], { meta: globalMeta, actions: loadButton });
 
   // 最近一次查询结果：切回图表页签时要用它重画，避免隐藏状态下量不到宽度
   const latest = { series: null };
@@ -161,39 +203,41 @@ export async function renderUsage(root, ctx) {
   // 每个页签一个内容容器，筛选条件也放在各自页签里
   const paneNodes = {
     overview: el("div", {}, [
-      panel("永久用量概览", [
-        el("p", { class: "muted", text: "卡片来自 usage_daily，趋势来自 usage_dimension_daily，均只累加、不随审计明细清理；P95 为按耗时直方图估算。" }),
+      panel("用量概览", [
+        el("p", { class: "muted", text: "卡片与趋势都来自日汇总表；P95 为按耗时直方图估算。" }),
       ], overviewButton),
       kpiBox,
       panel("趋势（请求数 / P95 耗时 / 首块耗时）", [chartCanvas]),
     ]),
     dimensions: el("div", {}, [
-      panel("维度汇总（永久日汇总）", dimensionControls,
-        el("div", { class: "row-actions" }, [dimButton, dimExportButton])),
+      panel("维度汇总", [
+        // 条件收进折叠区：查询按钮常驻标题行，表格直接接在下面
+        filterPanel("维度条件", [dimensionBuilder], {
+          meta: dimMeta,
+          actions: [dimButton, dimExportButton],
+        }),
+        el("div", { class: "dim-results" }, [dimensionBox]),
+      ]),
     ]),
   };
-  const tabButtons = USAGE_TABS.map((item) => el("button", {
-    class: "tab",
-    type: "button",
-    dataset: { tab: item.key },
-    text: item.label,
-    onclick: () => selectTab(item.key),
-  }));
-  const tabBar = el("div", { class: "tabs view-tabs" }, tabButtons);
+  const tabs = new Tabs(USAGE_TABS, paneNodes, {
+    onSelect: (key) => {
+      // 页签写回地址栏：刷新和分享都能回到同一处
+      ctx.setTab?.(key);
+      // 图表在隐藏容器里量不到宽度，切回可见状态后再画一次
+      window.requestAnimationFrame(drawVisibleCharts);
+    },
+  });
+  ctx.registerTabs?.((key) => tabs.select(key));
 
-  root.append(globalPanel, tabBar, ...Object.values(paneNodes));
-  selectTab("overview");
+  root.append(globalPanel, tabs.node, ...Object.values(paneNodes));
+  // 地址栏指定了页签就停在那一页，否则默认概览
+  tabs.select(paneNodes[ctx.initialTab] ? ctx.initialTab : "overview");
 
-  function selectTab(name) {
-    Object.entries(paneNodes).forEach(([key, pane]) => {
-      pane.hidden = key !== name;
-    });
-    tabButtons.forEach((node) => {
-      node.setAttribute("aria-selected", String(node.dataset.tab === name));
-    });
-    // 图表在隐藏容器里量不到宽度，切回可见状态后再画一次
-    window.requestAnimationFrame(drawVisibleCharts);
-  }
+  // 窗口尺寸变了，canvas 的位图尺寸也要跟着变，否则会被拉伸发虚
+  const handleResize = () => window.requestAnimationFrame(drawVisibleCharts);
+  window.addEventListener("resize", handleResize);
+  ctx.onTeardown?.(() => window.removeEventListener("resize", handleResize));
 
   function drawVisibleCharts() {
     if (!paneNodes.overview.hidden && latest.series) drawTrend(chartCanvas, latest.series);
@@ -208,7 +252,20 @@ export async function renderUsage(root, ctx) {
     syncDimensionSortOptions();
     syncDimensionPresetState();
     refreshDimensionKeyButtons();
+    syncDimensionMeta();
   });
+  // 其余条件一变也刷新折叠摘要，收起来之后还能对得上
+  range.onChange(syncGlobalMeta);
+  [userNode].forEach((node) => {
+    node.addEventListener("input", syncGlobalMeta);
+    node.addEventListener("change", syncGlobalMeta);
+  });
+  dimEndpoint.addEventListener("input", syncDimensionMeta);
+  dimSort.addEventListener("change", syncDimensionMeta);
+  dimOrder.addEventListener("change", syncDimensionMeta);
+  // 维度筛选框按组合动态重建，用事件委托一次监听
+  dimFilterBox.addEventListener("input", syncDimensionMeta);
+  dimFilterBox.addEventListener("change", syncDimensionMeta);
   dimGroup.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.isComposing) return;
     event.preventDefault();
@@ -231,6 +288,26 @@ export async function renderUsage(root, ctx) {
     } finally {
       loadButton.disabled = false;
     }
+  }
+
+  /** 折叠摘要：全局筛选收起时也看得出日期范围与用户标签 */
+  function syncGlobalMeta() {
+    const user = userNode.value.trim();
+    globalMeta.textContent = [range.summary(), user ? `用户 ${user}` : "全部用户"].join(" · ");
+    globalMeta.title = globalMeta.textContent;
+  }
+
+  /** 折叠摘要：维度区收起时看出当前分组、排序与筛选条数 */
+  function syncDimensionMeta() {
+    const condition = currentDimensionCondition();
+    const sortNode = [...dimSort.options].find((option) => option.value === condition.sort);
+    const parts = [`按 ${comboLabel(condition.group_by)}`, `排序 ${sortNode ? sortNode.text : condition.sort}`];
+    if (condition.order) parts.push(condition.order === "asc" ? "升序" : "降序");
+    if (condition.endpoint) parts.push(`入口 ${condition.endpoint}`);
+    const filterCount = Object.keys(condition.filters || {}).length;
+    if (filterCount) parts.push(`维度筛选 ${filterCount} 项`);
+    dimMeta.textContent = parts.join(" · ");
+    dimMeta.title = dimMeta.textContent;
   }
 
   async function loadOverview(quiet = false) {
@@ -392,6 +469,7 @@ export async function renderUsage(root, ctx) {
     dimOrder.value = order;
     syncDimensionPresetState();
     refreshDimensionKeyButtons();
+    syncDimensionMeta();
   }
 
   /** 最近组合按钮跟着输入框高亮，手改组合后自动取消高亮 */
@@ -438,7 +516,8 @@ export async function renderUsage(root, ctx) {
         ...params,
         limit: 500,
       });
-      renderDimensions(dimensionBox, payload);
+      latestDimensions = payload;
+      renderDimensions(dimensionBox, payload, dimColumns.visible());
       // 查询成功才记录：同一组合覆盖排序 / 方向 / 筛选，并置顶
       lastDimensionQuery.save(condition);
       renderRecentCombos(recentCombos.record(condition));
@@ -503,6 +582,8 @@ export async function renderUsage(root, ctx) {
 
   renderRecentCombos(initialRecent);
   applyDimensionCondition(lastCondition);
+  syncGlobalMeta();
+  syncDimensionMeta();
   await Promise.all([loadAll(true), loadDimensionKeys()]);
 }
 
@@ -521,14 +602,14 @@ function saveBlob(blob, filename) {
 function renderCards(box, totals = {}) {
   const rate = totals.success_rate;
   box.replaceChildren(cards([
-    { label: "请求数（永久）", value: fmtCompact(totals.requests), title: fmtNumber(totals.requests) },
-    { label: "输入 tokens（永久）", value: fmtCompact(totals.input_tokens), title: fmtNumber(totals.input_tokens) },
-    { label: "输出 tokens（永久）", value: fmtCompact(totals.output_tokens), title: fmtNumber(totals.output_tokens) },
-    { label: "缓存 tokens（永久）", value: fmtCompact(totals.cached_tokens), title: fmtNumber(totals.cached_tokens) },
-    { label: "成功率（永久）", value: rate === null || rate === undefined ? "-" : fmtRate(rate), title: rate === null || rate === undefined ? undefined : `成功率 ${fmtRate(rate)}`, tone: rate !== null && rate !== undefined && rate < 0.9 ? "bad" : "ok" },
-    { label: "失败尝试（永久）", value: fmtCompact(totals.failure), title: fmtNumber(totals.failure), tone: totals.failure ? "bad" : "" },
-    { label: "客户端中断（永久）", value: fmtCompact(totals.aborted), title: fmtNumber(totals.aborted) },
-    { label: "重试尝试（永久）", value: fmtCompact(totals.retries), title: fmtNumber(totals.retries) },
+    { label: "请求数", value: fmtCompact(totals.requests), title: fmtNumber(totals.requests) },
+    { label: "输入 tokens", value: fmtCompact(totals.input_tokens), title: fmtNumber(totals.input_tokens) },
+    { label: "输出 tokens", value: fmtCompact(totals.output_tokens), title: fmtNumber(totals.output_tokens) },
+    { label: "缓存 tokens", value: fmtCompact(totals.cached_tokens), title: fmtNumber(totals.cached_tokens) },
+    { label: "成功率", value: rate === null || rate === undefined ? "-" : fmtRate(rate), title: rate === null || rate === undefined ? undefined : `成功率 ${fmtRate(rate)}`, tone: rate !== null && rate !== undefined && rate < 0.9 ? "bad" : "ok" },
+    { label: "失败尝试", value: fmtCompact(totals.failure), title: fmtNumber(totals.failure), tone: totals.failure ? "bad" : "" },
+    { label: "客户端中断", value: fmtCompact(totals.aborted), title: fmtNumber(totals.aborted) },
+    { label: "重试尝试", value: fmtCompact(totals.retries), title: fmtNumber(totals.retries) },
   ]));
 }
 
@@ -543,33 +624,29 @@ function drawTrend(canvas, series) {
   ]);
 }
 
-function renderDimensions(box, payload) {
+function renderDimensions(box, payload, visibleKeys = null) {
   const items = payload.items || [];
   if (!items.length) {
     box.replaceChildren(empty("这个范围内还没有维度汇总：产生调用后会自动累计，且不随审计明细清理"));
     return;
   }
   const dims = payload.group_by || [];
-  box.replaceChildren(
-    el("p", { class: "muted", text: `按 ${dims.join(" × ")} 汇总；数值来自永久日汇总表` }),
+  // 维度列永远显示；指标列按「显示列」里的勾选过滤，没传就全显示
+  const metrics = visibleKeys
+    ? DIMENSION_METRIC_COLUMNS.filter((col) => visibleKeys.has(col.key))
+    : DIMENSION_METRIC_COLUMNS;
+  // 指标列全被隐藏时给一句提示，免得以为表格只有维度列或没数据
+  const hiddenHint = metrics.length
+    ? null
+    : el("p", { class: "muted", text: "指标列已全部隐藏：在「维度条件 → 显示列」里点一下需要的列。" });
+  box.replaceChildren(...[
+    el("p", { class: "muted", text: `按 ${dims.join(" × ")} 汇总` }),
+    hiddenHint,
     table([
       ...dims.map((name) => ({ key: name, label: name, render: (row) => (row.values || {})[name] })),
-      { key: "requests", label: "请求", num: true },
-      { key: "attempts", label: "尝试", num: true },
-      { key: "success", label: "成功", num: true },
-      { key: "failure", label: "失败", num: true },
-      { key: "aborted", label: "中断", num: true },
-      { key: "retries", label: "重试", num: true },
-      { key: "avg_ttft_ms", label: "首块", num: true, render: (row) => fmtMs(row.avg_ttft_ms) },
-      { key: "p95_duration_ms", label: "P95", num: true, render: (row) => fmtMs(row.p95_duration_ms) },
-      { key: "avg_duration_ms", label: "平均耗时", num: true, render: (row) => fmtMs(row.avg_duration_ms) },
-      { key: "avg_throughput", label: "tokens/s", num: true, render: (row) => fmtNumber(row.avg_throughput, 1) },
-      { key: "input_tokens", label: "输入 tokens", num: true },
-      { key: "cached_tokens", label: "缓存 tokens", num: true },
-      { key: "output_tokens", label: "输出 tokens", num: true },
-      { key: "success_rate", label: "成功率", num: true, render: (row) => fmtRate(row.success_rate) },
+      ...metrics,
     ], items),
-  );
+  ].filter(Boolean));
 }
 
 /** 可用维度候选：多选式按钮，选中态就是 aria-pressed */

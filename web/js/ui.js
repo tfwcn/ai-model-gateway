@@ -91,8 +91,10 @@ const WIDE_TABLE_COLUMNS = 8;
  * 渲染表格
  *
  * columns: [{key, label, num?, render?}]，render 返回字符串或节点
+ * options.onRow(row, tr)：点了某一行时的回调；拿到 tr 便于在行后插入展开内容
  *
- * 外面套一层 .table-scroll：列多的表在窄屏只在自己的区域里横向平移，不会把整页撑出横向滚动条。
+ * 外面套一层 .table-scroll：列多的表在窄屏只在自己的区域里横向平移，不会把整页撑出横向滚动条；
+ * 行数多的表由这一层自己竖向滚动（高度有上限），横向滚动条不用拉到整页最底部才能拖到。
  */
 export function table(columns, rows, options = {}) {
   const head = el("tr", {}, columns.map((col) =>
@@ -105,7 +107,7 @@ export function table(columns, rows, options = {}) {
       const node = value instanceof Node ? value : document.createTextNode(String(value === null || value === undefined ? "-" : value));
       tr.appendChild(el("td", { class: col.num ? "num" : "" }, node));
     });
-    if (options.onRow) tr.addEventListener("click", () => options.onRow(row));
+    if (options.onRow) tr.addEventListener("click", () => options.onRow(row, tr));
     return tr;
   });
 
@@ -116,6 +118,36 @@ export function table(columns, rows, options = {}) {
     parts.unshift(el("p", { class: "table-hint", text: "这一张表列多：窄屏时可以在表格区域里左右拖动，整页不会横向滚动。" }));
   }
   return el("div", { class: "table-box" }, parts);
+}
+
+/**
+ * 按表格在页面里的实际位置收窄高度
+ *
+ * 固定写 `calc(100vh - 240px)` 在每页都会差一点：条件区占得多的页面会超出视口，
+ * 于是最外层又冒出滚动条。这里统一按「视口高度 - 表格框顶部 - 底部留白」计算，
+ * 表格框刚好填满剩余空间，页面本身就不用再为看表格底部而滚动。
+ *
+ * 调用时机：视图重绘、窗口尺寸变化、折叠区展开/收起之后。
+ */
+export function fitTables(root = document) {
+  // 表格框下面还有面板内边距、面板下外边距和页面底部留白，一并留出来
+  const reserve = 72;
+  root.querySelectorAll(".table-scroll").forEach((box) => {
+    const top = documentTop(box);
+    const height = Math.max(200, Math.round(window.innerHeight - top - reserve));
+    box.style.maxHeight = `${height}px`;
+  });
+}
+
+/** 元素相对整个文档的顶部偏移：与页面当前滚动位置无关，量一次可以一直用 */
+function documentTop(node) {
+  let top = 0;
+  let current = node;
+  while (current) {
+    top += current.offsetTop;
+    current = current.offsetParent;
+  }
+  return top;
 }
 
 export function cards(items) {
@@ -200,6 +232,44 @@ export function collapsible(title, children, options = {}) {
   ]);
   // dataset.title 让上层视图能在刷新前后对上同一个区块，展开状态不会一刷新就丢
   return el("details", { class: "panel collapsible", open, dataset: { title } }, [summary, body]);
+}
+
+/**
+ * 可折叠的筛选区：默认收起，只留「标题 + 当前条件摘要 + 操作按钮」一行
+ *
+ * 筛选项一多就会占掉大半屏，表格反而被挤到下面要往下翻。收起后：
+ *   - 折叠状态也能一眼看出「现在筛的是什么」（meta 摘要）
+ *   - 查询按钮放在标题行里，不展开也能直接点
+ *
+ * Args:
+ *   title:    区块标题（如「筛选条件」）
+ *   children: 展开后才显示的筛选项
+ *   options:  {
+ *             meta:    条件摘要文本，或调用方自己创建的节点（便于随条件更新）
+ *             actions: 常驻操作按钮（单个节点或数组）
+ *             open:    默认是否展开，默认收起
+ *           }
+ */
+export function filterPanel(title, children, options = {}) {
+  const { meta = "", actions = null, open = false } = options;
+  const metaNode = typeof meta === "string"
+    ? el("span", { class: "panel-meta", text: meta })
+    : meta;
+  const summary = el("summary", {}, [
+    el("span", { class: "panel-title", text: title }),
+    metaNode,
+  ]);
+
+  if (actions) {
+    const actionBar = el("span", { class: "summary-actions" }, Array.isArray(actions) ? actions : [actions]);
+    // 按钮住在 summary 里：点按钮只是查询，不应该顺带展开/收起
+    actionBar.addEventListener("click", (event) => event.preventDefault());
+    summary.appendChild(actionBar);
+  }
+
+  const body = el("div", { class: "panel-body" }, Array.isArray(children) ? children : [children]);
+  // dataset.title 与 collapsible 保持一致，刷新后能按标题恢复展开状态
+  return el("details", { class: "panel collapsible filter-panel", open, dataset: { title } }, [summary, body]);
 }
 
 /** 批量展开/折叠容器里的可折叠区块 */
