@@ -150,3 +150,92 @@ except aiohttp.ClientError as e:
 3. **监控指标**：收集各模型的错误率和响应时间
 4. **动态策略调整**：根据历史数据动态调整错误处理策略
 5. **错误聚合分析**：定期分析错误模式，优化配置
+
+## 对外错误响应（下游契约）
+
+故障转移全部失败时，网关不会只回一句「所有模型都不可用」，而是把**关键错误**
+收敛成一份 OpenAI 兼容错误体。下游按 OpenAI SDK 的既有方式解析即可，无需改代码。
+
+### 1. 非流式
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 10
+Content-Type: application/json
+```
+
+```json
+{
+  "error": {
+    "message": "HTTP 429: rate limit exceeded",
+    "type": "rate_limit_error",
+    "param": null,
+    "code": "rate_limit_exceeded",
+    "request_id": "a1b2c3d4",
+    "attempts": [
+      {"status": 429, "category": "http_429_rate_limit"},
+      {"status": 503, "category": "http_503_service_unavailable"}
+    ]
+  }
+}
+```
+
+约定：
+
+- `message` 优先使用**上游原始文案**（例如「图片下载失败 + 完整 URL」），最多 800 字符；
+  拿不到上游文案时才用「HTTP 状态码 + 原始报文」兜底。
+- `type` / `code` / `param` 优先沿用上游返回值，下游的判断逻辑与直连上游时一致。
+- 只有 `error` 一个顶层键，同时保留 HTTP 状态码语义。
+- `attempts` 只包含 `status` 和 `category`，不暴露平台名、模型名、base_url。
+- 单次尝试失败时不输出 `attempts`。
+- 错误文本会先脱敏（`sk-*`、`Bearer *`、`api_key=*` 等）再回传。
+
+### 2. 状态码映射
+
+| 主错误 | HTTP | type |
+|---|---|---|
+| 上游 400 / 工具调用错误 / 参数错 | 400 | `invalid_request_error` |
+| 上游 429 | 429（带 `Retry-After`） | `rate_limit_error` |
+| 上游 401 / 403 / 404 | 502 | `api_error` |
+| 上游 5xx / 连接失败 | 502 | `api_error` |
+| 上游 504 / 首块超时 | 504 | `api_error` |
+| 所有模型当前不可用 | 503（带 `Retry-After`） | `api_error` |
+| 未预期异常 | 500 | `api_error` |
+
+> 上游 401/403 **不会**原样透传：那是网关侧的配置问题，透传 401 会让下游误以为自己的密钥失效。
+
+### 3. 主错误选择
+
+多次尝试全部失败时，按以下优先级挑一条作为 `message`：
+
+1. 标记为「停止故障转移」的错误（请求自身构造有问题）；
+2. 上游 400 类（换模型也没用）；
+3. **最早出现的真实上游错误**（根因，不会被后面的错误覆盖）；
+4. 「无可用模型」兜底。
+
+如果所有模型都在上一个周期内被禁用，`message` 会带上最近一次失败原因
+（例如「当前没有可用模型；最近一次失败原因: invalid api key」）。
+
+### 4. 流式
+
+流式请求增加一个「快速失败窗口」（`FAILOVER_FAST_FAIL_SECONDS`，默认 3 秒）：
+
+- 窗口内失败：还能用真实 HTTP 状态码返回上面的标准 JSON；
+- 超过窗口：先下发 SSE 心跳保活，之后的失败用标准事件通报。
+
+Chat Completions：
+
+```
+data: {"error":{"message":"...","type":"api_error","code":"upstream_timeout",...}}
+
+data: [DONE]
+```
+
+Responses：
+
+```
+event: error
+data: {"type":"error","code":"upstream_timeout","message":"...","param":null}
+
+data: [DONE]
+```

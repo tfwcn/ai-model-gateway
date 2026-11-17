@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from openai_proxy.admin_ui import AdminUiStatic
 from openai_proxy.core.api_errors import error_response, install_error_handlers, is_forward_path
 from openai_proxy.core.cache import MemoryCache
+from openai_proxy.core.error_envelope import ErrorEnvelope, SSE_DONE
 from openai_proxy.models import ModelConfig, list_available_models
 from openai_proxy.core.config_loader import ConfigSnapshot
 from openai_proxy.core.config_manager import ConfigManager, ReloadResult
@@ -21,6 +22,7 @@ from openai_proxy.adapter.responses import ResponsesAdapter
 from openai_proxy.utils.session import DualModeSessionStore
 from openai_proxy.utils.sse_parser import SSEEventParser
 from openai_proxy.utils.keepalive import KeepAliveStream, UpstreamStartHeartbeat, HeartbeatCounter
+from openai_proxy.utils.stream_start_gate import StreamStartGate
 from openai_proxy.utils.logger import sanitize_payload
 from openai_proxy.utils.stream_metrics import StreamPerformanceMonitor
 from openai_proxy.utils.stream_terminator import StreamTerminator, is_done_event
@@ -38,6 +40,16 @@ logger = logging.getLogger(__name__)
 
 # 数据面用户 header：只有携带管理密钥时才生效，用户密钥会忽略它
 USER_HEADER = "X-Gateway-User"
+
+
+def _chat_stream_error_bytes(exc: BaseException) -> bytes:
+    """Chat Completions 流式失败：标准 data: 错误事件 + [DONE] 终止标记"""
+    return ErrorEnvelope.from_exception(exc).chat_sse() + SSE_DONE
+
+
+def _responses_stream_error_bytes(exc: BaseException) -> bytes:
+    """Responses 流式失败：标准 event: error 事件 + [DONE] 终止标记"""
+    return ErrorEnvelope.from_exception(exc).responses_event() + SSE_DONE
 
 
 async def _finish_stream_audit(audit_ctx: Optional[AuditContext], monitor: StreamPerformanceMonitor, completed: bool,
@@ -182,6 +194,8 @@ class OpenAIProxyService:
         self.failover_manager: ModelFailoverManager = None  # type: ignore[assignment]
         self.responses_adapter: ResponsesAdapter = None  # type: ignore[assignment]
         self.session_store: DualModeSessionStore = None  # type: ignore[assignment]
+        # 流式「快速失败窗口」：窗口内失败还能返回真实 HTTP 状态码
+        self.stream_start_gate = StreamStartGate()
 
         cache_ttl = int(os.getenv("MODELS_API_CACHE_TTL", "300"))
         self.model_list_cache = MemoryCache(default_ttl=cache_ttl)
@@ -634,17 +648,21 @@ class OpenAIProxyService:
             )
 
             if is_stream:
+                # 快速失败窗口：窗口内失败还能用真实 HTTP 状态码返回标准错误体
+                gate = await self.stream_start_gate.open(
+                    self.failover_manager.chat_completion_stream(request_data, audit_ctx)
+                )
+                if gate.failed:
+                    raise gate.error
+
                 # 流式响应处理
                 async def stream_generator():
                     # 心跳计数：等待上游流对象阶段 + 上游首 token 静默阶段共用一个计数器
                     heartbeat = HeartbeatCounter()
                     try:
-                        # 等待上游返回流对象的静默期（连接建立/上游排队/首块等待）同样下发心跳，
+                        # 窗口内已就绪时不会产出心跳；超过窗口时继续等上游并保持静默期心跳，
                         # 否则客户端在这段时间收不到任何字节，无法区分「仍在处理」与「已卡死」
-                        waiter = UpstreamStartHeartbeat(
-                            self.failover_manager.chat_completion_stream(request_data, audit_ctx),
-                            counter=heartbeat,
-                        )
+                        waiter = UpstreamStartHeartbeat(gate.task, counter=heartbeat)
                         async for data in waiter:
                             yield data
                         audit_ctx.record_keepalive(heartbeat.count)
@@ -675,17 +693,10 @@ class OpenAIProxyService:
                                 payload = str(result).encode('utf-8')
                             yield payload + b"\n"
                             # 补发 [DONE]（非 SSE 流场景）
-                            yield b"data: [DONE]\n\n"
-                    except Exception as e:
-                        error_response = {
-                            "error": {
-                                "message": str(e),
-                                "type": "proxy_error",
-                                "param": None,
-                                "code": "proxy_error"
-                            }
-                        }
-                        yield json.dumps(error_response).encode() + b"\n"
+                            yield SSE_DONE
+                    except Exception as e:  # noqa: BLE001 - 流已开始，只能以 SSE 事件通报
+                        logger.error(f"流式响应失败（已开始传输）: {e}", exc_info=True)
+                        yield _chat_stream_error_bytes(e)
 
                 return StreamingResponse(stream_generator(), media_type="text/event-stream")  # type: ignore[arg-type]
             else:
@@ -735,15 +746,19 @@ class OpenAIProxyService:
             stream_context = self.responses_adapter.context
 
             if is_stream:
+                # 快速失败窗口：窗口内失败仍能用真实 HTTP 状态码返回标准错误体
+                gate = await self.stream_start_gate.open(
+                    self.failover_manager.chat_completion_stream(chat_payload, audit_ctx)
+                )
+                if gate.failed:
+                    raise gate.error
+
                 async def stream_generator():
                     context_token = self.responses_adapter.activate_context(stream_context)
                     heartbeat = HeartbeatCounter()
                     try:
-                        # 同 /v1/chat/completions：等待上游流对象的静默期也要下发心跳
-                        waiter = UpstreamStartHeartbeat(
-                            self.failover_manager.chat_completion_stream(chat_payload, audit_ctx),
-                            counter=heartbeat,
-                        )
+                        # 同 /v1/chat/completions：窗口内已就绪时不会产出心跳
+                        waiter = UpstreamStartHeartbeat(gate.task, counter=heartbeat)
                         async for data in waiter:
                             yield data
                         audit_ctx.record_keepalive(heartbeat.count)
@@ -761,7 +776,9 @@ class OpenAIProxyService:
                             if completion_events:
                                 yield completion_events.encode('utf-8')
                     except Exception as e:
+                        # 流已开始，用标准 event: error 通报，避免客户端拿到空流
                         logger.error(f"Upstream stream error: {e}", exc_info=True)
+                        yield _responses_stream_error_bytes(e)
                         self.responses_adapter.context.cleanup()
                     finally:
                         self.responses_adapter.reset_context(context_token)

@@ -18,6 +18,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from openai_proxy.core.error_envelope import GatewayFailoverError
+
 # 转发协议前缀：这些接口的错误形状保持不变
 FORWARD_PREFIXES = ("/v1", "/proxy")
 
@@ -90,6 +92,11 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # 故障转移失败：无论是否转发路径，都返回 OpenAI 兼容错误信封
+        # （状态码、type、code、param、Retry-After 都由信封统一决定）
+        if isinstance(exc, GatewayFailoverError):
+            return exc.to_response()
+
         if is_forward_path(request.url.path):
             # 转发协议接口：保持 FastAPI/Starlette 默认的 {"detail": ...}
             return JSONResponse(

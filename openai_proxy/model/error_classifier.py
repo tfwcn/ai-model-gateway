@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
+from openai_proxy.core.error_envelope import MAX_PUBLIC_MESSAGE_CHARS, UpstreamErrorParser
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,16 +45,24 @@ class ErrorCategory(Enum):
 class ClassifiedError:
     """分类后的错误信息"""
     category: ErrorCategory  # 错误分类
-    message: str  # 错误消息
+    message: str  # 错误消息（日志用，含模型名）
     is_retryable: bool  # 是否可重试
     should_disable_model: bool  # 是否应该禁用模型
     retry_delay_seconds: float = 0.0  # 重试延迟（秒）
     should_stop_failover: bool = False  # 是否停止故障转移（不切换模型）
     metadata: Dict[str, Any] = None  # 额外元数据
-    
+    # 对外可展示的错误文本：不含模型/平台名，优先使用上游原始 message
+    public_message: Optional[str] = None
+    # 上游 HTTP 状态码（网络类错误为 None）
+    http_status: Optional[int] = None
+    # 上游返回的 Retry-After（秒）
+    retry_after_seconds: Optional[float] = None
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
+        if self.public_message is None:
+            self.public_message = self.message
 
 
 class ErrorClassifier:
@@ -199,7 +209,8 @@ class ErrorClassifier:
         return any(kw in error_lower for kw in keywords)
     
     @classmethod
-    def classify_http_error(cls, status_code: int, error_text: str, model_name: str) -> ClassifiedError:
+    def classify_http_error(cls, status_code: int, error_text: str, model_name: str,
+                            retry_after: Optional[float] = None) -> ClassifiedError:
         """
         分类HTTP错误
         
@@ -207,6 +218,7 @@ class ErrorClassifier:
             status_code: HTTP状态码
             error_text: 错误响应文本
             model_name: 模型名称
+            retry_after: 上游返回的 Retry-After（秒）
             
         Returns:
             ClassifiedError: 分类后的错误
@@ -215,24 +227,42 @@ class ErrorClassifier:
         if cls._is_tool_call_id_error(error_text):
             return cls.classify_tool_call_error(model_name, error_text)
 
-        # 检测免费层拦截（OpenCode 新版网关：匿名伪装头已失效，返回 403 FreeTierError）
+        # 检测免费层拦截（部分平台匿名访问已失效，会返回 403 免费层错误）
         if cls._is_free_tier_blocked(error_text):
             return cls.classify_free_tier_blocked(model_name, error_text, status_code)
         
         category = cls.HTTP_STATUS_MAP.get(status_code, ErrorCategory.UNKNOWN_ERROR)
         strategy = cls.ERROR_STRATEGIES.get(category, cls.ERROR_STRATEGIES[ErrorCategory.UNKNOWN_ERROR])
-        
-        message = f"HTTP {status_code}: {error_text[:200]}"  # 限制错误消息长度
-        
+
+        # 优先复用上游自己的错误文案（如「图片下载失败 + 完整 URL」），
+        # 只有拿不到时才用「HTTP 状态码 + 原始报文」兜底
+        parsed = UpstreamErrorParser.parse(error_text)
+        upstream_message = parsed.get("message")
+        if upstream_message:
+            public_message = upstream_message[:MAX_PUBLIC_MESSAGE_CHARS]
+        elif (error_text or "").strip():
+            public_message = f"HTTP {status_code}: {error_text[:MAX_PUBLIC_MESSAGE_CHARS]}"
+        else:
+            public_message = f"上游返回 HTTP {status_code} 错误（无响应体）"
+
+        message = f"模型 {model_name} 返回错误: HTTP {status_code}: {error_text[:200]}"  # 日志用
+
         return ClassifiedError(
             category=category,
             message=message,
             is_retryable=strategy["is_retryable"],
             should_disable_model=strategy["should_disable_model"],
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=public_message,
+            http_status=status_code,
+            retry_after_seconds=retry_after,
             metadata={
                 "status_code": status_code,
                 "model_name": model_name,
+                "upstream_code": parsed.get("code"),
+                "upstream_type": parsed.get("type"),
+                "upstream_param": parsed.get("param"),
+                "retry_after": retry_after,
             }
         )
     
@@ -258,6 +288,7 @@ class ErrorClassifier:
             is_retryable=strategy["is_retryable"],
             should_disable_model=strategy["should_disable_model"],
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=f"上游请求超时（阈值 {timeout} 秒）",
             metadata={
                 "model_name": model_name,
                 "elapsed_time": elapsed_time,
@@ -293,6 +324,7 @@ class ErrorClassifier:
             is_retryable=strategy["is_retryable"],
             should_disable_model=strategy["should_disable_model"],
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=f"上游在 {budget:g} 秒内未返回首个数据块",
             metadata={
                 "model_name": model_name,
                 "elapsed_time": elapsed_time,
@@ -331,6 +363,7 @@ class ErrorClassifier:
             is_retryable=strategy["is_retryable"],
             should_disable_model=strategy["should_disable_model"],
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=f"上游连接失败: {str(exception)[:MAX_PUBLIC_MESSAGE_CHARS]}",
             metadata={
                 "model_name": model_name,
                 "exception_type": type(exception).__name__,
@@ -363,6 +396,7 @@ class ErrorClassifier:
             should_disable_model=strategy["should_disable_model"],
             should_stop_failover=strategy.get("should_stop_failover", False),
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=f"上游返回了无效响应: {reason[:MAX_PUBLIC_MESSAGE_CHARS]}",
             metadata={
                 "model_name": model_name,
                 "reason": reason,
@@ -391,6 +425,10 @@ class ErrorClassifier:
             should_disable_model=strategy["should_disable_model"],
             should_stop_failover=strategy["should_stop_failover"],
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=(
+                "请求中的工具调用缺少 tool_call_id，无法与上游的工具调用响应配对: "
+                f"{error_text[:MAX_PUBLIC_MESSAGE_CHARS]}"
+            ),
             metadata={
                 "model_name": model_name,
                 "error_text": error_text[:500],
@@ -413,7 +451,7 @@ class ErrorClassifier:
         strategy = cls.ERROR_STRATEGIES[ErrorCategory.FREE_TIER_BLOCKED]
         message = (
             f"模型 {model_name} 免费层被拦截（匿名访问已失效）: {error_text[:200]} "
-            f"请配置真实 Key（OPENCODE_API_KEY，见 opencode.ai/auth）或切换其他平台"
+            f"请配置该平台的真实 Key 或切换其他平台"
         )
 
         return ClassifiedError(
@@ -423,6 +461,9 @@ class ErrorClassifier:
             should_disable_model=strategy["should_disable_model"],
             should_stop_failover=strategy.get("should_stop_failover", False),
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            # 对外不暴露具体供应商，只说明需要授权访问
+            public_message="上游免费层不可用，请使用已授权的密钥或切换其他平台",
+            http_status=status_code,
             metadata={
                 "model_name": model_name,
                 "status_code": status_code,
@@ -452,6 +493,7 @@ class ErrorClassifier:
             is_retryable=strategy["is_retryable"],
             should_disable_model=strategy["should_disable_model"],
             retry_delay_seconds=strategy["retry_delay_seconds"],
+            public_message=f"上游调用异常: {str(exception)[:MAX_PUBLIC_MESSAGE_CHARS]}",
             metadata={
                 "model_name": model_name,
                 "exception_type": type(exception).__name__,

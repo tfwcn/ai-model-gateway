@@ -8,8 +8,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 
 import aiohttp
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+from openai_proxy.core.error_envelope import AttemptFailure, ErrorEnvelope, GatewayFailoverError
 
 from openai_proxy.models import ModelConfig
 from openai_proxy.model.state import ModelStateManager
@@ -71,6 +70,25 @@ class ModelFailoverManager:
         connect_timeout = model_config.connect_timeout
         connect_timeout = self.connect_timeout if connect_timeout is None else float(connect_timeout)
         return min(float(connect_timeout), float(model_config.timeout))
+
+    @staticmethod
+    def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+        """解析上游 Retry-After：只认秒数形式，HTTP 日期形式忽略"""
+        if not value:
+            return None
+        try:
+            return max(0.0, float(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _retry_after_from_response(cls, response: Any) -> Optional[float]:
+        """从上游响应头取 Retry-After（响应对象不一定带 headers，做容错）"""
+        headers = getattr(response, "headers", None) or {}
+        try:
+            return cls._parse_retry_after(headers.get("Retry-After"))
+        except AttributeError:
+            return None
 
     def _build_stream_timeout(self, model_config: ModelConfig) -> aiohttp.ClientTimeout:
         """构造流式请求超时：连接类用短超时，流式间隙由 sock_read 兜底，总时长不设限"""
@@ -425,7 +443,8 @@ class ModelFailoverManager:
                             if isinstance(json_data.get("error"), dict):
                                 error_text = json_data["error"].get("message", chunk_str)
                             classified_error = ErrorClassifier.classify_http_error(
-                                response.status, error_text, model_config.name
+                                response.status, error_text, model_config.name,
+                                retry_after=self._retry_after_from_response(response),
                             )
                             logger.info(f"[{request_id}] 错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
                             return False, classified_error
@@ -443,8 +462,9 @@ class ModelFailoverManager:
                         return False, self._first_chunk_timeout_error(model_config, budget)
                     error_msg = f"模型 {model_config.name} 流式响应为空（未收到有效数据）"
                     logger.warning(f"[{request_id}] {error_msg}")
+                    # 对外文本里不带模型名，避免泄露内部拓扑
                     classified_error = ErrorClassifier.classify_invalid_response(
-                        model_config.name, error_msg
+                        model_config.name, "流式响应为空（未收到有效数据）"
                     )
                     logger.info(f"[{request_id}] 错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
                     return False, classified_error
@@ -630,9 +650,9 @@ class ModelFailoverManager:
                     else:
                         error_msg = f"模型 {model_config.name} 返回的响应缺少有效的 content 字段"
                         logger.warning(error_msg)
-                        # 使用错误分类器进行分类
+                        # 使用错误分类器进行分类（对外文本里不带模型名）
                         classified_error = ErrorClassifier.classify_invalid_response(
-                            model_config.name, error_msg
+                            model_config.name, "响应缺少有效的 content 字段"
                         )
                         logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
                         return False, classified_error
@@ -642,7 +662,8 @@ class ModelFailoverManager:
 
                     # 使用错误分类器进行分类
                     classified_error = ErrorClassifier.classify_http_error(
-                        response.status, error_text, model_config.name
+                        response.status, error_text, model_config.name,
+                        retry_after=self._retry_after_from_response(response),
                     )
 
                     logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
@@ -674,6 +695,59 @@ class ModelFailoverManager:
             logger.info(f"错误分类结果: {ErrorClassifier.get_error_summary(classified_error)}")
             return False, classified_error
 
+    # ---------- 失败聚合 ----------
+
+    def _to_failure(self, result: Any) -> AttemptFailure:
+        """把分类错误（或旧版字符串错误）转成对外失败画像"""
+        if isinstance(result, ClassifiedError):
+            metadata = result.metadata or {}
+            return AttemptFailure(
+                category=result.category.value,
+                message=result.public_message or result.message,
+                http_status=result.http_status or metadata.get("status_code"),
+                upstream_code=metadata.get("upstream_code"),
+                upstream_type=metadata.get("upstream_type"),
+                upstream_param=metadata.get("upstream_param"),
+                retry_after=result.retry_after_seconds or metadata.get("retry_after"),
+                stop_failover=result.should_stop_failover,
+            )
+        return AttemptFailure(category="unknown_error", message=str(result))
+
+    async def _unavailable_failure(self, platform_models: List[ModelConfig]) -> AttemptFailure:
+        """平台内已无可用模型：把最近一次禁用原因一并带出，避免根因丢失"""
+        record = await self.model_state_manager.recent_disable_record(platform_models)
+        message = "当前没有可用模型"
+        if record and record.message:
+            message = f"{message}；最近一次失败原因: {record.message}"
+        return AttemptFailure(
+            category="no_available_model",
+            message=message,
+            http_status=record.http_status if record else None,
+            retry_after=await self.model_state_manager.nearest_recovery_seconds(platform_models),
+        )
+
+    @staticmethod
+    def _request_id(audit_ctx: Optional[AuditContext]) -> str:
+        """对外错误里的 request_id：优先复用审计的请求 ID，便于和日志对照"""
+        return getattr(audit_ctx, "gateway_request_id", None) or uuid.uuid4().hex[:8]
+
+    def _raise_failures(self, failures: List[AttemptFailure], selector: Optional[str], request_id: str) -> None:
+        """把所有失败收敛成错误信封并抛出（交给统一异常处理器还原成兼容响应）"""
+        envelope = ErrorEnvelope(failures, request_id=request_id, selector=selector)
+        logger.error(
+            f"[{request_id}] 选择器 '{selector}' 全部尝试失败: "
+            f"{envelope.http_status} {envelope.error_code} - {envelope.public_message}"
+        )
+        raise GatewayFailoverError(envelope)
+
+    def _raise_client_error(self, message: str, status: int = 400,
+                            code: Optional[str] = None,
+                            category: str = "http_400_bad_request") -> None:
+        """抛出请求本身不合法类的错误信封"""
+        raise GatewayFailoverError(
+            ErrorEnvelope.client_error(message, status=status, code=code, category=category)
+        )
+
     async def _try_single_model_with_retry(
         self,
         model_config: ModelConfig,
@@ -681,20 +755,16 @@ class ModelFailoverManager:
         is_stream: bool,
         audit_ctx: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
-        max_retries = model_config.retry_count
         """
         尝试单个模型调用，支持基于错误类型的智能重试
 
-        Args:
-            model_config: 模型配置
-            request_data: 请求数据
-            is_stream: 是否为流式调用
-            audit_ctx: 审计上下文（None 时不落审计）
-            max_retries: 最大重试次数，默认3次
-
         Returns:
-            Dict: {"success": bool, "data": Any, "error": str}
+            Dict: {"success": bool, "data": Any, "failures": List[AttemptFailure]}
         """
+        max_retries = model_config.retry_count
+        failures: List[AttemptFailure] = []
+        result: Any = None
+
         for attempt in range(1, max_retries + 1):
             if is_stream:
                 call = self.call_model_stream(model_config, request_data)
@@ -709,7 +779,9 @@ class ModelFailoverManager:
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（{'流式' if is_stream else '非流式'}）")
-                return {"success": True, "data": result, "error": None}
+                return {"success": True, "data": result, "failures": []}
+
+            failures.append(self._to_failure(result))
 
             # 根据错误类型决定是否重试
             if isinstance(result, ClassifiedError):
@@ -719,22 +791,18 @@ class ModelFailoverManager:
                     f"模型 {model_config.name} 第 {attempt}/{max_retries} 次尝试失败: {error_summary}"
                 )
 
-                # 如果错误分类建议禁用模型，则按配额情况处理
-                # 说明：仅配置了 quota_period 的模型才视为额度耗尽，需持久禁用并直接返回；
-                # 未配置 quota_period 时（如纯速率限制 429），只做本次请求内重试，不直接跳出。
-                if classified_error.should_disable_model:
-                    if model_config.quota_period is not None:
-                        logger.warning(
-                            f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）"
-                        )
-                        await self.model_state_manager.disable_model_for_period(model_config)
-                        # 配置了 quota_period 的模型禁用后不再重试
-                        return {"success": False, "error": classified_error.message, "data": None}
-                    # 未配置 quota_period：落到下面的可重试判断，继续重试
+                # 仅配置了 quota_period 的模型才视为额度耗尽，需持久禁用并直接返回；
+                # 未配置 quota_period 时（如纯速率限制 429），只做本次请求内重试。
+                if classified_error.should_disable_model and model_config.quota_period is not None:
+                    logger.warning(
+                        f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）"
+                    )
+                    await self.model_state_manager.disable_model_for_period(model_config, classified_error)
+                    return {"success": False, "failures": failures, "data": None}
 
                 # 如果错误不可重试，直接返回失败
                 if not classified_error.is_retryable:
-                    return {"success": False, "error": classified_error.message, "data": None}
+                    return {"success": False, "failures": failures, "data": None}
 
                 # 可重试的错误，等待延迟后继续
                 if attempt < max_retries:
@@ -748,7 +816,7 @@ class ModelFailoverManager:
                 if model_config.quota_period is not None:
                     logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
                     await self.model_state_manager.disable_model_for_period(model_config)
-                    return {"success": False, "error": error_msg, "data": None}
+                    return {"success": False, "failures": failures, "data": None}
 
                 # 旧版字符串错误，等待后重试
                 if attempt < max_retries:
@@ -757,28 +825,26 @@ class ModelFailoverManager:
         # 所有重试均失败
         last_error = str(result.message) if isinstance(result, ClassifiedError) else str(result)
         logger.error(f"模型 {model_config.name} 在 {max_retries} 次尝试后仍失败: {last_error}")
-        return {"success": False, "error": last_error, "data": None}
+        return {"success": False, "failures": failures, "data": None}
 
     async def _try_platform_models_non_stream(self, platform_name: str, platform_models: List[ModelConfig],
                                               request_data: Dict[str, Any],
                                               audit_ctx: Optional[AuditContext] = None) -> Dict[str, Any]:
-        """尝试平台内的模型（非流式），支持轮询机制"""
+        """尝试平台内的模型（非流式）"""
+        failures: List[AttemptFailure] = []
+
         # 过滤启用且当前周期内可用的模型
-        available_models = []
-        for model_config in platform_models:
-            if model_config.enabled and await self.model_state_manager.is_model_available(model_config):
-                available_models.append(model_config)
-
+        available_models = [
+            mc for mc in platform_models
+            if mc.enabled and await self.model_state_manager.is_model_available(mc)
+        ]
         if not available_models:
-
-            return {"success": False, "error": f"平台 {platform_name} 无可用模型", "data": None}
+            logger.info(f"平台 {platform_name} 当前没有可用模型（已全部被周期禁用或关闭）")
+            failures.append(await self._unavailable_failure(platform_models))
+            return {"success": False, "failures": failures, "data": None}
 
         # 故障转移模式：总是从索引0开始尝试（最高优先级）
-        models_to_try = available_models  # 保持原始顺序，索引0为首选
-
-        # 按顺序尝试每个模型
-        for i, model_config in enumerate(models_to_try):
-
+        for model_config in available_models:
             call = self.call_model_non_stream(model_config, request_data)
             if audit_ctx is not None:
                 success, result = await audit_ctx.run_attempt(model_config, call)
@@ -787,68 +853,32 @@ class ModelFailoverManager:
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（非流式）")
+                return {"success": True, "data": result, "failures": []}
 
-                return {"success": True, "data": result, "error": None}
-            else:
-                # 根据错误分类决定是否禁用模型
-                if isinstance(result, ClassifiedError):
-                    classified_error = result
-                    error_summary = ErrorClassifier.get_error_summary(classified_error)
-                    logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
+            failures.append(self._to_failure(result))
+            if await self._handle_model_failure(model_config, result):
+                return {"success": False, "failures": failures, "data": None}
 
-                    # 如果错误标记为停止故障转移，立即返回
-                    if classified_error.should_stop_failover:
-                        return {"success": False, "error": classified_error.message, "data": None}
-
-                    # 如果错误分类建议禁用模型，则禁用
-                    if classified_error.should_disable_model:
-                        if model_config.quota_period is not None:
-                            # 配置了 quota_period，持久化禁用
-                            logger.warning(f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）")
-                            await self.model_state_manager.disable_model_for_period(model_config)
-                        else:
-                            # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
-                            pass
-                    else:
-                        pass
-                else:
-                    # 兼容旧版本的字符串错误
-                    logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
-                    if model_config.quota_period is not None:
-                        logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
-                        await self.model_state_manager.disable_model_for_period(model_config)
-                    else:
-                        pass
-
-                # 如果是最后一个模型，返回错误
-                if i == len(models_to_try) - 1:
-                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
-                    return {"success": False, "error": error_message, "data": None}
-                else:
-                    pass
-
-        return {"success": False, "error": "未知错误", "data": None}
+        return {"success": False, "failures": failures, "data": None}
 
     async def _try_platform_models_stream(self, platform_name: str, platform_models: List[ModelConfig],
                                           request_data: Dict[str, Any],
                                           audit_ctx: Optional[AuditContext] = None) -> Dict[str, Any]:
-        """尝试平台内的模型（流式），支持轮询机制"""
+        """尝试平台内的模型（流式）"""
+        failures: List[AttemptFailure] = []
+
         # 过滤启用且当前周期内可用的模型
-        available_models = []
-        for model_config in platform_models:
-            if model_config.enabled and await self.model_state_manager.is_model_available(model_config):
-                available_models.append(model_config)
-
+        available_models = [
+            mc for mc in platform_models
+            if mc.enabled and await self.model_state_manager.is_model_available(mc)
+        ]
         if not available_models:
-
-            return {"success": False, "error": f"平台 {platform_name} 无可用模型", "data": None}
+            logger.info(f"平台 {platform_name} 当前没有可用模型（已全部被周期禁用或关闭）")
+            failures.append(await self._unavailable_failure(platform_models))
+            return {"success": False, "failures": failures, "data": None}
 
         # 故障转移模式：总是从索引0开始尝试（最高优先级）
-        models_to_try = available_models  # 保持原始顺序，索引0为首选
-
-        # 按顺序尝试每个模型
-        for i, model_config in enumerate(models_to_try):
-
+        for model_config in available_models:
             call = self.call_model_stream(model_config, request_data)
             if audit_ctx is not None:
                 success, result = await audit_ctx.run_attempt(model_config, call)
@@ -857,47 +887,43 @@ class ModelFailoverManager:
 
             if success:
                 logger.info(f"模型 {model_config.name} 调用成功（流式）")
+                return {"success": True, "data": result, "failures": []}
 
-                return {"success": True, "data": result, "error": None}
-            else:
-                # 根据错误分类决定是否禁用模型
-                if isinstance(result, ClassifiedError):
-                    classified_error = result
-                    error_summary = ErrorClassifier.get_error_summary(classified_error)
-                    logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
+            failures.append(self._to_failure(result))
+            if await self._handle_model_failure(model_config, result):
+                return {"success": False, "failures": failures, "data": None}
 
-                    # 如果错误标记为停止故障转移，立即返回
-                    if classified_error.should_stop_failover:
-                        return {"success": False, "error": classified_error.message, "data": None}
+        return {"success": False, "failures": failures, "data": None}
 
-                    # 如果错误分类建议禁用模型，则禁用
-                    if classified_error.should_disable_model:
-                        if model_config.quota_period is not None:
-                            # 配置了 quota_period，持久化禁用
-                            logger.warning(f"模型 {model_config.name} 被标记为周期内用完（错误类型: {classified_error.category.value}）")
-                            await self.model_state_manager.disable_model_for_period(model_config)
-                        else:
-                            # 未配置 quota_period，临时禁用（仅在本次请求的剩余尝试中）
-                            pass
-                    else:
-                        pass
-                else:
-                    # 兼容旧版本的字符串错误
-                    logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
-                    if model_config.quota_period is not None:
-                        logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
-                        await self.model_state_manager.disable_model_for_period(model_config)
-                    else:
-                        pass
+    async def _handle_model_failure(self, model_config: ModelConfig, result: Any) -> bool:
+        """
+        处理「平台内某个模型失败」后的状态与策略
 
-                # 如果是最后一个模型，返回错误
-                if i == len(models_to_try) - 1:
-                    error_message = str(result.message) if isinstance(result, ClassifiedError) else str(result)
-                    return {"success": False, "error": error_message, "data": None}
-                else:
-                    pass
+        Returns:
+            bool: True 表示应当立即停止故障转移
+        """
+        if isinstance(result, ClassifiedError):
+            error_summary = ErrorClassifier.get_error_summary(result)
+            logger.warning(f"模型 {model_config.name} 失败: {error_summary}")
 
-        return {"success": False, "error": "未知错误", "data": None}
+            # 如果错误标记为停止故障转移，立即返回
+            if result.should_stop_failover:
+                return True
+
+            # 配置了 quota_period 的模型按周期持久禁用，并保留失败原因
+            if result.should_disable_model and model_config.quota_period is not None:
+                logger.warning(
+                    f"模型 {model_config.name} 被标记为周期内用完（错误类型: {result.category.value}）"
+                )
+                await self.model_state_manager.disable_model_for_period(model_config, result)
+            return False
+
+        # 兼容旧版本的字符串错误
+        logger.warning(f"模型 {model_config.name} 失败: {str(result)}")
+        if model_config.quota_period is not None:
+            logger.warning(f"模型 {model_config.name} 失败，标记为周期内用完...")
+            await self.model_state_manager.disable_model_for_period(model_config)
+        return False
 
     def _collect_alias_models(self, alias_name: str) -> Dict[str, List[ModelConfig]]:
         """解析别名，收集所有匹配的模型并按平台分组
@@ -942,41 +968,52 @@ class ModelFailoverManager:
 
         return result
 
+    @staticmethod
+    def _sorted_platforms(platforms: Dict[str, List[ModelConfig]]) -> List[str]:
+        """按权重降序排列平台，权重相同时保持配置顺序"""
+        ordered = list(platforms.keys())
+
+        def weight(platform_name: str) -> int:
+            models = platforms.get(platform_name) or []
+            return models[0].weight if models else 0
+
+        return sorted(ordered, key=lambda name: (-weight(name), ordered.index(name)))
+
     async def _try_platforms_by_weight(self, platforms: Dict[str, List[ModelConfig]], request_data: Dict[str, Any],
                                        is_stream: bool, audit_ctx: Optional[AuditContext] = None) -> Dict[str, Any]:
-        """按权重降序尝试各平台的模型
-
-        Args:
-            platforms: 按平台分组的模型字典
-            request_data: 请求数据
-            is_stream: 是否为流式
+        """按权重降序尝试各平台的模型，汇总全部失败原因
 
         Returns:
-            调用结果
+            Dict: {"success": bool, "data": Any, "failures": List[AttemptFailure]}
         """
-        platform_weights = {}
-        for platform_name, platform_models in platforms.items():
-            if platform_models:
-                platform_weights[platform_name] = platform_models[0].weight
-            else:
-                platform_weights[platform_name] = 0
-
-        platforms_to_try = sorted(
-            platforms.keys(),
-            key=lambda x: (-platform_weights.get(x, 0), list(platforms.keys()).index(x))
-        )
-
-        last_error = None
-        for platform_name in platforms_to_try:
+        failures: List[AttemptFailure] = []
+        for platform_name in self._sorted_platforms(platforms):
             if is_stream:
                 result = await self._try_platform_models_stream(platform_name, platforms[platform_name], request_data, audit_ctx)
             else:
                 result = await self._try_platform_models_non_stream(platform_name, platforms[platform_name], request_data, audit_ctx)
             if result["success"]:
                 return result
-            last_error = result["error"]
+            failures.extend(result["failures"])
 
-        return {"success": False, "error": last_error, "data": None}
+        return {"success": False, "failures": failures, "data": None}
+
+    def _all_platforms_sorted(self) -> List[str]:
+        """所有平台按权重降序排列"""
+        return self._sorted_platforms(self.models)
+
+    async def _select_single_model(self, platform_name: str, model_name: str) -> ModelConfig:
+        """在指定平台内按模型名/模型 ID 查找目标模型"""
+        if platform_name not in self.models or not self.models[platform_name]:
+            logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
+            self._raise_client_error(f"平台 '{platform_name}' 未配置或无可用模型")
+
+        for model_config in self.models[platform_name]:
+            if model_config.name == model_name or model_config.model == model_name:
+                return model_config
+
+        logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
+        self._raise_client_error(f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
 
     async def chat_completion_non_stream(self, request_data: Dict[str, Any],
                                          audit_ctx: Optional[AuditContext] = None) -> Any:
@@ -984,19 +1021,19 @@ class ModelFailoverManager:
         执行非流式聊天完成请求，支持自动重试切换模型 - 完全参数透传
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
 
-        支持三种模型选择器格式：
+        支持四种模型选择器格式：
         1. "all" - 所有平台所有模型
         2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
         4. "{alias}" - 模型组别名（取并集）
         """
-        # 处理可选参数的默认值
         model_selector = request_data.get("model", "all")
         messages = request_data.get("messages")
+        request_id = self._request_id(audit_ctx)
 
         # 验证必要参数
         if not messages:
-            raise HTTPException(status_code=400, detail="messages参数是必需的")
+            self._raise_client_error("messages参数是必需的")
 
         # 解析模型选择器
         platform_or_all, model_name = self._parse_model_selector(model_selector)
@@ -1005,88 +1042,60 @@ class ModelFailoverManager:
         if model_selector in self.all_aliases:
             platforms = self._collect_alias_models(model_selector)
             if not platforms:
-                raise HTTPException(status_code=400, detail=f"别名 '{model_selector}' 未匹配到任何模型")
+                self._raise_client_error(f"别名 '{model_selector}' 未匹配到任何模型")
 
             result = await self._try_platforms_by_weight(platforms, request_data, is_stream=False, audit_ctx=audit_ctx)
             if result["success"]:
                 return result["data"]
-            raise HTTPException(status_code=500, detail=f"别名 '{model_selector}' 所有模型都不可用: {result['error']}")
+            self._raise_failures(result["failures"], model_selector, request_id)
 
         if platform_or_all == "all":
             # 模式1: all - 所有平台所有模型
-            all_platforms = list(self.models.keys())
-
-            if not all_platforms:
+            if not self.models:
                 logger.error("DEBUG: 无可用模型配置")
-                raise HTTPException(status_code=400, detail="无可用模型配置")
-
-            # 创建平台权重映射
-            platform_weights = {}
-            for platform_name in all_platforms:
-                # 获取平台的第一个模型来获取weight（同一平台内所有模型weight相同）
-                if self.models[platform_name]:
-                    platform_weights[platform_name] = self.models[platform_name][0].weight
-                else:
-                    platform_weights[platform_name] = 0
-
-            # 按权重降序排序（权重高的优先），权重相同时保持原有顺序
-            platforms_to_try = sorted(
-                all_platforms,
-                key=lambda x: (-platform_weights.get(x, 0), all_platforms.index(x))
-            )
-
-            # 尝试每个平台
-            last_error = None
-            for platform_name in platforms_to_try:
-                platform_models = self.models[platform_name]
-                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data, audit_ctx)
-                if result["success"]:
-                    return result["data"]
-                else:
-                    last_error = result["error"]
-
-            logger.error(f"所有平台都失败了，最后错误: {last_error}")
-            raise HTTPException(status_code=500, detail=f"所有模型都不可用: {last_error}")
-        else:
-            # 模式2或模式3: 指定平台
-            platform_name = platform_or_all
-            if platform_name not in self.models or not self.models[platform_name]:
-                logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
-                raise HTTPException(status_code=400, detail=f"平台 '{platform_name}' 未配置或无可用模型")
-
-            if model_name is None:
-                # 模式2: {platform} - 指定平台的所有模型
-                platform_models = self.models[platform_name]
-                result = await self._try_platform_models_non_stream(platform_name, platform_models, request_data, audit_ctx)
-                if result["success"]:
-                    return result["data"]
-                else:
-                    logger.error(f"指定平台 '{platform_name}' 所有模型都失败了: {result['error']}")
-                    raise HTTPException(status_code=500, detail=f"平台 '{platform_name}' 所有模型都不可用: {result['error']}")
-            else:
-                # 模式3: {platform}|{model_name} - 指定平台的指定模型
-                platform_models = self.models[platform_name]
-                target_model = None
-                for model_config in platform_models:
-                    if model_config.name == model_name or model_config.model == model_name:
-                        target_model = model_config
-                        break
-
-                if target_model is None:
-                    logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
-                    raise HTTPException(status_code=400, detail=f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
-
-                # 模式3: 指定单个模型，使用带重试的方法调用
-                retry_result = await self._try_single_model_with_retry(
-                    target_model, request_data, is_stream=False, audit_ctx=audit_ctx
+                self._raise_client_error(
+                    "网关尚未配置任何可用模型", status=503,
+                    code="no_available_model", category="no_available_model",
                 )
-                if retry_result["success"]:
-                    logger.info(f"模型 {target_model.name} 调用成功（非流式）")
-                    return retry_result["data"]
-                else:
-                    error_message = retry_result["error"]
-                    logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
-                    raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
+
+            failures: List[AttemptFailure] = []
+            for platform_name in self._all_platforms_sorted():
+                result = await self._try_platform_models_non_stream(
+                    platform_name, self.models[platform_name], request_data, audit_ctx
+                )
+                if result["success"]:
+                    return result["data"]
+                failures.extend(result["failures"])
+
+            self._raise_failures(failures, model_selector, request_id)
+
+        # 模式2或模式3: 指定平台
+        platform_name = platform_or_all
+        if platform_name not in self.models or not self.models[platform_name]:
+            logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
+            self._raise_client_error(f"平台 '{platform_name}' 未配置或无可用模型")
+
+        if model_name is None:
+            # 模式2: {platform} - 指定平台的所有模型
+            result = await self._try_platform_models_non_stream(
+                platform_name, self.models[platform_name], request_data, audit_ctx
+            )
+            if result["success"]:
+                return result["data"]
+            logger.error(f"指定平台 '{platform_name}' 所有模型都失败了")
+            self._raise_failures(result["failures"], model_selector, request_id)
+
+        # 模式3: {platform}|{model_name} - 指定平台的指定模型
+        target_model = await self._select_single_model(platform_name, model_name)
+        retry_result = await self._try_single_model_with_retry(
+            target_model, request_data, is_stream=False, audit_ctx=audit_ctx
+        )
+        if retry_result["success"]:
+            logger.info(f"模型 {target_model.name} 调用成功（非流式）")
+            return retry_result["data"]
+
+        logger.error(f"模型 '{model_name}' 调用失败")
+        self._raise_failures(retry_result["failures"], model_selector, request_id)
 
     async def chat_completion_stream(self, request_data: Dict[str, Any],
                                      audit_ctx: Optional[AuditContext] = None) -> Any:
@@ -1095,19 +1104,19 @@ class ModelFailoverManager:
         实现按权重排序的故障转移机制：平台按照weight字段从高到低排序（weight值越大优先级越高）
         注意：流式请求必须在开始传输前完成所有模型选择，不能在流式过程中切换
 
-        支持三种模型选择器格式：
+        支持四种模型选择器格式：
         1. "all" - 所有平台所有模型
         2. "{platform}" - 指定平台的所有模型
         3. "{platform}|{model_name}" - 指定平台的指定模型
         4. "{alias}" - 模型组别名（取并集）
         """
-        # 处理可选参数的默认值
         model_selector = request_data.get("model", "all")
         messages = request_data.get("messages")
+        request_id = self._request_id(audit_ctx)
 
         # 验证必要参数
         if not messages:
-            raise HTTPException(status_code=400, detail="messages参数是必需的")
+            self._raise_client_error("messages参数是必需的")
 
         # 解析模型选择器
         platform_or_all, model_name = self._parse_model_selector(model_selector)
@@ -1116,88 +1125,60 @@ class ModelFailoverManager:
         if model_selector in self.all_aliases:
             platforms = self._collect_alias_models(model_selector)
             if not platforms:
-                raise HTTPException(status_code=400, detail=f"别名 '{model_selector}' 未匹配到任何模型")
+                self._raise_client_error(f"别名 '{model_selector}' 未匹配到任何模型")
 
             result = await self._try_platforms_by_weight(platforms, request_data, is_stream=True, audit_ctx=audit_ctx)
             if result["success"]:
                 return result["data"]
-            raise HTTPException(status_code=500, detail=f"别名 '{model_selector}' 所有模型都不可用: {result['error']}")
+            self._raise_failures(result["failures"], model_selector, request_id)
 
         if platform_or_all == "all":
             # 模式1: all - 所有平台所有模型
-            all_platforms = list(self.models.keys())
-
-            if not all_platforms:
+            if not self.models:
                 logger.error("DEBUG: 无可用模型配置")
-                raise HTTPException(status_code=400, detail="无可用模型配置")
-
-            # 创建平台权重映射
-            platform_weights = {}
-            for platform_name in all_platforms:
-                # 获取平台的第一个模型来获取weight（同一平台内所有模型weight相同）
-                if self.models[platform_name]:
-                    platform_weights[platform_name] = self.models[platform_name][0].weight
-                else:
-                    platform_weights[platform_name] = 0
-
-            # 按权重降序排序（权重高的优先），权重相同时保持原有顺序
-            platforms_to_try = sorted(
-                all_platforms,
-                key=lambda x: (-platform_weights.get(x, 0), all_platforms.index(x))
-            )
-
-            # 尝试每个平台
-            last_error = None
-            for platform_name in platforms_to_try:
-                platform_models = self.models[platform_name]
-                result = await self._try_platform_models_stream(platform_name, platform_models, request_data, audit_ctx)
-                if result["success"]:
-                    return result["data"]
-                else:
-                    last_error = result["error"]
-
-            logger.error(f"所有平台都失败了，最后错误: {last_error}")
-            raise HTTPException(status_code=500, detail=f"所有模型都不可用: {last_error}")
-        else:
-            # 模式2或模式3: 指定平台
-            platform_name = platform_or_all
-            if platform_name not in self.models or not self.models[platform_name]:
-                logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
-                raise HTTPException(status_code=400, detail=f"平台 '{platform_name}' 未配置或无可用模型")
-
-            if model_name is None:
-                # 模式2: {platform} - 指定平台的所有模型
-                platform_models = self.models[platform_name]
-                result = await self._try_platform_models_stream(platform_name, platform_models, request_data, audit_ctx)
-                if result["success"]:
-                    return result["data"]
-                else:
-                    logger.error(f"指定平台 '{platform_name}' 所有模型都失败了: {result['error']}")
-                    raise HTTPException(status_code=500, detail=f"平台 '{platform_name}' 所有模型都不可用: {result['error']}")
-            else:
-                # 模式3: {platform}|{model_name} - 指定平台的指定模型
-                platform_models = self.models[platform_name]
-                target_model = None
-                for model_config in platform_models:
-                    if model_config.name == model_name or model_config.model == model_name:
-                        target_model = model_config
-                        break
-
-                if target_model is None:
-                    logger.error(f"DEBUG: 模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
-                    raise HTTPException(status_code=400, detail=f"模型 '{model_name}' 在平台 '{platform_name}' 中未找到")
-
-                # 模式3: 指定单个模型，使用带重试的方法调用
-                retry_result = await self._try_single_model_with_retry(
-                    target_model, request_data, is_stream=True, audit_ctx=audit_ctx
+                self._raise_client_error(
+                    "网关尚未配置任何可用模型", status=503,
+                    code="no_available_model", category="no_available_model",
                 )
-                if retry_result["success"]:
-                    logger.info(f"模型 {target_model.name} 调用成功（流式）")
-                    return retry_result["data"]
-                else:
-                    error_message = retry_result["error"]
-                    logger.error(f"模型 '{model_name}' 调用失败: {error_message}")
-                    raise HTTPException(status_code=500, detail=f"模型 '{model_name}' 调用失败: {error_message}")
+
+            failures: List[AttemptFailure] = []
+            for platform_name in self._all_platforms_sorted():
+                result = await self._try_platform_models_stream(
+                    platform_name, self.models[platform_name], request_data, audit_ctx
+                )
+                if result["success"]:
+                    return result["data"]
+                failures.extend(result["failures"])
+
+            self._raise_failures(failures, model_selector, request_id)
+
+        # 模式2或模式3: 指定平台
+        platform_name = platform_or_all
+        if platform_name not in self.models or not self.models[platform_name]:
+            logger.error(f"DEBUG: 平台 '{platform_name}' 未配置或无可用模型")
+            self._raise_client_error(f"平台 '{platform_name}' 未配置或无可用模型")
+
+        if model_name is None:
+            # 模式2: {platform} - 指定平台的所有模型
+            result = await self._try_platform_models_stream(
+                platform_name, self.models[platform_name], request_data, audit_ctx
+            )
+            if result["success"]:
+                return result["data"]
+            logger.error(f"指定平台 '{platform_name}' 所有模型都失败了")
+            self._raise_failures(result["failures"], model_selector, request_id)
+
+        # 模式3: {platform}|{model_name} - 指定平台的指定模型
+        target_model = await self._select_single_model(platform_name, model_name)
+        retry_result = await self._try_single_model_with_retry(
+            target_model, request_data, is_stream=True, audit_ctx=audit_ctx
+        )
+        if retry_result["success"]:
+            logger.info(f"模型 {target_model.name} 调用成功（流式）")
+            return retry_result["data"]
+
+        logger.error(f"模型 '{model_name}' 调用失败")
+        self._raise_failures(retry_result["failures"], model_selector, request_id)
 
     async def close(self):
         """关闭会话"""
