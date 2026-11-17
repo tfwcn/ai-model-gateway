@@ -149,7 +149,8 @@ class UsageCommands:
     def usage_dimensions(self, args) -> int:
         """永久维度日汇总：按任意维度组合看调用量"""
         result = self._call(lambda queries: queries.dimension_usage(
-            args.group_by, args.since, args.until, args.user, args.endpoint, args.limit
+            args.group_by, args.since, args.until, args.user, args.endpoint, args.limit,
+            args.sort, args.order, args.filters,
         ))
         if result is None:
             return EXIT_ERROR
@@ -158,7 +159,10 @@ class UsageCommands:
             return EXIT_OK
 
         columns = [(name, name) for name in result["group_by"]]
-        self.console.line(f"维度汇总（按 {args.group_by}，共 {result['count']} 组）")
+        self.console.line(
+            f"维度汇总（按 {args.group_by}，共 {result['count']} 组，"
+            f"排序 {result['sort']} {result['order']}）"
+        )
         rows = [
             {**item, **(item.get("values") or {})}
             for item in result["items"]
@@ -169,6 +173,11 @@ class UsageCommands:
             ("success", "成功"),
             ("failure", "失败"),
             ("aborted", "中断"),
+            ("retries", "重试"),
+            ("avg_ttft_ms", "首块ms"),
+            ("p95_duration_ms", "P95ms"),
+            ("avg_duration_ms", "平均ms"),
+            ("avg_throughput", "tokens/s"),
             ("input_tokens", "输入tokens"),
             ("cached_tokens", "缓存tokens"),
             ("output_tokens", "输出tokens"),

@@ -8,7 +8,8 @@
  * 点击任意一行会展开它所属请求的整条链路。
  */
 
-import { button, control, el, empty, fmtMs, fmtNumber, fmtTime, panel, readControls, select, table, textInput, userLabel } from "./ui.js";
+import { button, control, el, empty, fmtMs, fmtNumber, fmtRate, fmtTime, panel, readControls, select, table, textInput, userLabel } from "./ui.js";
+import { lineChart } from "./charts.js";
 import { DateRange } from "./date_range.js";
 
 const OUTCOME_OPTIONS = [
@@ -26,6 +27,33 @@ const LABELS = {
   user: "用户标签",
   gateway_request_id: "请求 ID",
 };
+
+// 30 天聚合：口径与 /admin/usage/summary 一致
+const GROUP_OPTIONS = [
+  { value: "model", label: "按模型" },
+  { value: "platform", label: "按平台" },
+  { value: "user", label: "按用户" },
+  { value: "endpoint", label: "按入口" },
+  { value: "selector", label: "按请求的 model" },
+  { value: "outcome", label: "按结局" },
+  { value: "error", label: "按错误分类" },
+  { value: "day", label: "按天" },
+];
+
+const SORT_OPTIONS = [
+  { value: "requests", label: "请求数" },
+  { value: "p95", label: "P95 耗时" },
+  { value: "ttft", label: "首块耗时" },
+  { value: "throughput", label: "tokens/s" },
+  { value: "failover", label: "故障转移次数" },
+  { value: "errors", label: "失败次数" },
+  { value: "tokens", label: "输出 tokens" },
+];
+
+const TREND_BUCKET_OPTIONS = [
+  { value: "day", label: "按天" },
+  { value: "hour", label: "按小时" },
+];
 
 // 结局口径写在页面上，避免把「[DONE] 已发完后客户端关闭」误读成中断
 const OUTCOME_NOTE =
@@ -51,6 +79,14 @@ export async function renderAudit(root, ctx) {
   const chainBox = el("div");
   const statusBox = el("div");
 
+  // 30 天聚合与趋势：保留期内的明细聚合成表格和曲线
+  const aggregateGroupBy = select(GROUP_OPTIONS, "day");
+  const aggregateSort = select(SORT_OPTIONS, "requests");
+  const trendBucket = select(TREND_BUCKET_OPTIONS, "day");
+  const aggregateButton = button("查询 30 天聚合", "primary");
+  const aggregateBox = el("div");
+  const aggregateCanvas = el("canvas", { class: "chart" });
+
   const paging = el("div", { class: "row-actions" }, [prev, next, el("span", { class: "muted", text: "点击任意行看整条链路" })]);
 
   root.append(
@@ -66,11 +102,22 @@ export async function renderAudit(root, ctx) {
     statusBox,
     panel("审计明细", [listBox], paging),
     chainBox,
+    panel("30 天聚合 / 趋势（审计明细范围内）", [
+      el("div", { class: "filters" }, [
+        control("聚合维度", aggregateGroupBy),
+        control("排序", aggregateSort),
+        control("曲线粒度", trendBucket),
+      ]),
+      el("p", { class: "muted", text: "这里的 P95 是明细精确值；永久维度汇总是直方图估算值。沿用上方日期范围、用户、平台、模型；结局 / 请求 ID 不参与聚合。" }),
+      aggregateCanvas,
+      aggregateBox,
+    ], aggregateButton),
   );
 
-  loadButton.addEventListener("click", () => { page.offset = 0; load(); });
+  loadButton.addEventListener("click", () => { page.offset = 0; load(); loadAggregate(true); });
   prev.addEventListener("click", () => { page.offset = Math.max(0, page.offset - page.limit); load(); });
   next.addEventListener("click", () => { page.offset += page.limit; load(); });
+  aggregateButton.addEventListener("click", () => loadAggregate());
 
   async function load() {
     const params = { ...readControls(filters), ...range.params() };
@@ -90,6 +137,39 @@ export async function renderAudit(root, ctx) {
     }
   }
 
+  async function loadAggregate(quiet = false) {
+    const { since, until } = range.params();
+    const controls = readControls(filters);
+    const user = (controls.user || "").trim();
+    const platform = (controls.platform || "").trim();
+    const model = (controls.model || "").trim();
+    aggregateButton.disabled = true;
+    try {
+      const [grouped, series] = await Promise.all([
+        ctx.api.postQuery("/admin/usage/summary", {
+          since,
+          until,
+          platform,
+          model,
+          user,
+          group_by: aggregateGroupBy.value,
+          limit: 60,
+          sort: aggregateSort.value,
+        }),
+        ctx.api.postQuery("/admin/usage/timeseries", {
+          since, until, platform, model, user, bucket: trendBucket.value,
+        }),
+      ]);
+      renderAggregate(aggregateBox, grouped);
+      drawAggregateTrend(aggregateCanvas, series);
+      if (!quiet) ctx.notice("30 天聚合已刷新", "ok");
+    } catch (error) {
+      ctx.guard(error);
+    } finally {
+      aggregateButton.disabled = false;
+    }
+  }
+
   async function openChain(gatewayRequestId) {
     try {
       const chain = await ctx.api.postQuery(`/admin/audit/chain/${encodeURIComponent(gatewayRequestId)}`);
@@ -99,7 +179,7 @@ export async function renderAudit(root, ctx) {
     }
   }
 
-  await load();
+  await Promise.all([load(), loadAggregate(true)]);
 }
 
 // ---------- 呈现 ----------
@@ -116,6 +196,46 @@ function renderHealth(box, health) {
     el("span", { class: "chip", text: `保留 ${health.config.retention_days} 天` }),
     el("span", { class: "chip", text: `最近刷盘 ${fmtTime(collector.last_flush_at)}` }),
   ]));
+}
+
+function drawAggregateTrend(canvas, series) {
+  const points = series.points || [];
+  const labels = points.map((point) => point.bucket.slice(-5));
+
+  lineChart(canvas, labels, [
+    { label: "请求数", values: points.map((point) => point.requests) },
+    { label: "P95 耗时(ms)", values: points.map((point) => point.p95_duration_ms) },
+    { label: "首块耗时(ms)", values: points.map((point) => point.avg_ttft_ms) },
+  ]);
+}
+
+function renderAggregate(box, grouped) {
+  if (!grouped.items.length) {
+    box.replaceChildren(empty("这个时间范围内没有审计记录"));
+    return;
+  }
+  box.replaceChildren(table([
+    { key: "bucket", label: "分组", render: (row) => chips(row) },
+    { key: "requests", label: "请求", num: true },
+    { key: "attempts", label: "尝试", num: true },
+    { key: "success_rate", label: "成功率", num: true, render: (row) => fmtRate(row.success_rate) },
+    { key: "failover_count", label: "切换", num: true },
+    { key: "input_tokens", label: "输入 tokens", num: true },
+    { key: "cached_tokens", label: "缓存 tokens", num: true },
+    { key: "output_tokens", label: "输出 tokens", num: true },
+    { key: "avg_ttft_ms", label: "首块", num: true, render: (row) => fmtMs(row.avg_ttft_ms) },
+    { key: "p95_duration_ms", label: "P95", num: true, render: (row) => fmtMs(row.p95_duration_ms) },
+    { key: "avg_duration_ms", label: "平均耗时", num: true, render: (row) => fmtMs(row.avg_duration_ms) },
+    { key: "avg_throughput", label: "tokens/s", num: true, render: (row) => fmtNumber(row.avg_throughput, 1) },
+  ], grouped.items));
+}
+
+function chips(row) {
+  const nodes = [el("span", { text: row.bucket })];
+  if (row.disabled_models) {
+    nodes.push(el("span", { class: "chip warn", text: `禁用 ${row.disabled_models}` }));
+  }
+  return el("span", {}, nodes);
 }
 
 function renderList(box, result, page, openChain) {

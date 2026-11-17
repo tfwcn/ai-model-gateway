@@ -149,6 +149,109 @@ class TestDimensionQueries:
         assert result["items"][0]["values"] == {"day": "2026-01-01", "user": "user-a"}
 
     @pytest.mark.unit
+    def test_可以按维度值排序(self, queries):
+        result = queries.dimension_usage(
+            "model,size", since="2026-01-01", sort="size", order="asc"
+        )
+
+        assert result["sort"] == "size"
+        assert result["order"] == "asc"
+        assert [item["values"]["size"] for item in result["items"]] == [
+            "1024x1024", "1024x1024", "512x512",
+        ]
+
+    @pytest.mark.unit
+    def test_维度排序默认升序(self, queries):
+        result = queries.dimension_usage("model", since="2026-01-01", sort="model")
+
+        assert result["order"] == "asc"
+        assert [item["values"]["model"] for item in result["items"]] == ["model-a", "model-b"]
+
+    @pytest.mark.unit
+    def test_可以按指标升序排序(self, queries):
+        result = queries.dimension_usage(
+            "model,size", since="2026-01-01", sort="requests", order="asc"
+        )
+
+        assert [item["requests"] for item in result["items"]] == [1, 1, 2]
+
+    @pytest.mark.unit
+    def test_可以按维度值过滤(self, queries):
+        result = queries.dimension_usage(
+            "model,size", since="2026-01-01",
+            filters='{"model": ["model-a"], "size": ["1024x1024"]}',
+        )
+
+        assert result["count"] == 1
+        assert result["items"][0]["values"] == {
+            "model": "model-a", "size": "1024x1024",
+        }
+
+    @pytest.mark.unit
+    def test_维度过滤支持固定分组键(self, queries):
+        result = queries.dimension_usage(
+            "day,user", since="2026-01-01", filters='{"user": "user-b"}',
+        )
+
+        assert result["count"] == 2
+        assert {item["values"]["user"] for item in result["items"]} == {"user-b"}
+
+    @pytest.mark.unit
+    def test_非法维度过滤被拒绝(self, queries):
+        with pytest.raises(ValueError):
+            queries.dimension_usage("model", filters="not-json")
+        with pytest.raises(ValueError):
+            queries.dimension_usage("model", filters='{"model;DROP": "x"}')
+
+    @pytest.mark.unit
+    def test_可以按成功率排序(self, queries):
+        result = queries.dimension_usage(
+            "model", since="2026-01-01", sort="success_rate", order="desc"
+        )
+
+        assert result["sort"] == "success_rate"
+        assert all(item["success_rate"] == 1.0 for item in result["items"])
+
+    @pytest.mark.unit
+    def test_返回耗时与吞吐指标(self, queries):
+        rows = []
+        for key, model, duration, ttft, output in (
+            ("r9-1", "model-c", 100, 20, 50),
+            ("r10-1", "model-c", 200, 30, 50),
+            ("r11-1", "model-d", 1000, 100, 100),
+        ):
+            attempt = _attempt(
+                key, "2026-01-03T10:00:00.000+00:00",
+                user="user-c", model=model, size="1024x1024",
+            )
+            attempt.duration_ms = duration
+            attempt.ttft_ms = ttft
+            attempt.has_usage = True
+            attempt.output_tokens = output
+            rows.append(attempt.to_row())
+        queries.store.insert_many(rows)
+        queries.store.aggregate_usage()
+
+        result = queries.dimension_usage(
+            "model", since="2026-01-03", user="user-c", sort="p95", order="desc"
+        )
+
+        assert result["items"][0]["values"]["model"] == "model-d"
+        by_model = {item["values"]["model"]: item for item in result["items"]}
+        assert by_model["model-c"]["avg_duration_ms"] == pytest.approx(150.0)
+        assert by_model["model-c"]["avg_ttft_ms"] == pytest.approx(25.0)
+        assert by_model["model-c"]["avg_throughput"] == pytest.approx(100 * 1000 / 300)
+        assert by_model["model-c"]["p95_duration_ms"] == 200
+        assert by_model["model-d"]["p95_duration_ms"] == 1000
+
+    @pytest.mark.unit
+    def test_非法排序键被拒绝(self, queries):
+        with pytest.raises(ValueError):
+            queries.dimension_usage("model", sort="size")
+        with pytest.raises(ValueError):
+            queries.dimension_usage("model", order="sideways")
+
+    @pytest.mark.unit
     def test_审计明细也可以按维度分组(self, queries):
         result = queries.summary("dim:model,size", since="2026-01-01")
 

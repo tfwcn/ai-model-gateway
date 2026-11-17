@@ -16,6 +16,11 @@ _METRIC_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("success", "成功"),
     ("failure", "失败"),
     ("aborted", "中断"),
+    ("retries", "重试"),
+    ("avg_ttft_ms", "首块ms"),
+    ("p95_duration_ms", "P95ms"),
+    ("avg_duration_ms", "平均ms"),
+    ("avg_throughput", "tokens/s"),
     ("input_tokens", "输入tokens"),
     ("cached_tokens", "缓存tokens"),
     ("output_tokens", "输出tokens"),
@@ -59,4 +64,6 @@ def _cell(value: Any, percent: bool = False) -> str:
         return ""
     if percent and isinstance(value, (int, float)):
         return f"{float(value) * 100:.1f}%"
+    if isinstance(value, float):
+        return f"{value:.2f}"
     return str(value)

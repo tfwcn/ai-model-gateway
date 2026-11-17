@@ -199,6 +199,15 @@ def _add_usage_group(groups) -> None:
     dimensions.add_argument("--group-by", default="model", help="逗号分隔：model / model,size / day,user,model,size")
     _add_filters(dimensions)
     dimensions.add_argument("--limit", type=int, default=200)
+    dimensions.add_argument(
+        "--sort", default="requests",
+        help="requests / attempts / success / failure / aborted / retries / duration / ttft / throughput / p95 / input_tokens / cached_tokens / output_tokens / success_rate，或 group-by 里的维度名",
+    )
+    dimensions.add_argument("--order", choices=("asc", "desc"), default="", help="留空时维度升序、指标降序")
+    dimensions.add_argument(
+        "--filters", default="",
+        help='按维度值过滤的 JSON，例如 \'{"model":"model-a","size":["1024x1024"]}\'',
+    )
 
     ranking = _action(actions, "models", "模型对比榜：慢模型、不稳定模型、用量大户", "usage_models")
     ranking.add_argument("--sort", choices=SORT_CHOICES, default="requests")

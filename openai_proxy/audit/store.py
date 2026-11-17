@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from openai_proxy.audit.duration_histogram import DurationHistogram, HistogramP95
 from openai_proxy.audit.record import COLUMNS
 
 logger = logging.getLogger(__name__)
@@ -25,10 +26,12 @@ USAGE_TABLE = "usage_daily"
 USAGE_DIMENSION_TABLE = "usage_dimension_daily"
 
 # 结构版本：版本 5 起标准维度改为 dimensions + 生成列；版本 6 给维度日汇总加 token；
-# 版本 7 修正历史行里按「提取响应体耗时」算出的假 tokens/s
+# 版本 7 修正历史行里按「提取响应体耗时」算出的假 tokens/s；
+# 版本 8 给维度日汇总补耗时、首块、tokens/s 与 P95 直方图
 DIMENSIONS_VERSION = 5
 TOKEN_COLUMNS_VERSION = 6
-SCHEMA_VERSION = 7
+THROUGHPUT_VERSION = 7
+PERFORMANCE_COLUMNS_VERSION = 8
 
 # 主键 + 常用过滤维度的索引：按时间、按模型、按结局、按请求链
 _INDEX_DDL = (
@@ -119,6 +122,14 @@ CREATE TABLE IF NOT EXISTS {USAGE_DIMENSION_TABLE} (
     input_tokens    INTEGER NOT NULL DEFAULT 0,
     cached_tokens   INTEGER NOT NULL DEFAULT 0,
     output_tokens   INTEGER NOT NULL DEFAULT 0,
+    -- 性能指标：sum/count 用来算加权平均，直方图用来估算 P95
+    duration_sum_ms     INTEGER NOT NULL DEFAULT 0,
+    duration_count      INTEGER NOT NULL DEFAULT 0,
+    ttft_sum_ms         INTEGER NOT NULL DEFAULT 0,
+    ttft_count          INTEGER NOT NULL DEFAULT 0,
+    throughput_tokens   INTEGER NOT NULL DEFAULT 0,
+    throughput_ms       INTEGER NOT NULL DEFAULT 0,
+    duration_histogram  TEXT NOT NULL DEFAULT '[]',
     updated_at      TEXT NOT NULL,
     PRIMARY KEY (day, endpoint, api_user, dimensions)
 )
@@ -239,6 +250,8 @@ class SqliteAuditStore(AuditStore):
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # 维度汇总按任意维度分组时，需要把多行日汇总的直方图合并后再算 P95
+        self._conn.create_aggregate("histogram_p95", 1, HistogramP95)
 
     def init_schema(self) -> None:
         """建表建索引，并按版本迁移老库结构（幂等）"""
@@ -290,8 +303,12 @@ class SqliteAuditStore(AuditStore):
             self._migrate_dimension_tokens()
             version = TOKEN_COLUMNS_VERSION
 
-        if version < SCHEMA_VERSION:
+        if version < THROUGHPUT_VERSION:
             self._migrate_throughput()
+            version = THROUGHPUT_VERSION
+
+        if version < PERFORMANCE_COLUMNS_VERSION:
+            self._migrate_dimension_performance()
 
     def _migrate_to_dimensions(self) -> None:
         """把老结构收拢为 dimensions + 生成列，并回填维度日汇总"""
@@ -386,8 +403,199 @@ class SqliteAuditStore(AuditStore):
               )
             """
         ).rowcount
-        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self._conn.execute(f"PRAGMA user_version = {THROUGHPUT_VERSION}")
         logger.info(f"审计库结构升级: 已按真实耗时重算 tokens/s（{updated} 行）")
+
+    def _migrate_dimension_performance(self) -> None:
+        """版本 8：给维度日汇总补性能列，并用仍保留的审计明细回填一次"""
+        columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({USAGE_DIMENSION_TABLE})")
+        }
+        additions = {
+            "duration_sum_ms": "INTEGER NOT NULL DEFAULT 0",
+            "duration_count": "INTEGER NOT NULL DEFAULT 0",
+            "ttft_sum_ms": "INTEGER NOT NULL DEFAULT 0",
+            "ttft_count": "INTEGER NOT NULL DEFAULT 0",
+            "throughput_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "throughput_ms": "INTEGER NOT NULL DEFAULT 0",
+            "duration_histogram": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for name, column_type in additions.items():
+            if name in columns:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE {USAGE_DIMENSION_TABLE} ADD COLUMN {name} {column_type}"
+            )
+            columns.add(name)
+        # 老库没有这些数据：先归零，再用还保留着的明细回填。
+        # 已按保留期清理掉的明细无法还原耗时分布，对应历史行的性能指标保持空值。
+        self._conn.execute(
+            f"""
+            UPDATE {USAGE_DIMENSION_TABLE}
+            SET duration_sum_ms = 0,
+                duration_count = 0,
+                ttft_sum_ms = 0,
+                ttft_count = 0,
+                throughput_tokens = 0,
+                throughput_ms = 0,
+                duration_histogram = '[]'
+            """
+        )
+        self._aggregate_dimension_performance(replace=True)
+        self._conn.execute(f"PRAGMA user_version = {PERFORMANCE_COLUMNS_VERSION}")
+        logger.info(
+            "审计库结构升级: 维度日汇总已补充性能指标"
+            "（仍保留的明细已回填，已清理部分保持空值）"
+        )
+
+    def _aggregate_dimension_performance(
+        self, *, pending_only: bool = False, replace: bool = False
+    ) -> int:
+        """
+        把审计明细的耗时、首块、tokens/s 与耗时直方图累加进维度日汇总
+
+        pending_only=True 只处理「已收尾但还没汇总」的行，供日常汇总调用；
+        replace=True 用全部保留明细重算，供版本迁移一次性回填。
+        调用方必须已经持有写锁与事务。
+        """
+        filters = [
+            "finalized = 1",
+            "endpoint != 'config_write'",
+            "dimensions IS NOT NULL",
+            "dimensions != ''",
+            "dimensions != '{}'",
+        ]
+        if pending_only:
+            filters.append("aggregated = 0")
+        cursor = self._conn.execute(
+            f"""
+            SELECT substr(ts, 1, 10) AS day, endpoint,
+                   COALESCE(NULLIF(api_user, ''), 'admin') AS api_user,
+                   dimensions, duration_ms, ttft_ms, has_usage, output_tokens
+            FROM {TABLE}
+            WHERE {' AND '.join(filters)}
+            """
+        )
+
+        groups: Dict[tuple, Dict[str, Any]] = {}
+        for row in cursor:
+            key = (
+                row["day"], row["endpoint"], row["api_user"], row["dimensions"],
+            )
+            group = groups.get(key)
+            if group is None:
+                group = {
+                    "duration_sum_ms": 0,
+                    "duration_count": 0,
+                    "ttft_sum_ms": 0,
+                    "ttft_count": 0,
+                    "throughput_tokens": 0,
+                    "throughput_ms": 0,
+                    "histogram": DurationHistogram(),
+                }
+                groups[key] = group
+
+            duration_ms = row["duration_ms"]
+            if duration_ms is not None:
+                duration_ms = int(duration_ms)
+                group["duration_sum_ms"] += duration_ms
+                group["duration_count"] += 1
+                group["histogram"].add(duration_ms)
+
+            ttft_ms = row["ttft_ms"]
+            if ttft_ms is not None:
+                group["ttft_sum_ms"] += int(ttft_ms)
+                group["ttft_count"] += 1
+
+            output_tokens = row["output_tokens"]
+            if row["has_usage"] and output_tokens and duration_ms and duration_ms > 0:
+                group["throughput_tokens"] += int(output_tokens)
+                group["throughput_ms"] += duration_ms
+
+        if not groups:
+            return 0
+
+        # 追加模式要和已有的日汇总直方图合并；迁移重算模式前面已经归零，不需要合并
+        existing = self._existing_dimension_histograms(groups.keys(), replace=replace)
+        for key, group in groups.items():
+            group["histogram"].merge(existing.get(key, DurationHistogram()))
+
+        sql = self._dimension_performance_update_sql(replace=replace)
+        values = [
+            (
+                group["duration_sum_ms"],
+                group["duration_count"],
+                group["ttft_sum_ms"],
+                group["ttft_count"],
+                group["throughput_tokens"],
+                group["throughput_ms"],
+                group["histogram"].to_json(),
+                key[0], key[1], key[2], key[3],
+            )
+            for key, group in groups.items()
+        ]
+        self._conn.executemany(sql, values)
+        return len(values)
+
+    def _existing_dimension_histograms(
+        self, keys: Iterable[tuple], *, replace: bool
+    ) -> Dict[tuple, DurationHistogram]:
+        """按主键批量读取已有直方图；迁移重算模式直接返回空表"""
+        if replace:
+            return {}
+        result: Dict[tuple, DurationHistogram] = {}
+        keys = list(keys)
+        # 一次拼太多主键会撞 SQLite 变量上限，按 200 组分批
+        for start in range(0, len(keys), 200):
+            chunk = keys[start:start + 200]
+            clause = " OR ".join(
+                ["(day = ? AND endpoint = ? AND api_user = ? AND dimensions = ?)"]
+                * len(chunk)
+            )
+            params = [value for key in chunk for value in key]
+            rows = self._conn.execute(
+                f"""
+                SELECT day, endpoint, api_user, dimensions, duration_histogram
+                FROM {USAGE_DIMENSION_TABLE}
+                WHERE {clause}
+                """,
+                params,
+            ).fetchall()
+            for row in rows:
+                key = (
+                    row["day"], row["endpoint"], row["api_user"], row["dimensions"],
+                )
+                result[key] = DurationHistogram.from_json(row["duration_histogram"])
+        return result
+
+    def _dimension_performance_update_sql(self, *, replace: bool) -> str:
+        """生成性能列更新语句：迁移重算用赋值，日常汇总用累加"""
+        if replace:
+            assignments = (
+                "duration_sum_ms = ?",
+                "duration_count = ?",
+                "ttft_sum_ms = ?",
+                "ttft_count = ?",
+                "throughput_tokens = ?",
+                "throughput_ms = ?",
+                "duration_histogram = ?",
+            )
+        else:
+            assignments = (
+                "duration_sum_ms = duration_sum_ms + ?",
+                "duration_count = duration_count + ?",
+                "ttft_sum_ms = ttft_sum_ms + ?",
+                "ttft_count = ttft_count + ?",
+                "throughput_tokens = throughput_tokens + ?",
+                "throughput_ms = throughput_ms + ?",
+                "duration_histogram = ?",
+            )
+        return f"""
+            UPDATE {USAGE_DIMENSION_TABLE}
+            SET {', '.join(assignments)}
+            WHERE day = ? AND endpoint = ? AND api_user = ? AND dimensions = ?
+        """
 
     def _backfill_dimension_usage(self) -> None:
         """维度日汇总表首次创建时，用全部已收尾明细回填一次（不碰 usage_daily）"""
@@ -549,6 +757,8 @@ class SqliteAuditStore(AuditStore):
                 """,
                 (_now_iso(),),
             )
+            # 性能指标需要读原始耗时行，单独累加到刚写入的维度汇总行
+            self._aggregate_dimension_performance(pending_only=True)
             cursor = self._conn.execute(
                 f"UPDATE {TABLE} SET aggregated = 1 WHERE finalized = 1 AND aggregated = 0"
             )

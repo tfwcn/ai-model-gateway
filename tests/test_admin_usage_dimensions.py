@@ -117,6 +117,42 @@ class TestDimensionEndpoints:
         assert first["output_tokens"] > 0
 
     @pytest.mark.unit
+    def test_可以按维度值排序(self, tmp_path, monkeypatch):
+        client = _client(tmp_path, monkeypatch)
+        headers = {"Authorization": f"Bearer {_KEY}"}
+
+        payload = client.post(
+            "/admin/usage/dimensions?group_by=model,size&since=2026-01-01&sort=size&order=asc",
+            headers=headers,
+        ).json()
+
+        assert payload["sort"] == "size"
+        assert payload["order"] == "asc"
+        assert [item["values"]["size"] for item in payload["items"]] == [
+            "1024x1024", "1024x1024", "512x512",
+        ]
+
+    @pytest.mark.unit
+    def test_可以按维度值过滤(self, tmp_path, monkeypatch):
+        client = _client(tmp_path, monkeypatch)
+        headers = {"Authorization": f"Bearer {_KEY}"}
+
+        payload = client.post(
+            "/admin/usage/dimensions",
+            params={
+                "group_by": "model,size",
+                "since": "2026-01-01",
+                "filters": '{"model": ["model-a"], "size": ["512x512"]}',
+            },
+            headers=headers,
+        ).json()
+
+        assert payload["count"] == 1
+        assert payload["items"][0]["values"] == {
+            "model": "model-a", "size": "512x512",
+        }
+
+    @pytest.mark.unit
     def test_导出csv包含维度列与固定指标(self, tmp_path, monkeypatch):
         client = _client(tmp_path, monkeypatch)
         headers = {"Authorization": f"Bearer {_KEY}"}
@@ -134,7 +170,8 @@ class TestDimensionEndpoints:
         text = response.content.decode("utf-8-sig")
         rows = list(csv.reader(io.StringIO(text)))
         assert rows[0] == [
-            "model", "size", "请求", "尝试", "成功", "失败", "中断",
+            "model", "size", "请求", "尝试", "成功", "失败", "中断", "重试",
+            "首块ms", "P95ms", "平均ms", "tokens/s",
             "输入tokens", "缓存tokens", "输出tokens", "成功率",
         ]
         assert len(rows) == 4

@@ -64,12 +64,20 @@ usage_daily(day, api_user) = 每天的请求数、尝试数、成功/失败/中�
 usage_dimension_daily(day, endpoint, api_user, dimensions)
   = requests / attempts / success / failure / aborted / retries
   + input_tokens / cached_tokens / output_tokens
+  + duration_sum_ms / duration_count      # 平均耗时
+  + ttft_sum_ms / ttft_count              # 平均首块耗时
+  + throughput_tokens / throughput_ms     # tokens/s
+  + duration_histogram                    # 固定桶耗时分布，用于估算 P95
 ```
 
 - `dimensions` 是完整维度组合的规范 JSON，例如
   `{"platform":"passthrough","model":"model-a","size":"1024x1024"}`；
 - 按任意子集分组时对 `requests` 求和即可；每个透传请求只有一条 attempt，不会重复计数；
 - 只累加、不删除，明细清理后历史仍在；
+- 平均耗时、平均首块、tokens/s 用 `sum / count` 加权计算，跨天分组时不会退化成「平均值的平均」；
+- P95 不保存原始样本，而是把每次耗时落进固定桶（10ms ~ 2min），查询时合并桶计数后取 95% 分位所在的桶上界，
+  因此是**估算值**；需要精确 P95 时看「审计明细」页的 30 天聚合；
+- 历史明细被清理后，旧数据的性能指标无法还原，迁移时对应行保持空值；
 - `usage_daily` 仍然是“每个用户准确请求总数”的口径：聊天请求可能故障转移产生多条不同模型的 attempt，
   直接对维度表求和会重复计算请求数。
 
@@ -98,6 +106,8 @@ usage_dimension_daily(day, endpoint, api_user, dimensions)
   新建的 `usage_dimension_daily` 会用已收尾明细回填一次。
 - 版本 6 给 `usage_dimension_daily` 补 `input_tokens` / `cached_tokens` / `output_tokens`，
   并用仍保留的审计明细回填一次。
+- 版本 8 给 `usage_dimension_daily` 补耗时 / 首块 / tokens/s 的 sum+count 与耗时直方图，
+  并用仍保留的审计明细回填；已经被清理的明细无法还原性能分布，对应行保持空值。
 
 **成功率只统计 `finalized=1` 的行**：
 

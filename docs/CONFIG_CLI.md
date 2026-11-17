@@ -177,7 +177,12 @@ python manage.py usage prune --before 30d                       # 清理旧明�
 以及 `dim:model,size` 这种任意维度组合。
 `usage dimensions` 读永久表 `usage_dimension_daily`，支持 `day` / `month` / `user` / `endpoint` 与任意透传维度名，
 例如 `--group-by model,size`、`--group-by month,user,model`；结果同时给出输入/缓存/输出 tokens。
-排序 `--sort`：`requests` / `p95` / `duration` / `ttft` / `throughput` / `failover` / `errors` / `tokens`。
+维度汇总的 `--sort` 可以是 `requests` / `attempts` / `success` / `failure` / `aborted` / `retries` /
+`duration` / `ttft` / `throughput` / `p95` / `input_tokens` / `cached_tokens` / `output_tokens` / `success_rate`，
+也可以直接写 `--group-by` 里的维度名，例如 `--sort model --order desc`；`--order` 留空时维度升序、指标降序。
+其中 `p95` 是固定桶直方图估算值，`duration` / `ttft` / `throughput` 分别是平均耗时、平均首块和 tokens/s。
+按维度值过滤用 `--filters`，值是 JSON 对象，例如 `--filters '{"model":"model-a"}'`，多个值可写成数组。
+聚合与模型榜的排序 `--sort`：`requests` / `p95` / `duration` / `ttft` / `throughput` / `failover` / `errors` / `tokens`。
 过滤：`--since` / `--until`（ISO 时间、日期或 `7d`、`24h`、`30m`）、`--platform`、`--model`、`--endpoint`。
 
 `usage attempts` 与 `usage chain` 都带一列 `[DONE]`：`已发完` 表示终止标记已经转发给客户端（客户端随后关闭连接属正常，记 `success`），

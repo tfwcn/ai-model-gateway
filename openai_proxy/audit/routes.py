@@ -110,9 +110,17 @@ def build_audit_router(
         user: Optional[str] = Query(None, description="只看某个用户标签"),
         endpoint: Optional[str] = Query(None, description="只看某个入口，例如 passthrough:example-service"),
         limit: int = Query(200, ge=1, le=1000),
+        sort: str = Query("requests", description="指标名，或 group_by 里的维度名"),
+        order: str = Query("", description="asc|desc；留空时维度升序、指标降序"),
+        filters: Optional[str] = Query(
+            None, description='JSON 对象，按维度值精确过滤，例如 {"model":"model-a"}'
+        ),
     ) -> Dict[str, Any]:
         """永久维度日汇总：按任意维度组合看调用量"""
-        return await _run(_queries().dimension_usage, group_by, since, until, user, endpoint, limit)
+        return await _run(
+            _queries().dimension_usage,
+            group_by, since, until, user, endpoint, limit, sort, order, filters,
+        )
 
     @router.post("/admin/usage/dimensions/export")
     async def usage_dimensions_export(
@@ -121,10 +129,16 @@ def build_audit_router(
         until: Optional[str] = None,
         user: Optional[str] = Query(None, description="只看某个用户标签"),
         endpoint: Optional[str] = Query(None, description="只看某个入口，例如 passthrough:example-service"),
+        sort: str = Query("requests", description="指标名，或 group_by 里的维度名"),
+        order: str = Query("", description="asc|desc；留空时维度升序、指标降序"),
+        filters: Optional[str] = Query(
+            None, description='JSON 对象，按维度值精确过滤，例如 {"model":"model-a"}'
+        ),
     ) -> Response:
         """永久维度日汇总导出 CSV（全部匹配行，不受页面分页限制）"""
         result = await _run(
-            _queries().dimension_usage, group_by, since, until, user, endpoint, None
+            _queries().dimension_usage,
+            group_by, since, until, user, endpoint, None, sort, order, filters,
         )
         content = DimensionCsvExporter(result["group_by"], result["items"]).render()
         return Response(

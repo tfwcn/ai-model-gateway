@@ -214,6 +214,56 @@ table.wrap td code { overflow-wrap: anywhere; }
 /* 带小标签的控件与按钮混在一行：按底边对齐，按钮才和输入控件竖着对上 */
 .control-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-end; }
 
+/* 维度汇总：输入区、常用组合、候选键分成清晰的三段 */
+.dim-builder { display: flex; flex-direction: column; gap: 12px; }
+.dim-builder-main {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.6fr) minmax(180px, 1.2fr) minmax(140px, .8fr) minmax(140px, .8fr);
+  gap: 10px;
+  align-items: end;
+}
+@media (max-width: 900px) {
+  .dim-builder-main { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 560px) {
+  .dim-builder-main { grid-template-columns: 1fr; }
+}
+.dim-section { display: flex; flex-direction: column; gap: 6px; }
+.dim-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+.dim-section-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.dim-hint { color: var(--muted); font-size: 12px; }
+.dim-chip-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.dim-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--chip);
+  color: var(--ink);
+  font-size: 12px;
+}
+.dim-chip:hover { border-color: var(--accent); }
+.dim-chip code { color: var(--muted); font-size: 11px; }
+.dim-chip[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.dim-chip[aria-pressed="true"] code { color: rgba(255, 255, 255, .82); }
+.dim-chip-add::before { content: "+"; color: var(--muted); font-weight: 700; }
+.dim-chip-add[aria-pressed="true"]::before { content: "−"; color: rgba(255, 255, 255, .82); }
+.dim-help { border-top: 1px dashed var(--line); padding-top: 8px; }
+.dim-help summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.dim-help p { margin: 6px 0 0; }
+.dim-results { border-top: 1px solid var(--line); padding-top: 12px; }
+
 /* 取值控件的槽位：字段类型不同控件宽度差很多，靠这里换行而不是挤歪编辑行 */
 .value-slot { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
 
@@ -257,6 +307,7 @@ input.wide { min-width: 200px; flex: 1 1 200px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 .card .value { font-size: 22px; font-weight: 700; }
+.card .value[title] { cursor: help; }
 .card .label { color: var(--muted); font-size: 12px; }
 .card.ok .value { color: var(--ok); }
 .card.bad .value { color: var(--bad); }

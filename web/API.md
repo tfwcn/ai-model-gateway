@@ -81,6 +81,7 @@ X-Gateway-User: user-a
   `usage_daily` 日汇总只累加、不清理，用于永久保留输入/输出/缓存 tokens 等用量。
 - **维度日汇总**：`usage_dimension_daily` 按 `(day, endpoint, api_user, dimensions)` 累加，
   同样只增不删；`dimensions` 是完整维度组合的规范 JSON，查询时可按任意子集分组。
+  表里还保存耗时 / 首块 / tokens/s 的 sum+count 与耗时直方图，用于永久查看性能指标和估算 P95。
 
 ---
 
@@ -162,11 +163,16 @@ X-Gateway-User: user-a
 ## POST /admin/usage/dimensions
 
 永久维度日汇总。查询参数：`group_by`（逗号分隔，支持 `day` / `month` / `user` / `endpoint` 与任意维度名，
-例如 `model`、`model,size`、`month,user,model`）、`since`、`until`、`user`、`endpoint`、`limit`（1~1000）。
+例如 `model`、`model,size`、`month,user,model`）、`since`、`until`、`user`、`endpoint`、`limit`（1~1000）、
+`sort`（请求数 / 尝试 / 成功 / 失败 / 中断 / 重试 / 首块 / P95 / 平均耗时 / tokens/s / tokens / 成功率等指标名，
+或 `group_by` 里的维度名）、`order`（`asc` / `desc`；留空时维度升序、指标降序）、
+`filters`（JSON 对象，按维度值精确过滤，例如 `{"model":"model-a","size":["1024x1024"]}`）。
 
 ```json
 {
   "group_by": ["month", "user", "model"],
+  "sort": "requests",
+  "order": "desc",
   "range": { "since": "2026-01-01T00:00:00+00:00", "until": "2026-02-01T00:00:00+00:00" },
   "count": 2,
   "items": [
@@ -174,6 +180,7 @@ X-Gateway-User: user-a
       "bucket": "2026-01 | user-a | model-a",
       "values": { "month": "2026-01", "user": "user-a", "model": "model-a" },
       "requests": 12, "attempts": 12, "success": 12, "failure": 0, "aborted": 0, "retries": 0,
+      "avg_ttft_ms": 120.0, "p95_duration_ms": 1500, "avg_duration_ms": 860.0, "avg_throughput": 42.5,
       "input_tokens": 12000, "cached_tokens": 3000, "output_tokens": 8000,
       "success_rate": 1.0
     }
@@ -183,14 +190,16 @@ X-Gateway-User: user-a
 
 数据来自 `usage_dimension_daily`，只累加、不清理；明细保留期清理后历史仍可查。
 `input_tokens` / `cached_tokens` / `output_tokens` 来自审计行，上游没有返回 usage 时为空值按 0 累计。
+`avg_ttft_ms` / `avg_duration_ms` / `avg_throughput` 用 sum/count 加权计算；`p95_duration_ms` 是固定桶直方图的估算值，
+没有耗时样本时为 `null`。
 
 ## POST /admin/usage/dimensions/export
 
 把同一组筛选条件下的维度日汇总导出为 CSV。查询参数与 `/admin/usage/dimensions` 相同
-（`group_by`、`since`、`until`、`user`、`endpoint`），但没有 `limit`：导出全部匹配分组。
+（`group_by`、`since`、`until`、`user`、`endpoint`、`sort`、`order`、`filters`），但没有 `limit`：导出全部匹配分组。
 
 响应头为 `Content-Type: text/csv; charset=utf-8`，文件带 UTF-8 BOM，可直接用 Excel 打开。
-列顺序是「所选维度列 + 请求 / 尝试 / 成功 / 失败 / 中断 / 输入tokens / 缓存tokens / 输出tokens / 成功率」。
+列顺序是「所选维度列 + 请求 / 尝试 / 成功 / 失败 / 中断 / 重试 / 首块ms / P95ms / 平均ms / tokens/s / 输入tokens / 缓存tokens / 输出tokens / 成功率」。
 
 ## POST /admin/usage/dimension-keys
 

@@ -29,6 +29,26 @@ export function fmtNumber(value, digits = 0) {
   return num.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
+/**
+ * 大数字的紧凑写法：卡片里只显示 1.2K / 3.4M / 5.6B，具体值放在 title 里
+ *
+ * 只用于展示，不改变接口返回值；没有单位时按原数字输出。
+ */
+export function fmtCompact(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  const abs = Math.abs(num);
+  const units = [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]];
+  for (const [size, unit] of units) {
+    if (abs >= size) {
+      const scaled = (num / size).toFixed(1).replace(/\.0$/, "");
+      return `${scaled}${unit}`;
+    }
+  }
+  return String(num);
+}
+
 export function fmtRate(value) {
   if (value === null || value === undefined) return "-";
   return `${(Number(value) * 100).toFixed(1)}%`;
@@ -101,7 +121,8 @@ export function table(columns, rows, options = {}) {
 export function cards(items) {
   return el("div", { class: "cards" }, items.map((item) =>
     el("div", { class: `card ${item.tone || ""}` }, [
-      el("div", { class: "value", text: item.value }),
+      // title 用于悬停时显示完整数字，不占用卡片空间
+      el("div", { class: "value", text: item.value, title: item.title }),
       el("div", { class: "label", text: item.label }),
     ])));
 }

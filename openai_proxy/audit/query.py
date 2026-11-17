@@ -7,6 +7,7 @@
 - 成功率只统计 finalized=1 的行，未收尾的流不算成功
 - P95 用 ROW_NUMBER 名次近似（SQLite 没有 percentile 函数）
 """
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -44,6 +45,28 @@ _SORT_KEYS: Dict[str, tuple] = {
     "failover": ("failover_count", True),
     "errors": ("failure", True),
     "tokens": ("output_tokens", True),
+}
+
+# 维度日汇总可排序的指标：只列永久表里真实存在的列。
+# 成功率是派生值，SQL 里用与 Python 相同的口径现算，保证分页前排序正确。
+_DIMENSION_SORT_KEYS: Dict[str, str] = {
+    "requests": "requests",
+    "attempts": "attempts",
+    "success": "success",
+    "failure": "failure",
+    "aborted": "aborted",
+    "retries": "retries",
+    "input_tokens": "input_tokens",
+    "cached_tokens": "cached_tokens",
+    "output_tokens": "output_tokens",
+    "success_rate": (
+        "CAST(SUM(success) AS REAL) "
+        "/ NULLIF(SUM(success) + SUM(failure) + SUM(aborted), 0)"
+    ),
+    "duration": "SUM(duration_sum_ms) * 1.0 / NULLIF(SUM(duration_count), 0)",
+    "ttft": "SUM(ttft_sum_ms) * 1.0 / NULLIF(SUM(ttft_count), 0)",
+    "throughput": "SUM(throughput_tokens) * 1000.0 / NULLIF(SUM(throughput_ms), 0)",
+    "p95": "histogram_p95(duration_histogram)",
 }
 
 _RELATIVE_RE = re.compile(r"^(\d+)\s*([dhm])$", re.IGNORECASE)
@@ -299,6 +322,9 @@ class UsageQueryService:
         user: Optional[str] = None,
         endpoint: Optional[str] = None,
         limit: Optional[int] = 200,
+        sort: str = "requests",
+        order: str = "",
+        filters: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         查询永久维度日汇总表（usage_dimension_daily）
@@ -306,13 +332,38 @@ class UsageQueryService:
         group_by 是逗号分隔的分组键，支持 day / user / endpoint 与任意维度名，
         例如 `model`、`model,size`、`day,user,model,size`。
         limit=None 表示导出场景不截断，返回全部匹配分组。
+        sort 可以是指标名，也可以是 group_by 里选中的某个维度名；
+        order 留空时维度默认升序、指标默认降序。
+        filters 是 JSON 对象，按维度值做精确过滤，例如
+        `{"model":"model-a","size":["1024x1024","512x512"]}`。
         """
         names = _parse_dimension_group(group_by)
+        dimension_filters = _parse_dimension_filters(filters)
         exprs = [_dimension_group_expr(name) for name in names]
         aliases = [f"g{index}" for index in range(len(exprs))]
         select_group = ", ".join(f"{expr} AS {alias}" for expr, alias in zip(exprs, aliases))
         group_clause = ", ".join(aliases)
         bucket_expr = _bucket_from_exprs(exprs)
+
+        # 排序键只允许指标白名单或本次分组里的维度名，彻底杜绝拼接注入
+        sort = str(sort or "requests").strip()
+        order = str(order or "").strip().lower()
+        if sort in _DIMENSION_SORT_KEYS:
+            order_expr = _DIMENSION_SORT_KEYS[sort]
+            default_order = "desc"
+        elif sort in names:
+            order_expr = aliases[names.index(sort)]
+            default_order = "asc"
+        else:
+            raise ValueError(
+                f"sort 只支持指标 {', '.join(sorted(_DIMENSION_SORT_KEYS))} "
+                f"或分组维度: {', '.join(names)}"
+            )
+        if order not in ("", "asc", "desc"):
+            raise ValueError("order 只支持 asc / desc")
+        order = order or default_order
+        # 派生指标可能没有样本（NULL），排序时统一放最后，和明细榜的口径一致
+        order_clause = f"({order_expr} IS NULL) ASC, {order_expr} {order.upper()}, bucket ASC"
 
         where: List[str] = ["1 = 1"]
         params: List[Any] = []
@@ -330,6 +381,12 @@ class UsageQueryService:
         if endpoint:
             where.append("endpoint = ?")
             params.append(endpoint)
+        # 维度值过滤：分组表达式本身已经处理 day/month/user/endpoint 与 JSON 维度
+        for name, values in dimension_filters.items():
+            expr = _dimension_group_expr(name)
+            placeholders = ", ".join("?" for _ in values)
+            where.append(f"{expr} IN ({placeholders})")
+            params.extend(values)
 
         # 导出时 limit=None：不拼 LIMIT，保证 CSV 不因页面分页而缺行
         limit_clause = ""
@@ -348,11 +405,21 @@ class UsageQueryService:
                    COALESCE(SUM(retries), 0) AS retries,
                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
                    COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
-                   COALESCE(SUM(output_tokens), 0) AS output_tokens
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   CASE WHEN SUM(duration_count) > 0
+                        THEN SUM(duration_sum_ms) * 1.0 / SUM(duration_count)
+                   END AS avg_duration_ms,
+                   CASE WHEN SUM(ttft_count) > 0
+                        THEN SUM(ttft_sum_ms) * 1.0 / SUM(ttft_count)
+                   END AS avg_ttft_ms,
+                   CASE WHEN SUM(throughput_ms) > 0
+                        THEN SUM(throughput_tokens) * 1000.0 / SUM(throughput_ms)
+                   END AS avg_throughput,
+                   histogram_p95(duration_histogram) AS p95_duration_ms
             FROM {USAGE_DIMENSION_TABLE}
             WHERE {' AND '.join(where)}
             GROUP BY {group_clause}
-            ORDER BY requests DESC, bucket ASC
+            ORDER BY {order_clause}
             {limit_clause}
             """,
             params,
@@ -369,6 +436,8 @@ class UsageQueryService:
             items.append(item)
         return {
             "group_by": names,
+            "sort": sort,
+            "order": order,
             "range": {"since": parse_time(since), "until": parse_time(until) or _now_iso()},
             "count": len(items),
             "items": items,
@@ -586,6 +655,31 @@ def _parse_dimension_names(raw: str) -> List[str]:
     for name in names:
         _require_dimension_name(name)
     return names
+
+
+def _parse_dimension_filters(raw: Optional[str]) -> Dict[str, List[str]]:
+    """解析维度值过滤 JSON：只允许安全维度名，值统一成字符串列表"""
+    if raw is None or str(raw).strip() == "":
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("filters 必须是 JSON 对象") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("filters 必须是 JSON 对象")
+    filters: Dict[str, List[str]] = {}
+    for key, value in payload.items():
+        name = str(key).strip()
+        _require_dimension_name(name)
+        raw_values = value if isinstance(value, list) else [value]
+        values = [
+            str(item).strip()
+            for item in raw_values
+            if item is not None and str(item).strip()
+        ]
+        if values:
+            filters[name] = values
+    return filters
 
 
 def _parse_dimension_group(raw: str) -> List[str]:

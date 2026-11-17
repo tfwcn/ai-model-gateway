@@ -11,11 +11,15 @@ export class DateRange {
   /**
    * Args:
    *   days: 默认显示最近几天（含今天）；不传表示默认留空、不限时间
+   *   currentMonth: 默认显示当月（本月 1 日到今天），优先级高于 days
    */
-  constructor({ days = null } = {}) {
+  constructor({ days = null, currentMonth = false } = {}) {
     this.sinceNode = el("input", { type: "date" });
     this.untilNode = el("input", { type: "date" });
-    if (days) {
+    if (currentMonth) {
+      this.untilNode.value = todayIso();
+      this.sinceNode.value = monthStartIso();
+    } else if (days) {
       this.untilNode.value = todayIso();
       this.sinceNode.value = daysAgoIso(days - 1);
     }
@@ -41,6 +45,12 @@ export class DateRange {
 /** 本地时区的今天（YYYY-MM-DD） */
 function todayIso() {
   return formatLocalDate(new Date());
+}
+
+/** 本地时区当月的 1 日（YYYY-MM-DD） */
+function monthStartIso() {
+  const today = new Date();
+  return formatLocalDate(new Date(today.getFullYear(), today.getMonth(), 1));
 }
 
 /** 本地时区往前推 N 天 */

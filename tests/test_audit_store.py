@@ -204,7 +204,7 @@ class TestSchemaMigration:
         upgraded.init_schema()
 
         columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(audit_attempts)")}
-        assert version == 7
+        assert version == 8
         assert "done_sent" not in columns
         upgraded.close()
 
@@ -253,7 +253,62 @@ class TestSchemaMigration:
         assert {"input_tokens", "cached_tokens", "output_tokens"} <= columns
         row = upgraded.query("SELECT input_tokens, cached_tokens, output_tokens FROM usage_dimension_daily")[0]
         assert row == {"input_tokens": 100, "cached_tokens": 10, "output_tokens": 20}
-        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+    @pytest.mark.unit
+    def test_版本8维度表补性能列并回填(self, tmp_path):
+        path = str(tmp_path / "audit.db")
+        legacy = SqliteAuditStore(path)
+        legacy.init_schema()
+        attempt = AuditAttempt(
+            attempt_key="req1-1",
+            gateway_request_id="req1",
+            endpoint="chat_completions",
+            stream=False,
+            dimensions={"platform": "example-platform", "model": "example-platform|model-a"},
+            ts="2026-01-01T10:00:00.000+00:00",
+        )
+        attempt.mark_success()
+        attempt.duration_ms = 120
+        attempt.ttft_ms = 30
+        attempt.has_usage = True
+        attempt.output_tokens = 60
+        legacy.insert_many([attempt.to_row()])
+        legacy.aggregate_usage()
+
+        # 退回到版本 7：维度表还没有性能列
+        performance_columns = (
+            "duration_sum_ms", "duration_count", "ttft_sum_ms", "ttft_count",
+            "throughput_tokens", "throughput_ms", "duration_histogram",
+        )
+        for column in performance_columns:
+            legacy._conn.execute(f"ALTER TABLE usage_dimension_daily DROP COLUMN {column}")
+        legacy._conn.execute("PRAGMA user_version = 7")
+        legacy._conn.commit()
+        legacy.close()
+
+        upgraded = SqliteAuditStore(path)
+        upgraded.init_schema()
+
+        columns = {
+            row["name"]
+            for row in upgraded._conn.execute("PRAGMA table_info(usage_dimension_daily)")
+        }
+        assert set(performance_columns) <= columns
+        row = upgraded.query(
+            "SELECT duration_sum_ms, duration_count, ttft_sum_ms, ttft_count, "
+            "throughput_tokens, throughput_ms, duration_histogram "
+            "FROM usage_dimension_daily"
+        )[0]
+        assert row["duration_sum_ms"] == 120
+        assert row["duration_count"] == 1
+        assert row["ttft_sum_ms"] == 30
+        assert row["ttft_count"] == 1
+        assert row["throughput_tokens"] == 60
+        assert row["throughput_ms"] == 120
+        assert row["duration_histogram"] != "[]"
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        upgraded.close()
         upgraded.close()
 
 

@@ -132,11 +132,13 @@ dimensions = {"platform":"passthrough","model":"model-a","size":"1024x1024",...}
 (day, endpoint, api_user, dimensions)
   → requests / attempts / success / failure / aborted / retries
   → input_tokens / cached_tokens / output_tokens
+  → 平均耗时 / 平均首块 / tokens/s / 耗时直方图（估算 P95）
 ```
 
 - 按完整维度组合存一行，查询时可按任意子集分组；
 - 只累加、不删除，审计明细保留期清理后历史仍在；
 - token 来自审计行；上游没有返回 usage 时按 0 累计；
+- 耗时指标用 sum/count 加权，跨天分组不会变成「平均值的平均」；P95 用固定桶直方图估算；
 - `group_by` 支持 `day`、`month`、`user`、`endpoint` 与任意维度名；
 - 每个透传请求只有一条 attempt，所以按用户/维度求和不会重复计数请求。
 
@@ -170,8 +172,16 @@ python manage.py usage summary --group-by dim:model,size --since 7d
 ## 5. 管理台
 
 - 「模型配置」页的“透传接口”面板可以新增/删除路由、编辑字段、维护维度键值对；
-- 「用量与性能」页的“维度汇总”页签可以选择维度组合和入口，时间范围与用户标签沿用页签上方的全局筛选；
-  常用组合以按钮形式列出（如 `user,model`、`month,user,model`），可用维度键来自 `/admin/usage/dimension-keys`，点一下即可追加；
+- 「用量与性能」页只显示永久汇总（`usage_daily` / `usage_dimension_daily`），不读审计明细；
+  30 天内的明细、聚合与趋势统一放到「审计明细」页；
+- 「用量与性能」页的“维度汇总”页签可以选择维度组合、入口和排序方式，时间范围与用户标签沿用页签上方的全局筛选；
+  结果除了请求 / 尝试 / 成功 / 失败 / 中断 / 重试 / tokens / 成功率，还包含首块、平均耗时、tokens/s 与 P95；
+  排序既支持这些指标，也支持按选中的维度值升序或降序；P95 用固定桶直方图估算，精确值看「审计明细」页的 30 天聚合；
+  浏览器会记住最近 10 个维度组合，查询成功后自动置顶；同一个组合再次查询只更新这一条，排序 / 方向 / 筛选以最后一次为准；
+  输入框、入口、排序、方向和维度筛选默认恢复上一次查询的条件；
+  「按维度筛选」随当前组合动态生成输入框，只筛当前组合里的维度，精确匹配，多个值用英文逗号分隔；
+  可用维度键来自 `/admin/usage/dimension-keys`，维度键是多选式按钮，点一下加入、再点一下移除；
+  每日用量不再单独占页签，用 `day,user` 组合即可查看；
 - 所有改动走现有补丁、预演、备份、回滚与热重载机制。
 
 ---
