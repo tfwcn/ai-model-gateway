@@ -12,11 +12,8 @@
   后续失败以标准 SSE error 事件下发。
 """
 import asyncio
-import logging
 import os
 from typing import Any, Awaitable, Optional
-
-logger = logging.getLogger(__name__)
 
 # 快速失败窗口（秒）：0 表示关闭，直接进入 SSE + 心跳模式
 DEFAULT_GRACE_SECONDS = float(os.getenv("FAILOVER_FAST_FAIL_SECONDS", "3"))
@@ -61,7 +58,7 @@ class StreamStartGate:
             await asyncio.wait_for(asyncio.shield(task), timeout=self.grace)
             return GateOutcome(task=task)
         except asyncio.TimeoutError:
-            logger.info(f"failover 超过 {self.grace:g} 秒仍未出结果，转入 SSE + 心跳模式")
+            # 属正常分支（上游较慢），不打印日志，避免正常请求刷屏
             return GateOutcome(task=task)
         except asyncio.CancelledError:
             task.cancel()
